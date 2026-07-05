@@ -315,6 +315,11 @@ def train(args: argparse.Namespace) -> Path:
             should_log = step == 1 or step % args.log_every == 0 or step == args.max_steps
             should_eval = step % args.eval_every == 0 or step == args.max_steps
             lr = float(scheduler.get_last_lr()[0])
+            should_print_progress = (
+                step == 1
+                or step == args.max_steps
+                or (args.progress_every > 0 and step % args.progress_every == 0)
+            )
             if should_log:
                 progress.set_postfix(
                     {
@@ -323,6 +328,19 @@ def train(args: argparse.Namespace) -> Path:
                         "grad": f"{float(grad_norm.detach().cpu()):.2f}",
                     },
                     refresh=False,
+                )
+            if should_print_progress:
+                elapsed = time.time() - start_time
+                steps_per_sec = step / max(elapsed, 1e-9)
+                remaining = max(args.max_steps - step, 0) / max(steps_per_sec, 1e-9)
+                print(
+                    "[train] "
+                    f"{run_label} step={step}/{args.max_steps} "
+                    f"loss={last_stats['total_weighted_loss']:.4f} "
+                    f"lr={lr:.2e} "
+                    f"{steps_per_sec:.2f} step/s "
+                    f"eta={remaining / 60:.1f}m",
+                    flush=True,
                 )
             if should_log or should_eval:
                 row = {
@@ -417,6 +435,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval_limit", type=int, default=512)
     parser.add_argument("--save_every", type=int, default=5000)
     parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument("--progress_every", type=int, default=100)
     parser.add_argument("--precision", default="bf16_if_available_else_fp32", choices=["bf16_if_available_else_fp32", "fp32"])
     parser.add_argument("--num_workers", type=int, default=0)
     return parser

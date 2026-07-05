@@ -32,6 +32,7 @@ def _run(cmd: list[str], *, dry_run: bool) -> None:
         return
     env = os.environ.copy()
     env["PYTHONPATH"] = str(SRC) + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONUNBUFFERED"] = "1"
     subprocess.run(cmd, check=True, cwd=ROOT, env=env)
 
 
@@ -73,6 +74,7 @@ def main() -> None:
     parser.add_argument("--seeds", default="0")
     parser.add_argument("--max_steps", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--progress_every", type=int, default=100)
     parser.add_argument("--eval_splits", default="val_id,val_length_ood,val_density_shift_low,val_density_shift_high")
     parser.add_argument("--eval_limit", type=int, default=None)
     parser.add_argument("--device", default=None)
@@ -94,6 +96,7 @@ def main() -> None:
                 f"data_dir={args.data_dir}",
                 f"model={args.model_name} config={args.model_config}",
                 f"seeds={','.join(str(seed) for seed in seeds)} max_steps={args.max_steps}",
+                f"batch_size={args.batch_size} progress_every={args.progress_every} eval_limit={args.eval_limit}",
                 "=" * 88,
             ]
         ),
@@ -138,6 +141,8 @@ def main() -> None:
                 str(args.max_steps),
                 "--batch_size",
                 str(args.batch_size),
+                "--progress_every",
+                str(args.progress_every),
             ]
             if final_weight is not None:
                 train_cmd += ["--final_weight", str(final_weight)]

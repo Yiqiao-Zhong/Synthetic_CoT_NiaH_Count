@@ -37,6 +37,7 @@ python scripts/run_loss_mask_sweep.py \
   --seeds 0 \
   --max_steps 10000 \
   --batch_size 128 \
+  --progress_every 100 \
   --eval_limit 1024 \
   --skip_completed
 python -m trace_counting.summarize \
@@ -46,6 +47,17 @@ python -m trace_counting.summarize \
 ```
 
 This is the notebook default. It trains 7 runs: 7 loss-mask regimes for seed 0. For an exhaustive paper-quality run, use `--max_steps 50000` and remove `--eval_limit 1024`.
+
+To monitor a run from a second VSCode/Colab terminal:
+
+```bash
+python scripts/monitor_runs.py \
+  --runs_dir runs/trace_count_v0_seed0 \
+  --max_steps 10000 \
+  --interval 60
+```
+
+The training command also prints a plain progress line every 100 optimizer steps, which is easier to see in Colab/VSCode notebooks than a live `tqdm` bar. The monitor reports GPU utilization, latest step/loss/validation metrics, checkpoint status, and how recently each `train_log.jsonl` changed.
 
 ## Manual Commands
 
