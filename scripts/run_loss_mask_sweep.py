@@ -21,6 +21,11 @@ REGIMES = [
 ]
 
 
+def _resolve(path: str | Path) -> Path:
+    path = Path(path)
+    return path if path.is_absolute() else ROOT / path
+
+
 def _run(cmd: list[str], *, dry_run: bool) -> None:
     print("$", " ".join(cmd))
     if dry_run:
@@ -34,6 +39,27 @@ def regime_name(loss_mask: str, final_weight: float | None) -> str:
     if final_weight is None:
         return loss_mask
     return f"{loss_mask}_fw{final_weight:g}"
+
+
+def preflight_data_dir(data_dir: str | Path, eval_splits: str) -> None:
+    data_path = _resolve(data_dir)
+    required = ["vocab.json", "train.jsonl"]
+    required.extend(f"{split.strip()}.jsonl" for split in eval_splits.split(",") if split.strip())
+    missing = [name for name in required if not (data_path / name).exists()]
+    if not missing:
+        return
+
+    missing_text = ", ".join(missing)
+    raise FileNotFoundError(
+        f"Missing dataset files under {data_path}: {missing_text}\n\n"
+        "Generate the dataset before running the sweep. For the full v0 sweep, run:\n"
+        "  python scripts/run_pipeline.py --config configs/experiment/v0.yaml --stage data\n\n"
+        "For the small Colab/debug dataset, run:\n"
+        "  python scripts/run_pipeline.py --config configs/experiment/debug.yaml --stage data\n"
+        "  python scripts/run_loss_mask_sweep.py --data_dir data/trace_count_v0_debug "
+        "--out_root runs/trace_count_v0_debug --model_config configs/model/tiny_debug.yaml "
+        "--model_name tiny_debug --max_steps 100 --eval_limit 128"
+    )
 
 
 def main() -> None:
@@ -50,6 +76,9 @@ def main() -> None:
     parser.add_argument("--device", default=None)
     parser.add_argument("--dry_run", action="store_true")
     args = parser.parse_args()
+
+    if not args.dry_run:
+        preflight_data_dir(args.data_dir, args.eval_splits)
 
     seeds = [int(part) for part in args.seeds.split(",") if part.strip()]
     for seed in seeds:

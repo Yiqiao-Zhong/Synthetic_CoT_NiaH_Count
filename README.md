@@ -23,7 +23,7 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-If you use Colab, clone the GitHub repo first, then run the install cells in `notebooks/Trace_Count_v0_Colab.ipynb`.
+If you use Colab, open `notebooks/Trace_Count_v0_Colab.ipynb` and run all cells. The notebook clones/updates the repo when needed, installs dependencies, runs tests, generates the debug dataset, trains/evaluates every loss-mask regime, summarizes results, runs probes, and displays plots.
 
 ## One-Command Debug Run
 
