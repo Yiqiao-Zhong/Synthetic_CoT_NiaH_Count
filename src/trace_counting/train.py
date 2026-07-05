@@ -163,6 +163,14 @@ def save_checkpoint(
     return checkpoint_dir
 
 
+def _run_label(args: argparse.Namespace, model_config: dict) -> str:
+    model_name = model_config.get("model_name", "model")
+    weighted = ""
+    if args.loss_mask in {"full_sequence_final_weighted", "completion_final_weighted"}:
+        weighted = f", fw={args.final_weight:g}"
+    return f"{model_name} | seed={args.seed} | {args.loss_mask}{weighted}"
+
+
 def train(args: argparse.Namespace) -> Path:
     set_seed(args.seed)
     device = pick_device(args.device)
@@ -173,6 +181,7 @@ def train(args: argparse.Namespace) -> Path:
     model_config = load_model_config(args.model_config)
     model = build_model_from_config(model_config, tokenizer).to(device)
     model.train()
+    run_label = _run_label(args, model_config)
 
     train_dataset = dataset_for_split(
         data_dir,
@@ -254,12 +263,28 @@ def train(args: argparse.Namespace) -> Path:
     if log_path.exists():
         log_path.unlink()
 
+    print(
+        "\n".join(
+            [
+                "",
+                "=" * 88,
+                f"Training: {run_label}",
+                f"Data: {data_dir}",
+                f"Output: {out_dir}",
+                f"Device: {device} | precision: {'bf16' if use_bf16 else 'fp32'}",
+                f"Steps: {args.max_steps} | batch_size: {args.batch_size} | train_examples: {len(train_dataset)}",
+                "=" * 88,
+            ]
+        ),
+        flush=True,
+    )
+
     step = 0
     micro_step = 0
     last_stats: dict[str, Any] = {}
     start_time = time.time()
     optimizer.zero_grad(set_to_none=True)
-    progress = tqdm(total=args.max_steps, desc="train", dynamic_ncols=True)
+    progress = tqdm(total=args.max_steps, desc=run_label, dynamic_ncols=True, leave=True)
     while step < args.max_steps:
         for batch in train_loader:
             batch = move_batch_to_device(batch, device)
@@ -289,16 +314,27 @@ def train(args: argparse.Namespace) -> Path:
 
             should_log = step == 1 or step % args.log_every == 0 or step == args.max_steps
             should_eval = step % args.eval_every == 0 or step == args.max_steps
+            lr = float(scheduler.get_last_lr()[0])
+            if should_log:
+                progress.set_postfix(
+                    {
+                        "loss": f"{last_stats['total_weighted_loss']:.4f}",
+                        "lr": f"{lr:.2e}",
+                        "grad": f"{float(grad_norm.detach().cpu()):.2f}",
+                    },
+                    refresh=False,
+                )
             if should_log or should_eval:
                 row = {
                     "step": step,
                     "epoch_fraction": step * args.batch_size / max(len(train_dataset), 1),
-                    "learning_rate": float(scheduler.get_last_lr()[0]),
+                    "learning_rate": lr,
                     "grad_norm": float(grad_norm.detach().cpu()),
                     "elapsed_sec": time.time() - start_time,
                     **last_stats,
                 }
                 if should_eval:
+                    progress.write(f"[eval] {run_label} step={step}: running validation...")
                     row.update(evaluate_weighted_loss(model, val_loader, device, max_batches=args.eval_batches, use_bf16=use_bf16))
                     row["val_tf_count_acc"] = quick_teacher_forced_accuracy(
                         model,
@@ -308,10 +344,29 @@ def train(args: argparse.Namespace) -> Path:
                         limit=args.eval_limit,
                         use_bf16=use_bf16,
                     )
+                    progress.write(
+                        "[eval] "
+                        f"{run_label} step={step}: "
+                        f"val_loss={row.get('val_total_weighted_loss')} "
+                        f"val_tf_acc={row.get('val_tf_count_acc')}"
+                    )
+                    progress.set_postfix(
+                        {
+                            "loss": f"{last_stats['total_weighted_loss']:.4f}",
+                            "val": (
+                                "nan"
+                                if row.get("val_total_weighted_loss") is None
+                                else f"{row['val_total_weighted_loss']:.4f}"
+                            ),
+                            "tf": f"{row['val_tf_count_acc']:.3f}",
+                            "lr": f"{lr:.2e}",
+                        },
+                        refresh=False,
+                    )
                 append_jsonl(row, log_path)
 
             if args.save_every > 0 and step % args.save_every == 0:
-                save_checkpoint(
+                checkpoint_dir = save_checkpoint(
                     model=model,
                     tokenizer=tokenizer,
                     optimizer=optimizer,
@@ -320,6 +375,7 @@ def train(args: argparse.Namespace) -> Path:
                     out_dir=out_dir,
                     name=f"step_{step:08d}",
                 )
+                progress.write(f"[save] {run_label} step={step}: {checkpoint_dir}")
             if step >= args.max_steps:
                 break
     progress.close()

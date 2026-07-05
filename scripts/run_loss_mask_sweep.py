@@ -27,7 +27,7 @@ def _resolve(path: str | Path) -> Path:
 
 
 def _run(cmd: list[str], *, dry_run: bool) -> None:
-    print("$", " ".join(cmd))
+    print("$", " ".join(cmd), flush=True)
     if dry_run:
         return
     env = os.environ.copy()
@@ -52,7 +52,9 @@ def preflight_data_dir(data_dir: str | Path, eval_splits: str) -> None:
     missing_text = ", ".join(missing)
     raise FileNotFoundError(
         f"Missing dataset files under {data_path}: {missing_text}\n\n"
-        "Generate the dataset before running the sweep. For the full v0 sweep, run:\n"
+        "Generate the dataset before running the sweep. For the notebook's single-seed full v0 sweep, run:\n"
+        "  python scripts/run_pipeline.py --config configs/experiment/v0_seed0.yaml --stage data\n\n"
+        "For the three-seed full v0 sweep, run:\n"
         "  python scripts/run_pipeline.py --config configs/experiment/v0.yaml --stage data\n\n"
         "For the small Colab/debug dataset, run:\n"
         "  python scripts/run_pipeline.py --config configs/experiment/debug.yaml --stage data\n"
@@ -81,53 +83,81 @@ def main() -> None:
         preflight_data_dir(args.data_dir, args.eval_splits)
 
     seeds = [int(part) for part in args.seeds.split(",") if part.strip()]
-    for seed in seeds:
-        for loss_mask, final_weight in REGIMES:
-            name = regime_name(loss_mask, final_weight)
-            run_dir = Path(args.out_root) / args.model_name / f"{name}_seed{seed}"
-            train_cmd = [
-                sys.executable,
-                "-m",
-                "trace_counting.train",
-                "--data_dir",
-                str(args.data_dir),
-                "--model_config",
-                str(args.model_config),
-                "--loss_mask",
-                loss_mask,
-                "--seed",
-                str(seed),
-                "--out_dir",
-                str(run_dir),
-                "--max_steps",
-                str(args.max_steps),
-                "--batch_size",
-                str(args.batch_size),
+    run_specs = [(seed, loss_mask, final_weight) for seed in seeds for loss_mask, final_weight in REGIMES]
+    print(
+        "\n".join(
+            [
+                "",
+                "=" * 88,
+                f"Loss-mask sweep: {len(run_specs)} training runs",
+                f"data_dir={args.data_dir}",
+                f"model={args.model_name} config={args.model_config}",
+                f"seeds={','.join(str(seed) for seed in seeds)} max_steps={args.max_steps}",
+                "=" * 88,
             ]
-            if final_weight is not None:
-                train_cmd += ["--final_weight", str(final_weight)]
-            if args.device:
-                train_cmd += ["--device", args.device]
-            _run(train_cmd, dry_run=args.dry_run)
+        ),
+        flush=True,
+    )
+    for run_idx, (seed, loss_mask, final_weight) in enumerate(run_specs, start=1):
+        name = regime_name(loss_mask, final_weight)
+        run_dir = Path(args.out_root) / args.model_name / f"{name}_seed{seed}"
+        print(
+            "\n".join(
+                [
+                    "",
+                    "-" * 88,
+                    f"RUN {run_idx}/{len(run_specs)}: seed={seed} loss_mask={loss_mask}"
+                    + ("" if final_weight is None else f" final_weight={final_weight:g}"),
+                    f"run_dir={run_dir}",
+                    "-" * 88,
+                ]
+            ),
+            flush=True,
+        )
+        train_cmd = [
+            sys.executable,
+            "-m",
+            "trace_counting.train",
+            "--data_dir",
+            str(args.data_dir),
+            "--model_config",
+            str(args.model_config),
+            "--loss_mask",
+            loss_mask,
+            "--seed",
+            str(seed),
+            "--out_dir",
+            str(run_dir),
+            "--max_steps",
+            str(args.max_steps),
+            "--batch_size",
+            str(args.batch_size),
+        ]
+        if final_weight is not None:
+            train_cmd += ["--final_weight", str(final_weight)]
+        if args.device:
+            train_cmd += ["--device", args.device]
+        _run(train_cmd, dry_run=args.dry_run)
 
-            eval_cmd = [
-                sys.executable,
-                "-m",
-                "trace_counting.eval",
-                "--checkpoint",
-                str(run_dir / "checkpoints" / "final"),
-                "--data_dir",
-                str(args.data_dir),
-                "--splits",
-                args.eval_splits,
-                "--out_dir",
-                str(run_dir / "eval"),
-            ]
-            if args.eval_limit is not None:
-                eval_cmd += ["--limit", str(args.eval_limit)]
-            if args.device:
-                eval_cmd += ["--device", args.device]
-            _run(eval_cmd, dry_run=args.dry_run)
+        print(f"[eval] RUN {run_idx}/{len(run_specs)}: evaluating {run_dir}", flush=True)
+        eval_cmd = [
+            sys.executable,
+            "-m",
+            "trace_counting.eval",
+            "--checkpoint",
+            str(run_dir / "checkpoints" / "final"),
+            "--data_dir",
+            str(args.data_dir),
+            "--splits",
+            args.eval_splits,
+            "--out_dir",
+            str(run_dir / "eval"),
+        ]
+        if args.eval_limit is not None:
+            eval_cmd += ["--limit", str(args.eval_limit)]
+        if args.device:
+            eval_cmd += ["--device", args.device]
+        _run(eval_cmd, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
