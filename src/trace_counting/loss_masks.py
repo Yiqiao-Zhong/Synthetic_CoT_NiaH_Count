@@ -46,7 +46,9 @@ def supervised_indices_for_mask(
         return set(range(1, spans["eos_idx"] + 1))
     if loss_mask in {"completion_only", "completion_final_weighted"}:
         return set(range(spans["think_open_idx"], spans["eos_idx"] + 1))
-    indices = {spans["count_idx"]}
+    count_start = spans.get("count_start_idx", spans["count_idx"])
+    count_end = spans.get("count_end_exclusive", spans["count_idx"] + 1)
+    indices = set(range(count_start, count_end))
     if final_count_only_include_eos:
         indices.add(spans["eos_idx"])
     return indices
@@ -75,7 +77,10 @@ def build_labels_and_weights(
 
     spans = example["spans"]
     if loss_mask in {"full_sequence_final_weighted", "completion_final_weighted"}:
-        weights[spans["count_idx"]] = float(final_weight)
+        count_start = spans.get("count_start_idx", spans["count_idx"])
+        count_end = spans.get("count_end_exclusive", spans["count_idx"] + 1)
+        for idx in range(count_start, count_end):
+            weights[idx] = float(final_weight)
         if spans["eos_idx"] in supervised:
             weights[spans["eos_idx"]] = float(eos_weight)
     elif loss_mask == "final_count_only" and final_count_only_include_eos:
@@ -95,10 +100,17 @@ def token_segment(example: dict, idx: int) -> str | None:
     if idx in think_indices:
         return "think_boundary_loss"
     if spans["trace_start"] <= idx < spans["trace_end_exclusive"]:
-        return "trace_index_loss" if token.startswith("<I") else "trace_marker_loss"
+        trace_index_indices = {
+            pair["index_idx"]
+            for pair in spans.get("trace_pairs", [])
+            if pair.get("index_idx") is not None
+        }
+        return "trace_index_loss" if idx in trace_index_indices or token.startswith("<I") else "trace_marker_loss"
     if idx == spans["ans_idx"]:
         return "answer_prefix_loss"
-    if idx == spans["count_idx"]:
+    count_start = spans.get("count_start_idx", spans["count_idx"])
+    count_end = spans.get("count_end_exclusive", spans["count_idx"] + 1)
+    if count_start <= idx < count_end:
         return "count_loss"
     if idx == spans["eos_idx"]:
         return "eos_loss"

@@ -17,6 +17,21 @@ SPLIT_OFFSETS = {
     "val_count_ood": 509,
 }
 
+TASK_FORMATS = {
+    "think_trace",
+    "answer_only",
+    "think_trace_repeat_count",
+    "answer_only_repeat_count",
+}
+
+
+def is_think_format(task_format: str) -> bool:
+    return task_format in {"think_trace", "think_trace_repeat_count"}
+
+
+def is_repeat_count_format(task_format: str) -> bool:
+    return task_format in {"think_trace_repeat_count", "answer_only_repeat_count"}
+
 
 def parse_int_list(value: str | list[int] | tuple[int, ...]) -> list[int]:
     if isinstance(value, (list, tuple)):
@@ -53,8 +68,8 @@ def make_example(
     noise_vocab: list[str] | tuple[str, ...] | None = None,
     task_format: str = "think_trace",
 ) -> dict:
-    if task_format not in {"think_trace", "answer_only"}:
-        raise ValueError("task_format must be 'think_trace' or 'answer_only'")
+    if task_format not in TASK_FORMATS:
+        raise ValueError(f"task_format must be one of {sorted(TASK_FORMATS)}")
     if count < 0 or count > min(seq_len, max_count):
         raise ValueError(f"Invalid count={count} for seq_len={seq_len}, max_count={max_count}")
     if noise_vocab is None:
@@ -74,15 +89,13 @@ def make_example(
 
     trace_tokens: list[str] = []
     for k, marker in enumerate(positive_markers, start=1):
-        trace_tokens.extend([f"<I{k}>", marker])
+        trace_tokens.extend(["<TICK>" if is_repeat_count_format(task_format) else f"<I{k}>", marker])
 
     source_start = 1
     source_end_exclusive = 1 + seq_len
-    if task_format == "think_trace":
-        full_tokens = ["<BOS>"] + source_tokens + ["<Think>"] + trace_tokens + [
-            "<Think>",
-            "<ANS>",
-            f"<C{count}>",
+    answer_tokens = ["<CNT>"] * count if is_repeat_count_format(task_format) else [f"<C{count}>"]
+    if is_think_format(task_format):
+        full_tokens = ["<BOS>"] + source_tokens + ["<Think>"] + trace_tokens + ["<Think>", "<ANS>"] + answer_tokens + [
             "<EOS>",
         ]
         think_open_idx = source_end_exclusive
@@ -90,21 +103,25 @@ def make_example(
         trace_end_exclusive = trace_start + len(trace_tokens)
         think_close_idx = trace_end_exclusive
         ans_idx = think_close_idx + 1
-        count_idx = ans_idx + 1
-        eos_idx = count_idx + 1
+        count_start_idx = ans_idx + 1
+        count_end_exclusive = count_start_idx + len(answer_tokens)
+        count_idx = count_start_idx if answer_tokens else count_end_exclusive
+        eos_idx = count_end_exclusive
     else:
-        full_tokens = ["<BOS>"] + source_tokens + ["<ANS>", f"<C{count}>", "<EOS>"]
+        full_tokens = ["<BOS>"] + source_tokens + ["<ANS>"] + answer_tokens + ["<EOS>"]
         think_open_idx = None
         trace_start = source_end_exclusive
         trace_end_exclusive = source_end_exclusive
         think_close_idx = None
         ans_idx = source_end_exclusive
-        count_idx = ans_idx + 1
-        eos_idx = count_idx + 1
+        count_start_idx = ans_idx + 1
+        count_end_exclusive = count_start_idx + len(answer_tokens)
+        count_idx = count_start_idx if answer_tokens else count_end_exclusive
+        eos_idx = count_end_exclusive
 
     trace_pairs = []
     for pair_idx, (source_pos, marker) in enumerate(zip(positions, positive_markers), start=1):
-        index_idx = trace_start + 2 * (pair_idx - 1) if task_format == "think_trace" else None
+        index_idx = trace_start + 2 * (pair_idx - 1) if is_think_format(task_format) else None
         trace_pairs.append(
             {
                 "k": pair_idx,
@@ -125,7 +142,8 @@ def make_example(
         "positive_positions_source": positions,
         "positive_markers": positive_markers,
         "trace_tokens": trace_tokens,
-        "answer_token": f"<C{count}>",
+        "answer_token": f"<C{count}>" if not is_repeat_count_format(task_format) else "<CNT>",
+        "answer_tokens": answer_tokens,
         "full_tokens": full_tokens,
         "task_format": task_format,
         "spans": {
@@ -136,6 +154,8 @@ def make_example(
             "trace_end_exclusive": trace_end_exclusive,
             "think_close_idx": think_close_idx,
             "ans_idx": ans_idx,
+            "count_start_idx": count_start_idx,
+            "count_end_exclusive": count_end_exclusive,
             "count_idx": count_idx,
             "eos_idx": eos_idx,
             "trace_pairs": trace_pairs,
@@ -152,18 +172,25 @@ def validate_example(example: dict) -> None:
     task_format = example.get("task_format", "think_trace")
     assert full_tokens[0] == "<BOS>"
     assert full_tokens[-1] == "<EOS>"
-    if task_format == "think_trace":
+    if is_think_format(task_format):
         assert full_tokens[spans["think_open_idx"]] == "<Think>"
         assert full_tokens[spans["think_close_idx"]] == "<Think>"
         assert len(example["trace_tokens"]) == 2 * count
-    elif task_format == "answer_only":
+        expected_index_token = "<TICK>" if is_repeat_count_format(task_format) else None
+        if expected_index_token is not None:
+            assert example["trace_tokens"][0::2] == [expected_index_token] * count
+    elif task_format in {"answer_only", "answer_only_repeat_count"}:
         assert spans["think_open_idx"] is None
         assert spans["think_close_idx"] is None
         assert spans["trace_start"] == spans["trace_end_exclusive"]
     else:
         raise AssertionError(f"Unknown task_format={task_format!r}")
     assert full_tokens[spans["ans_idx"]] == "<ANS>"
-    assert full_tokens[spans["count_idx"]] == f"<C{count}>"
+    if is_repeat_count_format(task_format):
+        assert full_tokens[spans["count_start_idx"] : spans["count_end_exclusive"]] == ["<CNT>"] * count
+    else:
+        assert full_tokens[spans["count_idx"]] == f"<C{count}>"
+        assert spans["count_end_exclusive"] == spans["count_start_idx"] + 1
     assert spans["eos_idx"] == len(full_tokens) - 1
     assert len(example["positive_positions_source"]) == count
     source_marker_tokens = [full_tokens[pair["source_idx"]] for pair in spans["trace_pairs"]]
@@ -328,7 +355,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--examples_per_pair_train", type=int, default=512)
     parser.add_argument("--examples_per_pair_val", type=int, default=128)
     parser.add_argument("--seeds", default="0,1,2")
-    parser.add_argument("--task_format", default="think_trace", choices=["think_trace", "answer_only"])
+    parser.add_argument("--task_format", default="think_trace", choices=sorted(TASK_FORMATS))
     parser.add_argument("--no_legacy_shifts", action="store_true")
     parser.add_argument("--debug", action="store_true", help="Use the tiny debug split from the pipeline spec.")
     return parser

@@ -28,5 +28,5 @@ def build_model_from_config(config: dict, tokenizer: VocabTokenizer) -> GPT2LMHe
     return GPT2LMHeadModel(gpt2_config)
 
 
-def load_model_from_checkpoint(checkpoint: str | Path) -> GPT2LMHeadModel:
-    return GPT2LMHeadModel.from_pretrained(str(checkpoint))
+def load_model_from_checkpoint(checkpoint: str | Path, **kwargs) -> GPT2LMHeadModel:
+    return GPT2LMHeadModel.from_pretrained(str(checkpoint), **kwargs)

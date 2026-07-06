@@ -122,11 +122,19 @@ def quick_teacher_forced_accuracy(
     limit: int = 512,
     use_bf16: bool = False,
 ) -> float:
+    from .eval import is_repeat_count_format, teacher_forced_predict_repeated_count
+
     model.eval()
     count_ids = torch.tensor(tokenizer.count_token_ids, dtype=torch.long, device=device)
     correct = 0
     total = 0
     for example in examples[:limit]:
+        if is_repeat_count_format(example.get("task_format", "think_trace")):
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                pred = teacher_forced_predict_repeated_count(model, tokenizer, example, device)
+            correct += int(bool(pred["correct"]))
+            total += 1
+            continue
         ans_idx = example["spans"]["ans_idx"]
         input_ids = torch.tensor([tokenizer.encode(example["full_tokens"][: ans_idx + 1])], dtype=torch.long, device=device)
         attention_mask = torch.ones_like(input_ids)

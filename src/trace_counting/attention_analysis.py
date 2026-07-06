@@ -88,7 +88,8 @@ def run_attention_analysis(args: argparse.Namespace) -> list[dict[str, Any]]:
     data_dir = Path(args.data_dir)
     out_dir = ensure_dir(args.out_dir)
     tokenizer = VocabTokenizer.load(data_dir / "vocab.json")
-    model = load_model_from_checkpoint(checkpoint).to(device)
+    model = load_model_from_checkpoint(checkpoint, attn_implementation="eager").to(device)
+    model.config.output_attentions = True
     model.eval()
     query_anchors = {part.strip() for part in args.query_anchors.split(",") if part.strip()}
     splits = [part.strip() for part in args.splits.split(",") if part.strip()]
@@ -101,9 +102,12 @@ def run_attention_analysis(args: argparse.Namespace) -> list[dict[str, Any]]:
             input_ids = torch.tensor([ids], dtype=torch.long, device=device)
             outputs = model(input_ids=input_ids, output_attentions=True)
             attentions = outputs.attentions
-            if attentions is None:
+            if not attentions or any(layer_attention is None for layer_attention in attentions):
                 raise RuntimeError(
-                    "Model did not return attentions. Make sure the model forward supports output_attentions=True."
+                    "Model did not return attention tensors. This usually means the checkpoint was loaded "
+                    "with an attention backend that does not materialize attention weights. "
+                    "The attention analysis loads GPT-2 with attn_implementation='eager'; "
+                    "if this still fails, check the installed transformers/torch versions."
                 )
             spans = example["spans"]
             source_indices = list(range(spans["source_start"], spans["source_end_exclusive"]))
@@ -182,6 +186,11 @@ def run_attention_analysis(args: argparse.Namespace) -> list[dict[str, Any]]:
         },
         out_dir / "attention_config.json",
     )
+    if not per_head_rows:
+        raise RuntimeError(
+            "Attention analysis produced zero rows. Check --query_anchors and the dataset spans. "
+            "For the default v1 setting, at least the 'ans' anchor should produce rows."
+        )
     print(f"saved attention analysis to {out_dir}")
     return summary_rows
 

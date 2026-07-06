@@ -16,13 +16,7 @@ def _is_complete_artifact(path: Path) -> bool:
         return False
     if path.suffix.lower() == ".csv":
         with path.open("r", encoding="utf-8", errors="ignore") as f:
-            non_empty_lines = 0
-            for line in f:
-                if line.strip():
-                    non_empty_lines += 1
-                if non_empty_lines >= 2:
-                    return True
-        return False
+            return sum(1 for line in f if line.strip()) >= 2
     return True
 
 
@@ -31,7 +25,7 @@ def _run(cmd: list[str], *, skip_if: Path | None = None) -> None:
         print(f"[skip] {skip_if}", flush=True)
         return
     if skip_if is not None and skip_if.exists():
-        print(f"[rerun] found empty/incomplete artifact: {skip_if}", flush=True)
+        print(f"[rerun] incomplete artifact: {skip_if}", flush=True)
     env = os.environ.copy()
     env["PYTHONPATH"] = str(SRC) + os.pathsep + env.get("PYTHONPATH", "")
     start = time.time()
@@ -47,10 +41,10 @@ def _python_module(module: str, *args: str) -> list[str]:
 def _stage(label: str, fn) -> None:
     start = time.time()
     print("\n" + "=" * 88, flush=True)
-    print(f"[v1] START {label}", flush=True)
+    print(f"[v2] START {label}", flush=True)
     print("=" * 88, flush=True)
     fn()
-    print(f"[v1] DONE {label} in {(time.time() - start) / 60:.1f}m", flush=True)
+    print(f"[v2] DONE {label} in {(time.time() - start) / 60:.1f}m", flush=True)
 
 
 def generate_data(args: argparse.Namespace, *, task_format: str, out_dir: Path) -> None:
@@ -221,7 +215,7 @@ def projection_run(args: argparse.Namespace, *, data_dir: Path, run_dir: Path) -
 def steering_run(args: argparse.Namespace, *, data_dir: Path, run_dir: Path) -> None:
     _run(
         _python_module(
-            "trace_counting.steering",
+            "trace_counting.generation_steering",
             "--checkpoint",
             str(run_dir / "checkpoints" / "final"),
             "--data_dir",
@@ -231,18 +225,14 @@ def steering_run(args: argparse.Namespace, *, data_dir: Path, run_dir: Path) -> 
             "--direction_dir",
             str(run_dir / "directions"),
             "--out_dir",
-            str(run_dir / "steering"),
+            str(run_dir / "generation_steering"),
             "--limit",
             str(args.steering_limit),
-            "--layer",
-            "final",
-            "--anchor",
-            "ans",
-            "--target",
-            "total_count",
+            "--direction_specs",
+            args.steering_direction_specs,
             f"--alphas={args.steering_alphas}",
         ),
-        skip_if=run_dir / "steering" / "steering_summary.csv" if args.skip_completed else None,
+        skip_if=run_dir / "generation_steering" / "generation_steering_summary.csv" if args.skip_completed else None,
     )
 
 
@@ -268,9 +258,9 @@ def attention_run(args: argparse.Namespace, *, data_dir: Path, run_dir: Path) ->
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run Trace Count v1 NiaH-like think/no-think experiment.")
-    parser.add_argument("--out_root", default="runs/trace_count_v1_seed0")
-    parser.add_argument("--data_root", default="data/trace_count_v1_seed0")
+    parser = argparse.ArgumentParser(description="Run Trace Count v2 repeated-token count experiment.")
+    parser.add_argument("--out_root", default="runs/trace_count_v2_seed0")
+    parser.add_argument("--data_root", default="data/trace_count_v2_seed0")
     parser.add_argument("--model_config", default="configs/model/small_main.yaml")
     parser.add_argument("--model_name", default="small_main")
     parser.add_argument("--seed", type=int, default=0)
@@ -297,16 +287,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--direction_anchors", default="ans,think_close,source_marker,trace_index,trace_marker")
     parser.add_argument(
         "--projection_specs",
-        default="layer_1:source_marker:running_count,layer_4:source_marker:running_count,layer_4:ans:total_count",
+        default=(
+            "layer_2:ans:total_count,layer_4:ans:total_count,"
+            "layer_2:source_marker:running_count,layer_4:source_marker:running_count,"
+            "layer_2:think_close:total_count,layer_4:think_close:total_count,"
+            "layer_2:trace_marker:k,layer_4:trace_marker:k"
+        ),
     )
-    parser.add_argument("--steering_limit", type=int, default=1024)
+    parser.add_argument("--steering_limit", type=int, default=512)
+    parser.add_argument(
+        "--steering_direction_specs",
+        default=(
+            "layer_2:ans:total_count,layer_4:ans:total_count,"
+            "layer_2:source_marker:running_count,layer_4:source_marker:running_count,"
+            "layer_2:think_close:total_count,layer_4:think_close:total_count,"
+            "layer_2:trace_marker:k,layer_4:trace_marker:k"
+        ),
+    )
     parser.add_argument("--attention_limit", type=int, default=512)
     parser.add_argument("--attention_splits", default="val_id,val_count_ood")
     parser.add_argument("--attention_query_anchors", default="ans,think_close")
     parser.add_argument("--save_every", type=int, default=0)
     parser.add_argument("--progress_every", type=int, default=100)
     parser.add_argument("--steering_alphas", default="-4,-2,-1,0,1,2,4")
-    parser.add_argument("--variants", default="think_trace,answer_only")
+    parser.add_argument("--variants", default="think_trace_repeat_count,answer_only_repeat_count")
     parser.add_argument(
         "--stage",
         default="all",
@@ -321,8 +325,8 @@ def main() -> None:
     out_root = ROOT / args.out_root
     data_root = ROOT / args.data_root
     known_variants = {
-        "think_trace": "think_trace_full_sequence_seed0",
-        "answer_only": "answer_only_full_sequence_seed0",
+        "think_trace_repeat_count": "think_trace_repeat_count_full_sequence_seed0",
+        "answer_only_repeat_count": "answer_only_repeat_count_full_sequence_seed0",
     }
     requested_variants = [part.strip() for part in args.variants.split(",") if part.strip()]
     unknown = sorted(set(requested_variants) - set(known_variants))
@@ -336,10 +340,11 @@ def main() -> None:
             [
                 "",
                 "=" * 88,
-                "[v1] Trace Count NiaH-like pipeline",
+                "[v2] Trace Count repeated-count-token pipeline",
                 f"variants={','.join(requested_variants)} stages={','.join(stages)}",
                 f"data_root={data_root}",
                 f"out_root={out_root}",
+                f"id_counts={args.id_counts} ood_counts={args.ood_counts} lengths={args.lengths}",
                 f"max_steps={args.max_steps} eval_mode={args.eval_mode} eval_limit={args.eval_limit}",
                 (
                     f"probe_limit={args.probe_limit} projection_limit={args.projection_limit} "
@@ -363,12 +368,9 @@ def main() -> None:
         if "probe" in stages:
             _stage(f"{task_format}: probe + ridge directions", lambda: probe_run(args, data_dir=data_dir, run_dir=run_dir))
         if "projection" in stages:
-            _stage(
-                f"{task_format}: OOD direction projection",
-                lambda: projection_run(args, data_dir=data_dir, run_dir=run_dir),
-            )
+            _stage(f"{task_format}: OOD direction projection", lambda: projection_run(args, data_dir=data_dir, run_dir=run_dir))
         if "steering" in stages:
-            _stage(f"{task_format}: steering", lambda: steering_run(args, data_dir=data_dir, run_dir=run_dir))
+            _stage(f"{task_format}: generation steering", lambda: steering_run(args, data_dir=data_dir, run_dir=run_dir))
         if "attention" in stages:
             _stage(f"{task_format}: attention", lambda: attention_run(args, data_dir=data_dir, run_dir=run_dir))
 

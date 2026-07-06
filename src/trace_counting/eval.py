@@ -15,6 +15,18 @@ from .io_utils import ensure_dir, read_jsonl, save_json
 from .tokenizer import VocabTokenizer, parse_count_token
 
 
+REPEAT_COUNT_FORMATS = {"think_trace_repeat_count", "answer_only_repeat_count"}
+THINK_FORMATS = {"think_trace", "think_trace_repeat_count"}
+
+
+def is_repeat_count_format(task_format: str) -> bool:
+    return task_format in REPEAT_COUNT_FORMATS
+
+
+def is_think_format(task_format: str) -> bool:
+    return task_format in THINK_FORMATS
+
+
 def resolve_checkpoint_path(path: str | Path) -> Path:
     path = Path(path)
     if path.exists() and (path / "config.json").exists():
@@ -48,6 +60,9 @@ def teacher_forced_predict(
     example: dict,
     device: str,
 ) -> dict[str, Any]:
+    task_format = example.get("task_format", "think_trace")
+    if is_repeat_count_format(task_format):
+        return teacher_forced_predict_repeated_count(model, tokenizer, example, device)
     ans_idx = example["spans"]["ans_idx"]
     prefix_ids = tokenizer.encode(example["full_tokens"][: ans_idx + 1])
     input_ids = torch.tensor([prefix_ids], dtype=torch.long, device=device)
@@ -62,6 +77,44 @@ def teacher_forced_predict(
         "pred_count": pred_count,
         "count_nll": float(-log_probs[true_count].detach().cpu()),
         "correct": pred_count == true_count,
+    }
+
+
+@torch.no_grad()
+def teacher_forced_predict_repeated_count(
+    model: torch.nn.Module,
+    tokenizer: VocabTokenizer,
+    example: dict,
+    device: str,
+) -> dict[str, Any]:
+    spans = example["spans"]
+    ans_idx = int(spans["ans_idx"])
+    eos_idx = int(spans["eos_idx"])
+    input_ids = torch.tensor([tokenizer.encode(example["full_tokens"][: eos_idx + 1])], dtype=torch.long, device=device)
+    attention_mask = torch.ones_like(input_ids)
+    logits = model(input_ids=input_ids, attention_mask=attention_mask).logits[0]
+    target_tokens = example["full_tokens"][ans_idx + 1 : eos_idx + 1]
+    pred_ids = torch.argmax(logits[ans_idx:eos_idx], dim=-1).detach().cpu().tolist()
+    pred_tokens = tokenizer.decode(pred_ids)
+    pred_count = 0
+    saw_eos = False
+    for token in pred_tokens:
+        if token == "<CNT>" and not saw_eos:
+            pred_count += 1
+        elif token == "<EOS>":
+            saw_eos = True
+            break
+        else:
+            break
+    true_count = int(example["count"])
+    log_probs = F.log_softmax(logits[ans_idx:eos_idx], dim=-1)
+    target_ids = tokenizer.encode(target_tokens)
+    nll = -log_probs[torch.arange(len(target_ids), device=device), torch.tensor(target_ids, device=device)]
+    return {
+        "pred_count": pred_count if saw_eos or pred_count > 0 else 0,
+        "count_nll": float(nll.mean().detach().cpu()) if len(target_ids) else None,
+        "correct": pred_tokens == target_tokens,
+        "pred_answer_tokens": pred_tokens,
     }
 
 
@@ -95,6 +148,10 @@ def _find_token(tokens: list[str], token: str, start: int = 0) -> int | None:
 
 
 def parse_generation(tokens: list[str], *, task_format: str = "think_trace") -> dict[str, Any]:
+    if task_format == "answer_only_repeat_count":
+        return parse_answer_only_repeat_count_generation(tokens)
+    if task_format == "think_trace_repeat_count":
+        return parse_think_repeat_count_generation(tokens)
     if task_format == "answer_only":
         return parse_answer_only_generation(tokens)
     if task_format != "think_trace":
@@ -141,6 +198,73 @@ def parse_generation(tokens: list[str], *, task_format: str = "think_trace") -> 
         "answer_token": answer_token,
         "pred_count": pred_count,
         "eos_after_count": eos_after_count,
+    }
+
+
+def parse_think_repeat_count_generation(tokens: list[str]) -> dict[str, Any]:
+    first_think = _find_token(tokens, "<Think>")
+    if first_think is None:
+        return {"format_valid": False, "invalid_reason": "missing_first_think", "trace_tokens": [], "pred_count": None}
+    second_think = _find_token(tokens, "<Think>", first_think + 1)
+    if second_think is None:
+        return {"format_valid": False, "invalid_reason": "missing_second_think", "trace_tokens": tokens[first_think + 1 :], "pred_count": None}
+    ans_idx = _find_token(tokens, "<ANS>", second_think + 1)
+    if ans_idx is None:
+        return {
+            "format_valid": False,
+            "invalid_reason": "missing_ans",
+            "trace_tokens": tokens[first_think + 1 : second_think],
+            "pred_count": None,
+        }
+    parsed = _parse_repeated_count_answer(tokens, ans_idx)
+    parsed.update(
+        {
+            "first_think_idx": first_think,
+            "second_think_idx": second_think,
+            "ans_idx": ans_idx,
+            "trace_tokens": tokens[first_think + 1 : second_think],
+        }
+    )
+    return parsed
+
+
+def parse_answer_only_repeat_count_generation(tokens: list[str]) -> dict[str, Any]:
+    ans_idx = _find_token(tokens, "<ANS>")
+    if ans_idx is None:
+        return {"format_valid": False, "invalid_reason": "missing_ans", "trace_tokens": [], "pred_count": None}
+    parsed = _parse_repeated_count_answer(tokens, ans_idx)
+    parsed.update({"ans_idx": ans_idx, "trace_tokens": []})
+    return parsed
+
+
+def _parse_repeated_count_answer(tokens: list[str], ans_idx: int) -> dict[str, Any]:
+    eos_idx = _find_token(tokens, "<EOS>", ans_idx + 1)
+    if eos_idx is None:
+        answer_tokens = tokens[ans_idx + 1 :]
+        valid_prefix = all(token == "<CNT>" for token in answer_tokens)
+        return {
+            "format_valid": False,
+            "invalid_reason": "missing_eos" if valid_prefix else "invalid_count_token",
+            "answer_tokens": answer_tokens,
+            "pred_count": None,
+            "eos_after_count": False,
+        }
+    answer_tokens = tokens[ans_idx + 1 : eos_idx]
+    if any(token != "<CNT>" for token in answer_tokens):
+        return {
+            "format_valid": False,
+            "invalid_reason": "invalid_count_token",
+            "answer_tokens": answer_tokens,
+            "pred_count": None,
+            "eos_after_count": True,
+        }
+    return {
+        "format_valid": True,
+        "invalid_reason": None,
+        "answer_tokens": answer_tokens,
+        "answer_token": "<CNT>",
+        "pred_count": len(answer_tokens),
+        "eos_after_count": True,
     }
 
 
@@ -309,7 +433,7 @@ def evaluate_split(
             task_format = example.get("task_format", "think_trace")
             parsed = parse_generation(generated, task_format=task_format)
             if parsed.get("format_valid", False):
-                if task_format == "answer_only":
+                if task_format in {"answer_only", "answer_only_repeat_count"}:
                     t_metrics = {
                         "trace_exact_match": None,
                         "trace_index_accuracy": None,
@@ -379,7 +503,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     tokenizer = VocabTokenizer.load(data_dir / "vocab.json")
     model = load_model_from_checkpoint(checkpoint).to(device)
     model.eval()
-    max_new_tokens = args.max_new_tokens or (2 * int(tokenizer.metadata.get("max_count", 64)) + 4)
+    max_new_tokens = args.max_new_tokens or (3 * int(tokenizer.metadata.get("max_count", 64)) + 4)
 
     summary = {}
     for split in [part.strip() for part in args.splits.split(",") if part.strip()]:

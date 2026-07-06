@@ -102,7 +102,7 @@ def anchor_positions(example: dict, anchors: set[str]) -> list[dict[str, Any]]:
                             "anchor": "trace_index",
                             "idx": pair["index_idx"],
                             "k": pair["k"],
-                            "token": f"<I{pair['k']}>",
+                            "token": example["full_tokens"][pair["index_idx"]],
                         }
                     )
             if "trace_marker" in anchors:

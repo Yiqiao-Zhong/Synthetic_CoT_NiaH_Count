@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from trace_counting.loss_masks import build_labels_and_weights
+from trace_counting.loss_masks import build_labels_and_weights, token_segment
 from trace_counting.tokenizer import build_default_tokenizer
 
 
@@ -90,3 +90,82 @@ def test_weighted_regimes_only_upweight_count_token() -> None:
                 continue
             if labels[idx] != -100:
                 assert weight == 1.0
+
+
+def repeat_count_example() -> dict:
+    full_tokens = [
+        "<BOS>",
+        "N4",
+        "X",
+        "N9",
+        "Y",
+        "N2",
+        "<Think>",
+        "<TICK>",
+        "X",
+        "<TICK>",
+        "Y",
+        "<Think>",
+        "<ANS>",
+        "<CNT>",
+        "<CNT>",
+        "<EOS>",
+    ]
+    return {
+        "example_id": "repeat",
+        "split": "train",
+        "seed": 0,
+        "seq_len": 5,
+        "count": 2,
+        "source_tokens": full_tokens[1:6],
+        "positive_positions_source": [1, 3],
+        "positive_markers": ["X", "Y"],
+        "trace_tokens": full_tokens[7:11],
+        "answer_token": "<CNT>",
+        "answer_tokens": ["<CNT>", "<CNT>"],
+        "full_tokens": full_tokens,
+        "task_format": "think_trace_repeat_count",
+        "spans": {
+            "source_start": 1,
+            "source_end_exclusive": 6,
+            "think_open_idx": 6,
+            "trace_start": 7,
+            "trace_end_exclusive": 11,
+            "think_close_idx": 11,
+            "ans_idx": 12,
+            "count_start_idx": 13,
+            "count_end_exclusive": 15,
+            "count_idx": 13,
+            "eos_idx": 15,
+            "trace_pairs": [
+                {"k": 1, "index_idx": 7, "marker_idx": 8, "marker": "X", "source_idx": 2},
+                {"k": 2, "index_idx": 9, "marker_idx": 10, "marker": "Y", "source_idx": 4},
+            ],
+        },
+    }
+
+
+def test_repeat_count_masks_supervise_every_count_unit() -> None:
+    tokenizer = build_default_tokenizer(max_count=10)
+    example = repeat_count_example()
+    labels, weights = build_labels_and_weights(
+        example,
+        tokenizer,
+        loss_mask="completion_final_weighted",
+        final_weight=5.0,
+    )
+    assert supervised_set(labels) == set(range(6, 16))
+    assert labels[13] != -100
+    assert labels[14] != -100
+    assert weights[13] == 5.0
+    assert weights[14] == 5.0
+    assert weights[15] == 1.0
+
+
+def test_repeat_count_tick_tokens_are_trace_index_segment() -> None:
+    example = repeat_count_example()
+    assert token_segment(example, 7) == "trace_index_loss"
+    assert token_segment(example, 8) == "trace_marker_loss"
+    assert token_segment(example, 9) == "trace_index_loss"
+    assert token_segment(example, 13) == "count_loss"
+    assert token_segment(example, 14) == "count_loss"

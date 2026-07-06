@@ -23,6 +23,31 @@ def test_parse_answer_only_generation() -> None:
     assert parsed["eos_after_count"] is True
 
 
+def test_parse_repeat_count_answer_only_generation() -> None:
+    parsed = parse_generation(["<ANS>", "<CNT>", "<CNT>", "<CNT>", "<EOS>"], task_format="answer_only_repeat_count")
+    assert parsed["format_valid"] is True
+    assert parsed["pred_count"] == 3
+    assert parsed["answer_tokens"] == ["<CNT>", "<CNT>", "<CNT>"]
+    assert parsed["trace_tokens"] == []
+
+
+def test_parse_repeat_count_think_generation() -> None:
+    parsed = parse_generation(
+        ["<Think>", "<TICK>", "X", "<TICK>", "Y", "<Think>", "<ANS>", "<CNT>", "<CNT>", "<EOS>"],
+        task_format="think_trace_repeat_count",
+    )
+    assert parsed["format_valid"] is True
+    assert parsed["pred_count"] == 2
+    assert parsed["trace_tokens"] == ["<TICK>", "X", "<TICK>", "Y"]
+
+
+def test_parse_repeat_count_rejects_invalid_answer_token() -> None:
+    parsed = parse_generation(["<ANS>", "<CNT>", "<C2>", "<EOS>"], task_format="answer_only_repeat_count")
+    assert parsed["format_valid"] is False
+    assert parsed["invalid_reason"] == "invalid_count_token"
+    assert parsed["pred_count"] is None
+
+
 @pytest.mark.parametrize(
     ("tokens", "reason"),
     [

@@ -27,12 +27,26 @@ If you use Colab, open `notebooks/Trace_Count_v0_Colab.ipynb` and run all cells.
 
 For the more NiaH-like v1 experiment, open `notebooks/Trace_Count_v1_Colab.ipynb`. It trains two all-token next-token-prediction models on shorter sparse-counting data: a `think_trace` model with explicit thinking/count trace tokens and an `answer_only` model without thinking tokens. The v1 notebook evaluates ID counts `0-5` and count-OOD `5-10`, then runs linear probes, ridge count-direction extraction, answer-state steering, and attention-to-needle analysis.
 
+For the cleaner count-OOD v2 experiment, open `notebooks/Trace_Count_v2_Colab.ipynb`. It controls the count-token vocabulary by representing every answer as repeated `<CNT>` tokens: ID uses counts `0-5`, OOD uses counts `6-10`, and both splits use the same count token type. The notebook trains a `think_trace_repeat_count` model and an `answer_only_repeat_count` model, then compares ID/OOD final-count accuracy, multiple ridge count-direction extraction methods, layer-specific generation steering, and attention-to-needle behavior.
+
 Manual v1 run:
 
 ```bash
 python scripts/run_v1_niah_like.py \
   --data_root data/trace_count_v1_seed0 \
   --out_root runs/trace_count_v1_seed0 \
+  --model_config configs/model/small_main.yaml \
+  --max_steps 10000 \
+  --batch_size 128 \
+  --skip_completed
+```
+
+Manual v2 run:
+
+```bash
+python scripts/run_v2_repeat_count.py \
+  --data_root data/trace_count_v2_seed0 \
+  --out_root runs/trace_count_v2_seed0_full_colab \
   --model_config configs/model/small_main.yaml \
   --max_steps 10000 \
   --batch_size 128 \

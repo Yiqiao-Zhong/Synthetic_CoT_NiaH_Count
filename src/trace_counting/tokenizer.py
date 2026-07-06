@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .io_utils import load_json, save_json
 
-SPECIAL_TOKENS = ["<PAD>", "<BOS>", "<EOS>", "<Think>", "<ANS>"]
+SPECIAL_TOKENS = ["<PAD>", "<BOS>", "<EOS>", "<Think>", "<ANS>", "<CNT>", "<TICK>"]
 DEFAULT_POSITIVE_VOCAB = ["X", "Y", "Z"]
 
 
@@ -47,6 +47,14 @@ class VocabTokenizer:
     def count_tokens(self) -> list[str]:
         max_count = int(self.metadata.get("max_count", self._infer_max_count()))
         return [f"<C{k}>" for k in range(max_count + 1)]
+
+    @property
+    def count_unit_token_id(self) -> int:
+        return self.token_to_id["<CNT>"]
+
+    @property
+    def trace_tick_token_id(self) -> int:
+        return self.token_to_id["<TICK>"]
 
     def encode(self, tokens: list[str]) -> list[int]:
         try:
