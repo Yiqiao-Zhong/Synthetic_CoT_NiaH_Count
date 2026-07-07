@@ -102,10 +102,15 @@ def greedy_generate(
     return outputs
 
 
-def summarize_example_rows(rows: list[dict], group_cols: list[str]) -> pd.DataFrame:
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows)
+def summarize_example_rows(rows: list[dict] | pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    if isinstance(rows, pd.DataFrame):
+        if rows.empty:
+            return pd.DataFrame()
+        df = rows.copy()
+    else:
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
     numeric_cols = [col for col in df.columns if col not in group_cols and pd.api.types.is_numeric_dtype(df[col])]
     return df.groupby(group_cols, as_index=False)[numeric_cols].mean()
 

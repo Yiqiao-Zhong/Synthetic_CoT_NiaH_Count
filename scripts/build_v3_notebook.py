@@ -169,6 +169,8 @@ if SKIP_TRAINING:
     cmd.append("--skip_training")
 
 print(" ".join(cmd), flush=True)
+log_file = Path(OUT_ROOT) / "last_pipeline.log"
+log_file.parent.mkdir(parents=True, exist_ok=True)
 proc = subprocess.Popen(
     cmd,
     stdout=subprocess.PIPE,
@@ -178,11 +180,18 @@ proc = subprocess.Popen(
 )
 captured_lines = []
 assert proc.stdout is not None
-for line in proc.stdout:
-    print(line, end="", flush=True)
-    captured_lines.append(line.rstrip("\n"))
+with log_file.open("w", encoding="utf-8") as log:
+    log.write(" ".join(cmd) + "\n")
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        log.write(line)
+        log.flush()
+        captured_lines.append(line.rstrip("\n"))
 returncode = proc.wait()
 if returncode != 0:
+    print(f"\nPipeline failed with return code {returncode}. Log file: {log_file}")
+    print("---- Last 200 log lines ----")
+    print("\n".join(captured_lines[-200:]))
     raise subprocess.CalledProcessError(returncode, cmd)
 
 FINAL_RUN_DIR = None
