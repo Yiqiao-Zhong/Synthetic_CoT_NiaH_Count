@@ -29,6 +29,8 @@ For the more NiaH-like v1 experiment, open `notebooks/Trace_Count_v1_Colab.ipynb
 
 For the controlled marker-trace v2 experiment, open `notebooks/Trace_Count_v2_Colab.ipynb`. This notebook follows `notebooks/pipeline_v2_codex_prompt.md`: fixed prompt length, 64 noise-token types, 10 countable marker-token types, count range `1..10`, and two separately trained random-init decoder-only Transformers (`non_thinking` and `thinking`). It intentionally has no ID/OOD split, no variable sequence length, and no steering. The notebook reports training/eval curves by low/mid/high count bin, exact-count accuracy, hidden-state probes, and attention/retrieval diagnostics.
 
+For the harder v3 experiment, open `notebooks/Trace_Count_v3_Colab.ipynb`. It follows `notebooks/pipeline_v3_codex_prompt.md` and keeps the symbolic setting while adding length generalization to `512/1024`, loss-mask ablations, corrupted-trace readout diagnostics, hidden-state probes, attention retrieval analysis, and single-head ablation. The notebook uses a small RoPE decoder-only Transformer rather than GPT-2 learned absolute position embeddings.
+
 Manual v1 run:
 
 ```bash
@@ -41,7 +43,7 @@ python scripts/run_v1_niah_like.py \
   --skip_completed
 ```
 
-The v2 implementation is self-contained in the Colab notebook. Use `PRESET = "debug"` for a quick end-to-end artifact check, then switch to `PRESET = "main"` for the full 20k-step run.
+The v2/v3 implementations are self-contained in their Colab notebooks. Use `PRESET = "debug"` for a quick end-to-end artifact check, then switch to `PRESET = "main"` for the full 10k-step runs.
 
 ## Full v0 Sweep
 
