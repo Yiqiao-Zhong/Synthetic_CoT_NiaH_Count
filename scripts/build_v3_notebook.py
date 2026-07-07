@@ -37,6 +37,7 @@ the new `pipeline_v3_codex_prompt.md`:
 - Round 3: probes, attention retrieval, and single-head ablation.
 
 中文速记：v3 现在不是 sweep 一堆 objective，而是集中比较两个模型：
+
 1. `non_thinking`: prompt 后直接给 `<Ans>`，只训练最后数字 readout；
 2. `thinking`: prompt 后给 `<Think/>`，训练 indexed trace + 最后数字 readout。
         """
@@ -87,7 +88,7 @@ if INSTALL_PACKAGE and (ROOT / "pyproject.toml").exists():
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", "."], check=True)
 
 import pandas as pd
-from IPython.display import HTML, Markdown, display
+from IPython.display import Image, Markdown, display
 import torch
 
 print("cwd:", ROOT)
@@ -151,7 +152,8 @@ Outputs are written under:
 runs/syn_v3_no_loss/{timestamp}_{preset}/
 ```
 
-At the end it prints `FINAL_RUN_DIR` and `FINAL_REPORT`.
+At the end it prints `FINAL_RUN_DIR`. Tables, figures, and `summary.json` are
+displayed in the following cells.
         """
     ),
     code(
@@ -212,25 +214,40 @@ if returncode != 0:
     raise subprocess.CalledProcessError(returncode, cmd)
 
 FINAL_RUN_DIR = None
-FINAL_REPORT = None
 for line in captured_lines:
     if line.startswith("FINAL_RUN_DIR "):
         FINAL_RUN_DIR = Path(line.split(" ", 1)[1].strip())
-    if line.startswith("FINAL_REPORT "):
-        FINAL_REPORT = Path(line.split(" ", 1)[1].strip())
 
-if FINAL_RUN_DIR is None or FINAL_REPORT is None:
-    raise RuntimeError("Could not parse FINAL_RUN_DIR / FINAL_REPORT from runner output.")
+if FINAL_RUN_DIR is None:
+    raise RuntimeError("Could not parse FINAL_RUN_DIR from runner output.")
 
 display(Markdown(f"**Run directory:** `{FINAL_RUN_DIR}`"))
-display(Markdown(f"**HTML report:** `{FINAL_REPORT}`"))
         """
     ),
     md(
         r"""
-## Inspect Key Tables
+## Summary
 
-These tables are the main CSV artifacts:
+This cell shows the machine-readable run summary. It is intentionally brief;
+the detailed analysis should live in the notebook cells and any later report
+you decide to write separately.
+        """
+    ),
+    code(
+        r"""
+SUMMARY_PATH = FINAL_RUN_DIR / "summary.json"
+if SUMMARY_PATH.exists():
+    summary = json.loads(SUMMARY_PATH.read_text(encoding="utf-8"))
+    display(pd.DataFrame([{"field": k, "value": v} for k, v in summary.items()]))
+else:
+    display(Markdown("_No summary.json found._"))
+        """
+    ),
+    md(
+        r"""
+## Key Tables
+
+These are the main CSV artifacts:
 
 - `round1_final_checkpoint_by_count.csv`: final accuracy by count and length;
 - `round2_follow_rule_summary.csv`: corrupted-trace follow-rule diagnostics;
@@ -257,17 +274,58 @@ for name in [
     ),
     md(
         r"""
-## Open Self-contained HTML Report
+## Key Figures
 
-The report explains each figure, axis definition, group definition, and main
-interpretation. It is saved as a self-contained HTML file that can be opened
-locally or uploaded with the run folder.
+The notebook displays the important PNG outputs directly. Any polished report
+can be written separately after inspecting these results.
         """
     ),
     code(
         r"""
-html_text = FINAL_REPORT.read_text(encoding="utf-8")
-display(HTML(html_text))
+FIGURES_DIR = FINAL_RUN_DIR / "figures"
+
+figure_groups = {
+    "Round 1: hard length/noise evaluation": [
+        ("round1_train_loss_by_step.png", "x=training step; y=masked next-token loss. Compare convergence of non-thinking vs thinking."),
+        ("round1_final_accuracy_by_step_and_seq_len.png", "x=checkpoint step; y=final count accuracy. Curves compare model type and eval length."),
+        ("round1_accuracy_by_count_final.png", "x=gold count 1..10; y=final checkpoint accuracy."),
+        ("round1_accuracy_heatmap_count_x_seq_len.png", "Rows/columns summarize final accuracy by model and eval length."),
+        ("round1_trace_metrics_by_seq_len.png", "Thinking-only trace exactness, marker recall, and invalid generation by length."),
+        ("round1_oracle_vs_generated_trace_accuracy.png", "Generated trace vs oracle trace final readout; separates trace generation from answer readout."),
+    ],
+    "Round 2: corrupted-trace diagnostics": [
+        ("round2_corruption_accuracy_by_type.png", "x=corruption type; y=whether the answer still matches the prompt count."),
+        ("round2_follow_rule_breakdown.png", "Shows whether predictions follow prompt count, trace pair count, last index, max index, or marker count."),
+        ("round2_confusion_pred_vs_prompt_count.png", "Rows=true prompt count; columns=predicted count."),
+        ("round2_confusion_pred_vs_trace_pair_count.png", "Rows=corrupted trace pair count; columns=predicted count."),
+        ("round2_confusion_pred_vs_last_index.png", "Rows=last index token in corrupted trace; columns=predicted count."),
+        ("round2_corruption_by_seq_len.png", "x=eval length; y=prompt-count accuracy under corrupted traces."),
+    ],
+    "Round 3: probe, attention, and ablation": [
+        ("round3_probe_accuracy_layer_by_anchor.png", "x=anchor position; y=linear probe count accuracy. Compare with baselines in the CSV."),
+        ("round3_probe_r2_layer_by_anchor.png", "x=anchor position; y=ridge R^2 for numeric count prediction."),
+        ("round3_probe_vs_position_baseline.png", "x=position-only baseline; y=hidden-state probe accuracy."),
+        ("round3_attention_head_leaderboard.png", "Ranks retrieval-like attention heads. Diagnostic only, not causal evidence by itself."),
+        ("round3_thinking_trace_to_prompt_heatmap_best_head.png", "Thinking model: layer/head retrieval top-1 from trace item to corresponding prompt needle."),
+        ("round3_nonthinking_ans_to_prompt_attention.png", "Non-thinking model: <Ans>-to-prompt top-n retrieval by layer/head."),
+        ("round3_attention_metrics_by_count_bin.png", "Attention mass to prompt needles by count bin."),
+        ("round3_attention_metrics_by_seq_len.png", "Attention mass to prompt needles by eval length."),
+        ("round3_head_ablation_effects.png", "Single-head ablation effect on final answer accuracy."),
+        ("round3_attention_masking_effects.png", "Single-head ablation effect on trace exactness; targeted masking remains separate future work."),
+    ],
+}
+
+for section, specs in figure_groups.items():
+    display(Markdown(f"### {section}"))
+    any_found = False
+    for filename, caption in specs:
+        path = FIGURES_DIR / filename
+        if path.exists():
+            any_found = True
+            display(Markdown(f"**{filename}**  \n{caption}"))
+            display(Image(filename=str(path)))
+    if not any_found:
+        display(Markdown("_No figures generated for this section / selected round._"))
         """
     ),
     md(

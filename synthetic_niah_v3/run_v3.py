@@ -282,6 +282,52 @@ def existing_or_empty(path: Path) -> pd.DataFrame:
     return pd.read_csv(path) if path.exists() and path.stat().st_size > 0 else pd.DataFrame()
 
 
+def write_summary_json(run_dir: Path, cfg: dict[str, Any], eval_df, corrupt_df, attention_df) -> dict[str, Any]:
+    generated = eval_df[eval_df["eval_mode"].isin(["direct", "generated_trace"])] if not eval_df.empty else eval_df
+
+    def acc_by_len(model_type: str) -> dict[str, float]:
+        if generated.empty:
+            return {}
+        sub = generated[generated["model_type"].eq(model_type)]
+        if sub.empty:
+            return {}
+        return {str(k): float(v) for k, v in sub.groupby("seq_len_eval")["final_accuracy"].mean().to_dict().items()}
+
+    trace = (
+        eval_df[(eval_df["model_type"].eq("thinking")) & (eval_df["eval_mode"].eq("generated_trace"))]
+        if not eval_df.empty
+        else eval_df
+    )
+    summary = {
+        "run_name": run_dir.name,
+        "preset": cfg["preset"],
+        "train_seq_len": cfg["train_seq_len"],
+        "seq_lens_eval": cfg["seq_lens_eval"],
+        "count_range": [1, 10],
+        "seeds": cfg["seeds"],
+        "non_thinking_final_accuracy_by_len": acc_by_len("non_thinking"),
+        "thinking_final_accuracy_by_len": acc_by_len("thinking"),
+        "thinking_trace_exact_by_len": {
+            str(k): float(v) for k, v in trace.groupby("seq_len_eval")["trace_exact_rate"].mean().to_dict().items()
+        }
+        if not trace.empty
+        else {},
+        "round1_main_takeaway": "Round 1 isolates length/noise generalization at fixed count range 1..10.",
+        "round2_main_takeaway": "Round 2 checks whether thinking final answers follow prompt count or corrupted trace-derived shortcuts.",
+        "round3_main_takeaway": "Round 3 separates probe/attention diagnostics from causal single-head ablation evidence.",
+        "limitations": [
+            "All data are symbolic.",
+            "Counts are limited to 1..10.",
+            "The trace exposes count length, so final readout may exploit trace length or last-index shortcuts.",
+            "Probe decodability is not causal evidence.",
+            "Attention patterns are not causal unless ablation or masking changes behavior.",
+            "There is no loss-mask ablation in this version by design.",
+        ],
+    }
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return summary
+
+
 def run(args: argparse.Namespace) -> Path:
     from .vocab import Vocab
 
@@ -315,17 +361,14 @@ def run(args: argparse.Namespace) -> Path:
         probe_df, attention_df, ablation_df, _ = run_round3(cfg, run_dir, vocab)
 
     from .plots import make_round1_plots, make_round2_plots, make_round3_plots
-    from .report import build_report, write_summary
 
     figures_dir = run_dir / "figures"
     make_round1_plots(train_log, eval_df, figures_dir)
     make_round2_plots(corrupt_df, figures_dir)
     make_round3_plots(probe_df, attention_df, ablation_df, figures_dir)
-    summary = write_summary(run_dir, cfg, eval_df, corrupt_df, attention_df)
-    report_path = build_report(run_dir, cfg, summary)
+    write_summary_json(run_dir, cfg, eval_df, corrupt_df, attention_df)
     print(f"FINAL_RUN_DIR {run_dir}")
-    print(f"FINAL_REPORT {report_path}")
-    return report_path
+    return run_dir
 
 
 def build_parser() -> argparse.ArgumentParser:
