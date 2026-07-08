@@ -81,18 +81,26 @@ class HookedGPT2LMHeadModel(nn.Module):
                 )
             )
             for layer_idx, block in enumerate(self.gpt2.transformer.h):
+                def pre_hook(_module, inputs, layer_idx=layer_idx):
+                    if not inputs:
+                        return inputs
+                    hidden = inputs[0]
+                    if isinstance(hidden, tuple):
+                        if not hidden:
+                            return inputs
+                        patched = (apply(f"resid_pre_layer_{layer_idx}", hidden[0]), *hidden[1:])
+                        return (patched, *inputs[1:])
+                    return (apply(f"resid_pre_layer_{layer_idx}", hidden), *inputs[1:])
+
                 handles.append(
-                    block.register_forward_pre_hook(
-                        lambda _module, inputs, layer_idx=layer_idx: (
-                            apply(f"resid_pre_layer_{layer_idx}", inputs[0]),
-                            *inputs[1:],
-                        )
-                    )
+                    block.register_forward_pre_hook(pre_hook)
                 )
 
                 def post_hook(_module, _inputs, output, layer_idx=layer_idx):
-                    hidden = apply(f"resid_post_layer_{layer_idx}", output[0])
-                    return (hidden, *output[1:])
+                    if isinstance(output, tuple):
+                        hidden = apply(f"resid_post_layer_{layer_idx}", output[0])
+                        return (hidden, *output[1:])
+                    return apply(f"resid_post_layer_{layer_idx}", output)
 
                 handles.append(block.register_forward_hook(post_hook))
             handles.append(
