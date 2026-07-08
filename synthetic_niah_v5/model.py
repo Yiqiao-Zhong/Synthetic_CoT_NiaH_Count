@@ -34,6 +34,7 @@ def make_gpt2_config(config: dict[str, Any]) -> GPT2Config:
     bos_token_id = int(cfg.pop("bos_token_id"))
     eos_token_id = int(cfg.pop("eos_token_id"))
     pad_token_id = int(cfg.pop("pad_token_id", eos_token_id))
+    cfg.setdefault("attn_implementation", "eager")
     return GPT2Config(
         vocab_size=vocab_size,
         bos_token_id=bos_token_id,
