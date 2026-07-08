@@ -1063,6 +1063,13 @@ display(Markdown(
 - 如果 `clean_target - corrupt_target` 的 logit margin 被恢复，说明被 patch 的 activation 携带了可用的 clean count / final-needle 信息。
 
 `normalized_recovery = (patched_margin - corrupt_base_margin) / (clean_base_margin - corrupt_base_margin)`。接近 1 表示 patch 充分恢复 clean 信息；接近 0 表示没有恢复；负数表示反方向。
+
+重要修正：**最终答案太容易饱和**，只看 `<Ans>` 后的 count logits 可能得到一排 0。v3.2 额外加入一个更局部的 patching target：
+
+- `marker_after_final_index`：在最后一个 trace index token `<n>` 之后，看模型是否更支持正确的最后 marker；
+- `answer_after_ans`：在 `<Ans>` 之后看最终 count，只作为 readout 对照。
+
+如果 targeted retrieval head 真在把第 `n` 个 prompt needle/marker 取回来，它应该更先影响 `marker_after_final_index`，而不一定能单头改变已经很稳的 final-answer readout。
         """
     ),
     code(
@@ -1348,7 +1355,173 @@ def run_activation_patching() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def token_margin_from_logits(logits_1d: torch.Tensor, target_id: int, candidate_ids: list[int]) -> dict[str, Any]:
+    cand = torch.tensor(candidate_ids, dtype=torch.long, device=logits_1d.device)
+    cand_logits = logits_1d.index_select(0, cand)
+    target_pos = candidate_ids.index(int(target_id))
+    target_logit = cand_logits[target_pos]
+    other = torch.cat([cand_logits[:target_pos], cand_logits[target_pos + 1 :]])
+    margin = target_logit - other.max() if other.numel() else torch.tensor(float("nan"), device=logits_1d.device)
+    pred_id = int(cand[int(torch.argmax(cand_logits).item())].item())
+    return {
+        "target_logit": float(target_logit.detach().cpu()),
+        "target_margin": float(margin.detach().cpu()),
+        "pred_token_id": pred_id,
+    }
+
+
+def score_local_target(
+    model: GPT2LMHeadModel,
+    rendered: dict[str, Any],
+    *,
+    target_type: str,
+    target_token: str,
+    head_specs: list[dict[str, Any]] | None = None,
+    residual_specs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    if target_type == "marker_after_final_index":
+        q_pos = rendered["anchors"]["index_positions"][-1]
+        candidate_tokens = MARKER_TOKENS
+    elif target_type == "answer_after_ans":
+        q_pos = rendered["anchors"]["ans_token"]
+        candidate_tokens = NUMBER_TOKENS
+    else:
+        raise ValueError(f"Unknown local target type: {target_type}")
+    ids = as_input(rendered["input_ids"][: q_pos + 1])
+    with head_output_intervention(model, head_specs), residual_replacement_intervention(model, residual_specs):
+        out = model(input_ids=ids, attention_mask=torch.ones_like(ids), use_cache=False)
+    logits = out.logits[0, -1, :]
+    candidate_ids = [vocab.token_to_id[tok] for tok in candidate_tokens]
+    metrics = token_margin_from_logits(logits, vocab.token_to_id[target_token], candidate_ids)
+    metrics["pred_token"] = vocab.id_to_token[metrics["pred_token_id"]]
+    metrics["target_token"] = target_token
+    return metrics
+
+
+def build_prompt_corrupt_keep_trace_pairs(examples_per_count: int, seed: int) -> list[dict[str, Any]]:
+    # Same trace length, corrupted prompt evidence. These pairs isolate the
+    # targeted-retrieval question better than count-changing pairs whose traces
+    # have different lengths. The corrupt prompt removes the final prompt needle,
+    # but the teacher-forced trace remains the clean trace.
+    rng = random.Random(seed)
+    pairs = []
+    for count in range(2, 11):
+        for i in range(examples_per_count):
+            clean = sample_base_example(int(cfg["seq_len"]), rng, count=count, example_id=f"local_c{count}_{i}")
+            corrupt = remove_last_needle(clean, rng)
+            if corrupt is None:
+                continue
+            pairs.append({
+                "pair_id": f"prompt_delete_keep_trace_c{count}_{i}",
+                "pair_type": "prompt_delete_last_keep_clean_trace",
+                "clean": clean,
+                "corrupt": corrupt,
+                "clean_trace": trace_tokens_from_markers(clean.needle_markers, vocab),
+                "clean_target_count": clean.count,
+                "corrupt_prompt_count": corrupt.count,
+                "target_marker": clean.needle_markers[-1],
+            })
+    return pairs
+
+
+def run_local_causal_patching() -> pd.DataFrame:
+    pairs = build_prompt_corrupt_keep_trace_pairs(PATCH_PAIRS_PER_COUNT, RANDOM_SEED + 9101)
+    head_sites = [
+        ("head_output", "retrieval_top1", RETRIEVAL_HEADS[:1], "index_token_last"),
+        ("head_output", "retrieval_top2", RETRIEVAL_HEADS[:2], "index_token_last"),
+        ("head_output", "retrieval_top4", RETRIEVAL_HEADS, "index_token_last"),
+        ("head_output", "plus_one_top1_pre_index", PLUS_ONE_HEADS[:1], "pre_index_last"),
+        ("head_output", "plus_one_top1_index", PLUS_ONE_HEADS[:1], "index_token_last"),
+        ("head_output", "control_top2", CONTROL_HEADS, "index_token_last"),
+    ]
+    residual_sites = [
+        ("resid_after_block", f"resid_L{layer}_index_last", layer, "index_token_last", "marker_after_final_index")
+        for layer in range(1, N_LAYER + 1)
+    ] + [
+        ("resid_after_block", f"resid_L{layer}_ans", layer, "ans_token", "answer_after_ans")
+        for layer in range(1, N_LAYER + 1)
+    ]
+    rows = []
+    for pair in tqdm(pairs, desc="local causal patching"):
+        clean = pair["clean"]
+        corrupt = pair["corrupt"]
+        clean_trace = pair["clean_trace"]
+        clean_render = render_thinking(clean, vocab)
+        corrupt_render = render_thinking(corrupt, vocab, trace_override=clean_trace, answer_count=clean.count)
+        targets = [
+            ("marker_after_final_index", pair["target_marker"]),
+            ("answer_after_ans", vocab.count_to_token(clean.count)),
+        ]
+        base_scores: dict[str, dict[str, Any]] = {}
+        for target_type, target_token in targets:
+            clean_base = score_local_target(thinking_model, clean_render, target_type=target_type, target_token=target_token)
+            corrupt_base = score_local_target(thinking_model, corrupt_render, target_type=target_type, target_token=target_token)
+            base_scores[target_type] = {"clean": clean_base, "corrupt": corrupt_base}
+        for site_type, name, heads, scope in head_sites:
+            if not heads:
+                continue
+            clean_cache = cache_head_vectors(thinking_model, clean_render, heads, scope)
+            specs = build_head_specs(heads, corrupt_render, mode="replace", position_scope=scope, prefix_len=corrupt_render["anchors"]["ans_token"] + 1, replacement=clean_cache)
+            for target_type, target_token in targets:
+                patched = score_local_target(thinking_model, corrupt_render, target_type=target_type, target_token=target_token, head_specs=specs)
+                clean_margin = base_scores[target_type]["clean"]["target_margin"]
+                corrupt_margin = base_scores[target_type]["corrupt"]["target_margin"]
+                recovery = (patched["target_margin"] - corrupt_margin) / (clean_margin - corrupt_margin + 1e-9)
+                rows.append({
+                    "experiment_name": "local_causal_patching",
+                    "pair_id": pair["pair_id"],
+                    "pair_type": pair["pair_type"],
+                    "site_type": site_type,
+                    "intervention_name": name,
+                    "heads": json.dumps(heads),
+                    "position_scope": scope,
+                    "target_type": target_type,
+                    "target_token": target_token,
+                    "count_clean": pair["clean_target_count"],
+                    "count_corrupt": pair["corrupt_prompt_count"],
+                    "clean_base_margin": clean_margin,
+                    "corrupt_base_margin": corrupt_margin,
+                    "patched_margin": patched["target_margin"],
+                    "margin_delta": patched["target_margin"] - corrupt_margin,
+                    "normalized_recovery": recovery,
+                    "pred_token": patched["pred_token"],
+                })
+        for site_type, name, layer, scope, target_type in residual_sites:
+            target_token = pair["target_marker"] if target_type == "marker_after_final_index" else vocab.count_to_token(clean.count)
+            donor = cache_residual_vector(thinking_model, clean_render, layer, scope)
+            if donor is None:
+                continue
+            positions = positions_for_scope(corrupt_render, scope, prefix_len=corrupt_render["anchors"]["ans_token"] + 1)
+            residual_specs = [{"layer": layer, "positions": positions, "replacement": donor}]
+            patched = score_local_target(thinking_model, corrupt_render, target_type=target_type, target_token=target_token, residual_specs=residual_specs)
+            clean_margin = base_scores[target_type]["clean"]["target_margin"]
+            corrupt_margin = base_scores[target_type]["corrupt"]["target_margin"]
+            recovery = (patched["target_margin"] - corrupt_margin) / (clean_margin - corrupt_margin + 1e-9)
+            rows.append({
+                "experiment_name": "local_causal_patching",
+                "pair_id": pair["pair_id"],
+                "pair_type": pair["pair_type"],
+                "site_type": site_type,
+                "intervention_name": name,
+                "heads": "[]",
+                "layer": layer,
+                "position_scope": scope,
+                "target_type": target_type,
+                "target_token": target_token,
+                "count_clean": pair["clean_target_count"],
+                "count_corrupt": pair["corrupt_prompt_count"],
+                "clean_base_margin": clean_margin,
+                "corrupt_base_margin": corrupt_margin,
+                "patched_margin": patched["target_margin"],
+                "margin_delta": patched["target_margin"] - corrupt_margin,
+                "normalized_recovery": recovery,
+                "pred_token": patched["pred_token"],
+            })
+    return pd.DataFrame(rows)
+
+
 activation_path = TABLE_DIR / "activation_patching_results.csv"
+local_patch_path = TABLE_DIR / "local_causal_patching_results.csv"
 path_path = TABLE_DIR / "path_patching_results.csv"
 if RUN_ACTIVATION_PATCHING:
     if SKIP_COMPLETED and activation_path.exists() and activation_path.stat().st_size > 0:
@@ -1362,24 +1535,32 @@ if RUN_ACTIVATION_PATCHING:
     else:
         activation_df = run_activation_patching()
         activation_df.to_csv(activation_path, index=False)
+    if SKIP_COMPLETED and local_patch_path.exists() and local_patch_path.stat().st_size > 0:
+        local_patch_df = pd.read_csv(local_patch_path)
+    else:
+        local_patch_df = run_local_causal_patching()
+        local_patch_df.to_csv(local_patch_path, index=False)
 else:
     activation_df = pd.read_csv(activation_path)
+    local_patch_df = pd.read_csv(local_patch_path)
 
 if RUN_PATH_PATCHING:
-    # Minimal path patching is implemented as named head-output clean-to-corrupt patches.
-    path_df = activation_df[activation_df["site_type"].eq("head_output")].copy()
+    # Minimal path patching is implemented as named head-output patches.
+    path_df = local_patch_df[local_patch_df["site_type"].eq("head_output")].copy()
     path_df["path_name"] = np.where(
         path_df["intervention_name"].str.contains("retrieval"),
-        "final_prompt_needle_to_retrieval_head_to_answer",
-        np.where(path_df["intervention_name"].str.contains("plus_one"), "local_trace_to_plus_one_head_to_answer", "control_path"),
+        "final_prompt_needle_to_retrieval_head_to_marker_or_answer",
+        np.where(path_df["intervention_name"].str.contains("plus_one"), "local_trace_to_plus_one_head_to_marker_or_answer", "control_path"),
     )
     path_df.to_csv(path_path, index=False)
 else:
     path_df = pd.read_csv(path_path)
 
 display(Markdown(f"Saved activation patching table: `{activation_path}`"))
+display(Markdown(f"Saved local causal patching table: `{local_patch_path}`"))
 display(Markdown(f"Saved path patching table: `{path_path}`"))
 display(activation_df.groupby(["site_type", "intervention_name", "position_scope"], as_index=False)[["normalized_recovery", "margin_delta", "count_shift"]].mean().sort_values("normalized_recovery", ascending=False).head(20))
+display(local_patch_df.groupby(["target_type", "site_type", "intervention_name", "position_scope"], as_index=False)[["normalized_recovery", "margin_delta"]].mean().sort_values("normalized_recovery", ascending=False).head(20))
         """
     ),
     md("### Figures for Activation and Path Patching"),
@@ -1394,36 +1575,77 @@ if not activation_df.empty:
         plt.bar(labels, hp["normalized_recovery"], color="#2f6fed")
         plt.axhline(0, color="black", linewidth=1)
         plt.axhline(1, color="gray", linewidth=1, linestyle="--")
+        if float(hp["normalized_recovery"].abs().max()) < 1e-3:
+            plt.ylim(-0.05, 1.05)
+            plt.text(
+                0.5,
+                0.55,
+                "No measurable final-answer recovery in this setting.\n"
+                "This usually means final count readout is saturated/redundant;\n"
+                "inspect the local marker/readout patching plot below.",
+                transform=plt.gca().transAxes,
+                ha="center",
+                va="center",
+                fontsize=10,
+                bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.85),
+            )
         plt.xticks(rotation=30, ha="right")
         plt.ylabel("mean normalized recovery")
         plt.xlabel("patched head group and token position")
-        plt.title("Clean-to-corrupt head-output patching: is the head sufficient?")
+        plt.title("Final-answer head-output patching: often insensitive when readout is saturated")
         savefig("patching_recovery_by_head_group.png")
 
-    resid = activation_df[activation_df["site_type"].eq("resid_after_block")].copy()
-    if not resid.empty:
-        mat = resid.groupby(["position_scope", "layer"], as_index=False)["normalized_recovery"].mean().pivot(index="position_scope", columns="layer", values="normalized_recovery")
-        plt.figure(figsize=(9, 3.8))
-        im = plt.imshow(mat.fillna(0).values, aspect="auto", cmap="coolwarm", vmin=-1, vmax=1)
-        plt.colorbar(im, label="normalized recovery")
-        plt.yticks(range(len(mat.index)), mat.index)
-        plt.xticks(range(len(mat.columns)), mat.columns)
-        plt.xlabel("residual stream after layer")
-        plt.ylabel("patched token position")
-        plt.title("Residual patching recovery by layer and position")
+if not local_patch_df.empty:
+    local_head = local_patch_df[local_patch_df["site_type"].eq("head_output")].copy()
+    if not local_head.empty:
+        hp = local_head.groupby(["target_type", "intervention_name", "position_scope"], as_index=False)["normalized_recovery"].mean()
+        target_types = list(hp["target_type"].drop_duplicates())
+        fig, axes = plt.subplots(1, len(target_types), figsize=(max(8, 6 * len(target_types)), 4.8), squeeze=False)
+        for ax, target_type in zip(axes[0], target_types):
+            sub = hp[hp["target_type"].eq(target_type)].copy()
+            labels = sub["intervention_name"] + "\n" + sub["position_scope"]
+            ax.bar(labels, sub["normalized_recovery"], color="#2f6fed")
+            ax.axhline(0, color="black", linewidth=1)
+            ax.axhline(1, color="gray", linewidth=1, linestyle="--")
+            ax.set_title(target_type)
+            ax.set_ylabel("mean normalized recovery")
+            ax.set_xlabel("patched head group and token position")
+            ax.tick_params(axis="x", rotation=30)
+        fig.suptitle("Local causal patching: marker-after-index vs final-answer readout")
+        savefig("local_patching_marker_and_answer_recovery_by_head_group.png")
+
+    local_resid = local_patch_df[local_patch_df["site_type"].eq("resid_after_block")].copy()
+    if not local_resid.empty:
+        target_types = list(local_resid["target_type"].drop_duplicates())
+        fig, axes = plt.subplots(1, len(target_types), figsize=(max(8, 4.8 * len(target_types)), 3.8), squeeze=False)
+        for ax, target_type in zip(axes[0], target_types):
+            sub = local_resid[local_resid["target_type"].eq(target_type)]
+            mat = sub.groupby(["position_scope", "layer"], as_index=False)["normalized_recovery"].mean().pivot(index="position_scope", columns="layer", values="normalized_recovery")
+            im = ax.imshow(mat.fillna(0).values, aspect="auto", cmap="coolwarm", vmin=-1, vmax=1)
+            ax.set_title(target_type)
+            ax.set_yticks(range(len(mat.index)), mat.index)
+            ax.set_xticks(range(len(mat.columns)), mat.columns)
+            ax.set_xlabel("residual stream after layer")
+            ax.set_ylabel("patched token position")
+        fig.colorbar(im, ax=axes.ravel().tolist(), label="normalized recovery", shrink=0.9)
+        fig.suptitle("Local residual patching recovery by target, layer, and position")
         savefig("patching_recovery_by_layer_position.png")
 
 if not path_df.empty:
-    path_sum = path_df.groupby(["path_name", "intervention_name"], as_index=False)["normalized_recovery"].mean()
-    mat = path_sum.pivot(index="path_name", columns="intervention_name", values="normalized_recovery").fillna(0)
-    plt.figure(figsize=(9, max(3.5, 0.5 * len(mat.index) + 1.5)))
-    im = plt.imshow(mat.values, aspect="auto", cmap="coolwarm", vmin=-1, vmax=1)
-    plt.colorbar(im, label="normalized recovery")
-    plt.yticks(range(len(mat.index)), mat.index)
-    plt.xticks(range(len(mat.columns)), mat.columns, rotation=35, ha="right")
-    plt.xlabel("patched component")
-    plt.ylabel("causal path hypothesis")
-    plt.title("Minimal path patching recovery heatmap")
+    target_types = list(path_df["target_type"].drop_duplicates()) if "target_type" in path_df.columns else ["all"]
+    fig, axes = plt.subplots(1, len(target_types), figsize=(max(8, 5 * len(target_types)), max(3.5, 0.5 * path_df["path_name"].nunique() + 1.5)), squeeze=False)
+    for ax, target_type in zip(axes[0], target_types):
+        sub = path_df[path_df["target_type"].eq(target_type)] if target_type != "all" else path_df
+        path_sum = sub.groupby(["path_name", "intervention_name"], as_index=False)["normalized_recovery"].mean()
+        mat = path_sum.pivot(index="path_name", columns="intervention_name", values="normalized_recovery").fillna(0)
+        im = ax.imshow(mat.values, aspect="auto", cmap="coolwarm", vmin=-1, vmax=1)
+        ax.set_yticks(range(len(mat.index)), mat.index)
+        ax.set_xticks(range(len(mat.columns)), mat.columns, rotation=35, ha="right")
+        ax.set_xlabel("patched component")
+        ax.set_ylabel("causal path hypothesis")
+        ax.set_title(target_type)
+    fig.colorbar(im, ax=axes.ravel().tolist(), label="normalized recovery", shrink=0.9)
+    fig.suptitle("Minimal path patching recovery heatmap")
     savefig("path_patching_recovery_heatmap.png")
         """
     ),
@@ -1641,7 +1863,8 @@ control_margin = safe_mean(
     & necessity_df["eval_mode"].eq("teacher_forced_final_readout"),
     "gold_logit_margin",
 )
-best_patch = activation_df.sort_values("normalized_recovery", ascending=False).head(1) if "activation_df" in globals() and not activation_df.empty else pd.DataFrame()
+best_final_patch = activation_df.sort_values("normalized_recovery", ascending=False).head(1) if "activation_df" in globals() and not activation_df.empty else pd.DataFrame()
+best_local_patch = local_patch_df.sort_values("normalized_recovery", ascending=False).head(1) if "local_patch_df" in globals() and not local_patch_df.empty else pd.DataFrame()
 cf_summary = counterfactual_df.groupby("edit_type", as_index=False)["trace_minus_prompt_logit"].mean() if "counterfactual_df" in globals() and not counterfactual_df.empty else pd.DataFrame()
 
 lines = []
@@ -1650,9 +1873,12 @@ lines.append("")
 lines.append(f"- **实验对象**：v2 thinking model，checkpoint `{THINKING_MODEL_DIR}`；架构是 GPT-2 style learned absolute positional embeddings。")
 lines.append(f"- **候选 retrieval heads**：{', '.join(f'L{l}H{h}' for l, h in RETRIEVAL_HEADS)}。候选 local/plus-one heads：{', '.join(f'L{l}H{h}' for l, h in PLUS_ONE_HEADS)}。")
 lines.append(f"- **Necessity 初读**：baseline final-answer margin = `{baseline_margin:.3f}`；retrieval_top4 at final index margin = `{top_retr_margin:.3f}`；control margin = `{control_margin:.3f}`。如果 retrieval_top4 和 control 接近，说明这些 attention heads 更像 diagnostic/redundant；如果 retrieval_top4 明显更低，说明 retrieval group 有必要性。")
-if not best_patch.empty:
-    r = best_patch.iloc[0]
-    lines.append(f"- **Sufficiency 初读**：最高 normalized recovery 来自 `{r['intervention_name']}` at `{r['position_scope']}`，平均/单项 recovery = `{r['normalized_recovery']:.3f}`。如果 recovery 明显高于 control，说明该 activation 携带可转移的 clean count 信息。")
+if not best_local_patch.empty:
+    r = best_local_patch.iloc[0]
+    lines.append(f"- **Local sufficiency 初读**：局部 target `{r['target_type']}` 上最高 normalized recovery 来自 `{r['intervention_name']}` at `{r['position_scope']}`，recovery = `{r['normalized_recovery']:.3f}`。这比 final-answer patching 更直接检验 targeted retrieval 是否携带最后 marker/needle 信息。")
+if not best_final_patch.empty:
+    r = best_final_patch.iloc[0]
+    lines.append(f"- **Final-answer patching 初读**：最高 final-answer recovery 来自 `{r['intervention_name']}` at `{r['position_scope']}`，recovery = `{r['normalized_recovery']:.3f}`。如果这里接近 0 但 local patching 有效果，说明最终读出可能被 trace/readout 冗余保护。")
 if not cf_summary.empty:
     lines.append("- **Prompt vs trace 初读**：`trace_minus_prompt_logit > 0` 表示最终答案更支持 teacher-forced trace count；`< 0` 表示更支持 edited prompt count。")
     for _, r in cf_summary.iterrows():
