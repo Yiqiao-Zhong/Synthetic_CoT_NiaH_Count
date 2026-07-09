@@ -58,12 +58,24 @@ REPO_URL = "https://github.com/Twist-Shan/Synthetic_CoT_NiaH_Count.git"
 INSTALL_DEPS = False
 FIX_NUMPY_ABI = False  # set True only if pandas/scipy complains about NumPy dtype size
 
+def resolve_repo_root(start: Path) -> Path:
+    start = start.resolve()
+    for candidate in [start, *start.parents]:
+        if (candidate / "synthetic_counting_extensions").exists() and (candidate / "notebooks").exists():
+            return candidate
+        if (candidate / ".git").exists() and (candidate / "notebooks").exists():
+            return candidate
+    return start
+
+
 IN_COLAB = "google.colab" in sys.modules or Path("/content").exists()
 if IN_COLAB:
     repo_dir = Path("/content/Synthetic_CoT_NiaH_Count")
     cwd = Path.cwd()
     if (cwd / ".git").exists() or (cwd / "notebooks" / "Trace_Count_v2_Colab.ipynb").exists():
         repo_dir = cwd
+    elif (cwd.parent / ".git").exists() or (cwd.parent / "synthetic_counting_extensions").exists():
+        repo_dir = cwd.parent
     elif (repo_dir / ".git").exists() or (repo_dir / "notebooks" / "Trace_Count_v2_Colab.ipynb").exists():
         pass
     elif repo_dir.exists() and any(repo_dir.iterdir()):
@@ -72,9 +84,18 @@ if IN_COLAB:
         subprocess.run(["git", "clone", REPO_URL, str(repo_dir)], check=True)
     os.chdir(repo_dir)
 
-ROOT = Path.cwd()
+ROOT = resolve_repo_root(Path.cwd())
+os.chdir(ROOT)
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+followup_module_path = ROOT / "synthetic_counting_extensions" / "v2_2_followup.py"
+if not followup_module_path.exists():
+    print(
+        "Warning: synthetic_counting_extensions/v2_2_followup.py is missing. "
+        "The main v2.2 attention diagnostics can still run, but Section 12 needs the updated repo files. "
+        "Run git pull in Colab or upload the latest local repo before running Section 12."
+    )
 
 if INSTALL_DEPS:
     subprocess.run(
@@ -1547,6 +1568,35 @@ RUN_FOLLOWUP_MECHANISM = True
 FOLLOWUP_EXAMPLES_PER_COUNT = min(50, EXAMPLES_PER_COUNT)
 
 if RUN_FOLLOWUP_MECHANISM:
+    from pathlib import Path
+    import os
+    import sys
+
+    def _resolve_followup_repo_root() -> Path:
+        starts = []
+        if "ROOT" in globals():
+            starts.append(Path(ROOT))
+        starts.append(Path.cwd())
+        for start in starts:
+            start = start.resolve()
+            for candidate in [start, *start.parents]:
+                if (candidate / "synthetic_counting_extensions" / "v2_2_followup.py").exists():
+                    return candidate
+        searched = []
+        for start in starts:
+            searched.extend(str(p) for p in [start.resolve(), *start.resolve().parents])
+        raise FileNotFoundError(
+            "Could not find synthetic_counting_extensions/v2_2_followup.py. "
+            "This means the runtime is using an older repo copy. In Colab, run git pull "
+            "or upload the latest repo files, then rerun the setup cell and this cell. "
+            f"Searched: {searched[:8]}"
+        )
+
+    ROOT = _resolve_followup_repo_root()
+    os.chdir(ROOT)
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+
     from synthetic_counting_extensions.v2_2_followup import run_v2_2_followup
 
     followup_outputs = run_v2_2_followup(
