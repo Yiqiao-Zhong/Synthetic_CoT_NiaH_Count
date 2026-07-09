@@ -11,7 +11,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
-from synthetic_niah_v5.model import GPT2LMHeadModel
+
+try:
+    from synthetic_niah_v5.model import GPT2LMHeadModel
+except ModuleNotFoundError:
+    from transformers import GPT2LMHeadModel
 
 
 SPECIAL_TOKENS = ["<PAD>", "<BOS>", "<EOS>", "<Ans>", "<Think/>", "</Think>"]

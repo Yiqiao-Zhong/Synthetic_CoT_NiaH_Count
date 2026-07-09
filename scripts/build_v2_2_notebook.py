@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "notebooks" / "Trace_Count_v2_2_Colab.ipynb"
+FOLLOWUP_SOURCE = (ROOT / "synthetic_counting_extensions" / "v2_2_followup.py").read_text(encoding="utf-8")
 
 
 def md(source: str) -> dict:
@@ -1563,10 +1564,10 @@ display(Markdown("\n".join(lines)))
         """
     ),
     code(
+        "RUN_FOLLOWUP_MECHANISM = True\n"
+        "FOLLOWUP_EXAMPLES_PER_COUNT = min(50, EXAMPLES_PER_COUNT)\n\n"
+        f"_EMBEDDED_FOLLOWUP_SOURCE = {json.dumps(FOLLOWUP_SOURCE)}\n\n"
         r"""
-RUN_FOLLOWUP_MECHANISM = True
-FOLLOWUP_EXAMPLES_PER_COUNT = min(50, EXAMPLES_PER_COUNT)
-
 if RUN_FOLLOWUP_MECHANISM:
     from pathlib import Path
     import os
@@ -1582,15 +1583,25 @@ if RUN_FOLLOWUP_MECHANISM:
             for candidate in [start, *start.parents]:
                 if (candidate / "synthetic_counting_extensions" / "v2_2_followup.py").exists():
                     return candidate
+                if (candidate / "notebooks").exists() or (candidate / ".git").exists():
+                    target = candidate / "synthetic_counting_extensions" / "v2_2_followup.py"
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    init_path = target.parent / "__init__.py"
+                    if not init_path.exists():
+                        init_path.write_text("", encoding="utf-8")
+                    target.write_text(_EMBEDDED_FOLLOWUP_SOURCE, encoding="utf-8")
+                    print(f"Wrote embedded follow-up module to {target}")
+                    return candidate
         searched = []
         for start in starts:
             searched.extend(str(p) for p in [start.resolve(), *start.resolve().parents])
-        raise FileNotFoundError(
-            "Could not find synthetic_counting_extensions/v2_2_followup.py. "
-            "This means the runtime is using an older repo copy. In Colab, run git pull "
-            "or upload the latest repo files, then rerun the setup cell and this cell. "
-            f"Searched: {searched[:8]}"
-        )
+        fallback_root = Path.cwd().resolve()
+        target = fallback_root / "synthetic_counting_extensions" / "v2_2_followup.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        (target.parent / "__init__.py").write_text("", encoding="utf-8")
+        target.write_text(_EMBEDDED_FOLLOWUP_SOURCE, encoding="utf-8")
+        print(f"Wrote embedded follow-up module to fallback path {target}")
+        return fallback_root
 
     ROOT = _resolve_followup_repo_root()
     os.chdir(ROOT)
