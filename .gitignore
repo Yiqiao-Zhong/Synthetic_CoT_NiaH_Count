@@ -15,6 +15,7 @@ checkpoints/
 logs/
 wandb/
 paper_figs/
+tmp_extension_*/
 
 *.pt
 *.pth

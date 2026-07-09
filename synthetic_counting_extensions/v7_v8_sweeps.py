@@ -1,0 +1,478 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import random
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from torch.optim import AdamW
+from tqdm.auto import tqdm
+
+from synthetic_niah_v5.model import make_model
+
+
+IGNORE_INDEX = -100
+
+
+@dataclass
+class SweepConfig:
+    experiment: str
+    preset: str = "debug"
+    seed: int = 1234
+    seq_len: int = 256
+    train_count_min: int = 1
+    train_count_max: int = 10
+    eval_count_min: int = 1
+    eval_count_max: int = 10
+    noise_vocab_size: int = 64
+    marker_vocab_size: int = 10
+    train_steps: int = 2000
+    batch_size: int = 64
+    lr: float = 3e-4
+    warmup_steps: int = 200
+    log_every: int = 50
+    eval_examples_per_count: int = 100
+    ar_examples_per_count: int = 40
+    n_layer: int = 4
+    n_head: int = 4
+    n_embd: int = 256
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+    @property
+    def max_count(self) -> int:
+        return max(int(self.train_count_max), int(self.eval_count_max))
+
+    @property
+    def n_positions(self) -> int:
+        return int(self.seq_len) + 2 * int(self.max_count) + 12
+
+
+class Vocab:
+    def __init__(self, cfg: SweepConfig):
+        self.special = ["<PAD>", "<BOS>", "<EOS>", "<Think>", "</Think>", "<Ans>"]
+        self.noise = [f"<N{i}>" for i in range(cfg.noise_vocab_size)]
+        self.markers = [f"<M{i}>" for i in range(cfg.marker_vocab_size)]
+        self.counts = [f"<C{i}>" for i in range(1, cfg.max_count + 1)]
+        self.indices = [f"<I{i}>" for i in range(1, cfg.max_count + 1)]
+        self.id_to_token = self.special + self.noise + self.markers + self.counts + self.indices
+        self.token_to_id = {t: i for i, t in enumerate(self.id_to_token)}
+
+    def encode(self, tokens: list[str]) -> list[int]:
+        return [self.token_to_id[t] for t in tokens]
+
+    def decode(self, ids: list[int]) -> list[str]:
+        return [self.id_to_token[int(i)] for i in ids]
+
+    @property
+    def pad_id(self) -> int:
+        return self.token_to_id["<PAD>"]
+
+    @property
+    def bos_id(self) -> int:
+        return self.token_to_id["<BOS>"]
+
+    @property
+    def eos_id(self) -> int:
+        return self.token_to_id["<EOS>"]
+
+    @property
+    def think_id(self) -> int:
+        return self.token_to_id["<Think>"]
+
+    @property
+    def think_end_id(self) -> int:
+        return self.token_to_id["</Think>"]
+
+    @property
+    def ans_id(self) -> int:
+        return self.token_to_id["<Ans>"]
+
+    def count_token(self, value: int) -> str:
+        return f"<C{int(value)}>"
+
+    def index_token(self, value: int) -> str:
+        return f"<I{int(value)}>"
+
+    @property
+    def count_ids(self) -> list[int]:
+        return [self.token_to_id[t] for t in self.counts]
+
+    def to_json(self) -> dict[str, Any]:
+        return {"token_to_id": self.token_to_id, "id_to_token": self.id_to_token}
+
+
+@dataclass
+class Example:
+    seq_tokens: list[str]
+    count: int
+    needle_positions: list[int]
+    needle_markers: list[str]
+
+
+def make_example(cfg: SweepConfig, vocab: Vocab, rng: random.Random, count: int | None = None) -> Example:
+    c = rng.randint(cfg.train_count_min, cfg.train_count_max) if count is None else int(count)
+    if c > cfg.seq_len:
+        raise ValueError("count cannot exceed seq_len")
+    positions = sorted(rng.sample(range(cfg.seq_len), c))
+    markers = [rng.choice(vocab.markers) for _ in positions]
+    seq = [rng.choice(vocab.noise) for _ in range(cfg.seq_len)]
+    for pos, marker in zip(positions, markers):
+        seq[pos] = marker
+    return Example(seq, c, positions, markers)
+
+
+def balanced_examples(cfg: SweepConfig, vocab: Vocab, examples_per_count: int, seed: int, *, eval_counts: bool = False) -> list[Example]:
+    rng = random.Random(seed)
+    lo = cfg.eval_count_min if eval_counts else cfg.train_count_min
+    hi = cfg.eval_count_max if eval_counts else cfg.train_count_max
+    examples: list[Example] = []
+    for count in range(lo, hi + 1):
+        for _ in range(examples_per_count):
+            examples.append(make_example(cfg, vocab, rng, count=count))
+    rng.shuffle(examples)
+    return examples
+
+
+def render(ex: Example, vocab: Vocab, mode: str) -> dict[str, Any]:
+    labels: list[int]
+    if mode == "nonthinking":
+        tokens = ["<BOS>"] + ex.seq_tokens + ["<Ans>", vocab.count_token(ex.count), "<EOS>"]
+        ans_pos = 1 + len(ex.seq_tokens)
+        labels = [IGNORE_INDEX] * len(tokens)
+        labels[ans_pos + 1] = vocab.token_to_id[vocab.count_token(ex.count)]
+        labels[ans_pos + 2] = vocab.eos_id
+        anchors = {"ans_pos": ans_pos, "count_pos": ans_pos + 1}
+    elif mode == "thinking":
+        trace: list[str] = []
+        for k, marker in enumerate(ex.needle_markers, start=1):
+            trace.extend([vocab.index_token(k), marker])
+        tokens = ["<BOS>"] + ex.seq_tokens + ["<Think>"] + trace + ["</Think>", "<Ans>", vocab.count_token(ex.count), "<EOS>"]
+        think_pos = 1 + len(ex.seq_tokens)
+        close_pos = think_pos + 1 + len(trace)
+        ans_pos = close_pos + 1
+        labels = [IGNORE_INDEX] * len(tokens)
+        for pos in range(think_pos + 1, len(tokens)):
+            labels[pos] = vocab.token_to_id[tokens[pos]]
+        anchors = {"think_pos": think_pos, "close_pos": close_pos, "ans_pos": ans_pos, "count_pos": ans_pos + 1}
+    else:
+        raise ValueError(mode)
+    return {"tokens": tokens, "input_ids": vocab.encode(tokens), "labels": labels, "anchors": anchors, "count": ex.count}
+
+
+def collate(items: list[dict[str, Any]], vocab: Vocab, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+    max_len = max(len(x["input_ids"]) for x in items)
+    ids = torch.full((len(items), max_len), vocab.pad_id, dtype=torch.long)
+    labels = torch.full((len(items), max_len), IGNORE_INDEX, dtype=torch.long)
+    for i, item in enumerate(items):
+        ids[i, : len(item["input_ids"])] = torch.tensor(item["input_ids"])
+        labels[i, : len(item["labels"])] = torch.tensor(item["labels"])
+    return ids.to(device), labels.to(device)
+
+
+def lr_at(step: int, cfg: SweepConfig) -> float:
+    if step < cfg.warmup_steps:
+        return cfg.lr * (step + 1) / max(1, cfg.warmup_steps)
+    progress = (step - cfg.warmup_steps) / max(1, cfg.train_steps - cfg.warmup_steps)
+    return cfg.lr * 0.5 * (1 + math.cos(math.pi * min(1.0, progress)))
+
+
+def build_model_cfg(cfg: SweepConfig, vocab: Vocab) -> dict[str, Any]:
+    return {
+        "vocab_size": len(vocab.id_to_token),
+        "n_layer": cfg.n_layer,
+        "n_head": cfg.n_head,
+        "n_embd": cfg.n_embd,
+        "n_inner": 4 * cfg.n_embd,
+        "n_positions": cfg.n_positions,
+        "n_ctx": cfg.n_positions,
+        "activation_function": "gelu_new",
+        "resid_pdrop": 0.0,
+        "embd_pdrop": 0.0,
+        "attn_pdrop": 0.0,
+        "use_cache": False,
+        "bos_token_id": vocab.bos_id,
+        "eos_token_id": vocab.eos_id,
+        "pad_token_id": vocab.pad_id,
+    }
+
+
+def train_one(cfg: SweepConfig, vocab: Vocab, mode: str, run_dir: Path) -> pd.DataFrame:
+    ckpt = run_dir / "checkpoints" / mode
+    ckpt.mkdir(parents=True, exist_ok=True)
+    if (ckpt / "model.pt").exists():
+        return pd.read_csv(run_dir / "tables" / f"train_{mode}.csv")
+    torch.manual_seed(cfg.seed + (0 if mode == "nonthinking" else 17))
+    rng = random.Random(cfg.seed + (100 if mode == "nonthinking" else 200))
+    model = make_model(build_model_cfg(cfg, vocab), cfg.device)
+    opt = AdamW(model.parameters(), lr=cfg.lr, betas=(0.9, 0.95), weight_decay=0.01)
+    rows: list[dict[str, Any]] = []
+    pbar = tqdm(range(1, cfg.train_steps + 1), desc=f"{cfg.experiment} {mode}", leave=True)
+    for step in pbar:
+        lr = lr_at(step - 1, cfg)
+        for group in opt.param_groups:
+            group["lr"] = lr
+        batch = [render(make_example(cfg, vocab, rng), vocab, mode) for _ in range(cfg.batch_size)]
+        ids, labels = collate(batch, vocab, cfg.device)
+        out = model(input_ids=ids, attention_mask=(ids != vocab.pad_id).long())
+        shift_logits = out.logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=IGNORE_INDEX)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        if step == 1 or step % cfg.log_every == 0 or step == cfg.train_steps:
+            row = {"step": step, "mode": mode, "loss": float(loss.detach().cpu()), "lr": lr}
+            rows.append(row)
+            pbar.set_postfix(loss=f"{row['loss']:.4f}", lr=f"{lr:.1e}")
+    torch.save({"model_state_dict": model.state_dict(), "cfg": asdict(cfg), "mode": mode}, ckpt / "model.pt")
+    train_df = pd.DataFrame(rows)
+    train_df.to_csv(run_dir / "tables" / f"train_{mode}.csv", index=False)
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return train_df
+
+
+def load_model(cfg: SweepConfig, vocab: Vocab, mode: str, run_dir: Path):
+    model = make_model(build_model_cfg(cfg, vocab), cfg.device)
+    obj = torch.load(run_dir / "checkpoints" / mode / "model.pt", map_location=cfg.device)
+    model.load_state_dict(obj["model_state_dict"])
+    model.eval()
+    return model
+
+
+@torch.no_grad()
+def evaluate_one(cfg: SweepConfig, vocab: Vocab, mode: str, run_dir: Path) -> pd.DataFrame:
+    model = load_model(cfg, vocab, mode, run_dir)
+    examples = balanced_examples(cfg, vocab, cfg.eval_examples_per_count, cfg.seed + 9000, eval_counts=True)
+    rows: list[dict[str, Any]] = []
+    ar_seen = {count: 0 for count in range(cfg.eval_count_min, cfg.eval_count_max + 1)}
+    for ex in tqdm(examples, desc=f"eval {mode}", leave=False):
+        r = render(ex, vocab, mode)
+        ids = torch.tensor([r["input_ids"]], dtype=torch.long, device=cfg.device)
+        logits = model(input_ids=ids).logits[0, r["anchors"]["ans_pos"]]
+        pred = int(logits[vocab.count_ids].argmax().item()) + 1
+        ar_pred = None
+        ar_steps = None
+        if ar_seen[ex.count] < cfg.ar_examples_per_count:
+            ar_seen[ex.count] += 1
+            ar_pred, ar_steps = autoregressive_predict_count(model, vocab, ex, cfg, mode)
+        rows.append(
+            {
+                "mode": mode,
+                "count": ex.count,
+                "tf_pred_count": pred,
+                "tf_accuracy": float(pred == ex.count),
+                "tf_abs_error": abs(pred - ex.count),
+                "ar_pred_count": ar_pred,
+                "ar_accuracy": float(ar_pred == ex.count) if ar_pred is not None else None,
+                "ar_abs_error": abs(ar_pred - ex.count) if ar_pred is not None else None,
+                "ar_generated_steps": ar_steps,
+            }
+        )
+    df = pd.DataFrame(rows)
+    df.to_csv(run_dir / "tables" / f"eval_{mode}_examples.csv", index=False)
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return df
+
+
+@torch.no_grad()
+def autoregressive_predict_count(model, vocab: Vocab, ex: Example, cfg: SweepConfig, mode: str) -> tuple[int | None, int]:
+    if mode == "nonthinking":
+        generated = vocab.encode(["<BOS>"] + ex.seq_tokens + ["<Ans>"])
+        seen_ans = True
+        max_new = 2
+    else:
+        generated = vocab.encode(["<BOS>"] + ex.seq_tokens + ["<Think>"])
+        seen_ans = False
+        max_new = 2 * cfg.max_count + 8
+    count_lookup = {tok_id: count for count, tok_id in enumerate(vocab.count_ids, start=1)}
+    for step in range(1, max_new + 1):
+        ids = torch.tensor([generated], dtype=torch.long, device=cfg.device)
+        next_id = int(model(input_ids=ids).logits[0, -1].argmax().item())
+        generated.append(next_id)
+        if seen_ans and next_id in count_lookup:
+            return count_lookup[next_id], step
+        if next_id == vocab.ans_id:
+            seen_ans = True
+        if next_id == vocab.eos_id and not seen_ans:
+            return None, step
+    return None, max_new
+
+
+def summarize_eval(dfs: list[pd.DataFrame]) -> pd.DataFrame:
+    all_df = pd.concat(dfs, ignore_index=True)
+    summary = (
+        all_df.groupby(["mode", "count"], as_index=False)
+        .agg(
+            n=("tf_accuracy", "size"),
+            n_ar=("ar_accuracy", "count"),
+            tf_accuracy=("tf_accuracy", "mean"),
+            ar_accuracy=("ar_accuracy", "mean"),
+            tf_mae=("tf_abs_error", "mean"),
+            ar_mae=("ar_abs_error", "mean"),
+        )
+        .sort_values(["mode", "count"])
+    )
+    summary["accuracy"] = summary["ar_accuracy"].fillna(summary["tf_accuracy"])
+    summary["mae"] = summary["ar_mae"].fillna(summary["tf_mae"])
+    return summary
+
+
+def preset_configs(experiment: str, preset: str) -> list[SweepConfig]:
+    if preset == "debug":
+        base = SweepConfig(
+            experiment=experiment,
+            preset=preset,
+            seq_len=48,
+            train_steps=4,
+            batch_size=8,
+            eval_examples_per_count=2,
+            ar_examples_per_count=2,
+            n_layer=2,
+            n_head=2,
+            n_embd=64,
+        )
+        return [base]
+    if experiment == "v7":
+        return [
+            SweepConfig(experiment=experiment, preset=preset, seq_len=256, train_count_max=10, eval_count_max=10, train_steps=6000, eval_examples_per_count=200, ar_examples_per_count=50),
+            SweepConfig(experiment=experiment, preset=preset, seq_len=512, train_count_max=16, eval_count_max=16, train_steps=8000, eval_examples_per_count=200, ar_examples_per_count=40),
+            SweepConfig(experiment=experiment, preset=preset, seq_len=768, train_count_max=24, eval_count_max=24, train_steps=10000, eval_examples_per_count=150, ar_examples_per_count=30, marker_vocab_size=10),
+        ]
+    if experiment == "v8":
+        return [
+            SweepConfig(experiment=experiment, preset=preset, seq_len=512, train_count_max=20, eval_count_max=30, train_steps=10000, eval_examples_per_count=120, ar_examples_per_count=30, marker_vocab_size=10),
+            SweepConfig(experiment=experiment, preset=preset, seq_len=1024, train_count_max=20, eval_count_max=40, train_steps=12000, eval_examples_per_count=80, ar_examples_per_count=20, marker_vocab_size=10),
+        ]
+    raise ValueError(experiment)
+
+
+def run_one_config(cfg: SweepConfig, out_root: Path, skip_completed: bool = True) -> Path:
+    name = f"{cfg.experiment}_{cfg.preset}_L{cfg.seq_len}_train{cfg.train_count_min}-{cfg.train_count_max}_eval{cfg.eval_count_min}-{cfg.eval_count_max}_seed{cfg.seed}"
+    run_dir = out_root / name
+    for sub in ["tables", "figures", "checkpoints", "report"]:
+        (run_dir / sub).mkdir(parents=True, exist_ok=True)
+    (run_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2), encoding="utf-8")
+    vocab = Vocab(cfg)
+    (run_dir / "vocab.json").write_text(json.dumps(vocab.to_json(), indent=2), encoding="utf-8")
+    eval_dfs = []
+    for mode in ["nonthinking", "thinking"]:
+        if not skip_completed or not (run_dir / "checkpoints" / mode / "model.pt").exists():
+            train_one(cfg, vocab, mode, run_dir)
+        eval_path = run_dir / "tables" / f"eval_{mode}_examples.csv"
+        if skip_completed and eval_path.exists():
+            eval_dfs.append(pd.read_csv(eval_path))
+        else:
+            eval_dfs.append(evaluate_one(cfg, vocab, mode, run_dir))
+    summary = summarize_eval(eval_dfs)
+    summary.to_csv(run_dir / "tables" / "eval_by_count.csv", index=False)
+    make_plots(run_dir, summary)
+    make_report(run_dir, cfg, summary)
+    return run_dir
+
+
+def make_plots(run_dir: Path, summary: pd.DataFrame) -> None:
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for mode, group in summary.sort_values("count").groupby("mode"):
+        ax.plot(group["count"], group["accuracy"], marker="o", label=mode)
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_xlabel("gold needle count")
+    ax.set_ylabel("final-count accuracy")
+    ax.set_title("Accuracy by needle count")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(run_dir / "figures" / "accuracy_by_count.png", dpi=180)
+    plt.close(fig)
+
+    pivot = summary.pivot(index="mode", columns="count", values="accuracy")
+    values = pivot.to_numpy(dtype=float)
+    fig, ax = plt.subplots(figsize=(10, 3.2))
+    im = ax.imshow(values, aspect="auto", vmin=0, vmax=1, cmap="viridis")
+    ax.set_xticks(range(len(pivot.columns)), labels=[str(c) for c in pivot.columns])
+    ax.set_yticks(range(len(pivot.index)), labels=[str(i) for i in pivot.index])
+    ax.set_xlabel("gold needle count")
+    ax.set_ylabel("model mode")
+    for y, row in enumerate(values):
+        for x, val in enumerate(row):
+            if np.isfinite(val):
+                ax.text(x, y, f"{val:.2f}", ha="center", va="center", color="white" if val < 0.5 else "black")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_title("Accuracy heatmap by mode and count")
+    fig.tight_layout()
+    fig.savefig(run_dir / "figures" / "accuracy_heatmap.png", dpi=180)
+    plt.close(fig)
+
+
+def _img(name: str) -> str:
+    return f"<img src='../figures/{name}' style='max-width:100%;border:1px solid #ddd;border-radius:8px'>"
+
+
+def make_report(run_dir: Path, cfg: SweepConfig, summary: pd.DataFrame) -> None:
+    wide = summary.pivot(index="count", columns="mode", values="accuracy").reset_index()
+    if {"thinking", "nonthinking"}.issubset(wide.columns):
+        wide["cot_minus_nonthinking"] = wide["thinking"] - wide["nonthinking"]
+    threshold_rows = []
+    for mode, g in summary.groupby("mode"):
+        bad = g[g["accuracy"] < 0.9]
+        threshold_rows.append({"mode": mode, "first_count_below_0.9": int(bad["count"].iloc[0]) if not bad.empty else "none"})
+    threshold = pd.DataFrame(threshold_rows)
+    html = f"""<!doctype html><html><head><meta charset="utf-8"><title>{cfg.experiment} report</title>
+<style>body{{font-family:Segoe UI,Arial,sans-serif;line-height:1.55;max-width:1050px;margin:32px auto;padding:0 20px;color:#172033}}table{{border-collapse:collapse;width:100%;font-size:14px}}td,th{{border:1px solid #ddd;padding:8px}}th{{background:#f4f7fb}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:18px}}</style></head><body>
+<h1>{cfg.experiment} synthetic counting sweep</h1>
+<p>v7 用来寻找 CoT 明显优于 non-thinking 的 harder setting；v8 用来找 needle count 增多后 accuracy 开始下降的阈值。</p>
+<h2>Config</h2><pre>{json.dumps(asdict(cfg), indent=2)}</pre>
+<div class="grid"><div>{_img('accuracy_by_count.png')}</div><div>{_img('accuracy_heatmap.png')}</div></div>
+<h2>CoT advantage by count</h2>{wide.to_html(index=False)}
+<h2>First count below 0.9 accuracy</h2>{threshold.to_html(index=False)}
+<h2>Raw summary</h2>{summary.to_html(index=False)}
+</body></html>"""
+    (run_dir / "report" / "report.html").write_text(html, encoding="utf-8")
+
+
+def run_sweep(experiment: str, preset: str, out_root: str | Path, *, skip_completed: bool = True, device: str | None = None) -> pd.DataFrame:
+    out_root = Path(out_root)
+    out_root.mkdir(parents=True, exist_ok=True)
+    all_rows = []
+    for cfg in preset_configs(experiment, preset):
+        if device:
+            cfg.device = device
+        run_dir = run_one_config(cfg, out_root, skip_completed=skip_completed)
+        summary = pd.read_csv(run_dir / "tables" / "eval_by_count.csv")
+        summary.insert(0, "run_dir", str(run_dir))
+        summary.insert(1, "setting", run_dir.name)
+        all_rows.append(summary)
+    combined = pd.concat(all_rows, ignore_index=True)
+    combined.to_csv(out_root / f"{experiment}_{preset}_combined_eval_by_count.csv", index=False)
+    return combined
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="v7/v8 synthetic counting sweeps")
+    p.add_argument("--experiment", choices=["v7", "v8"], required=True)
+    p.add_argument("--preset", choices=["debug", "main"], default="debug")
+    p.add_argument("--out-root", default="runs/synthetic_counting_sweeps")
+    p.add_argument("--device", default=None)
+    p.add_argument("--no-skip-completed", action="store_true")
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    run_sweep(args.experiment, args.preset, args.out_root, skip_completed=not args.no_skip_completed, device=args.device)
+
+
+if __name__ == "__main__":
+    main()

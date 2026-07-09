@@ -49,6 +49,7 @@ import random
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -105,7 +106,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
-from IPython.display import Markdown, display
+from IPython.display import Image, Markdown, display
 from tqdm.auto import tqdm
 from transformers import GPT2LMHeadModel
 
@@ -1005,7 +1006,7 @@ display(Markdown("\n".join(lines)))
 
 1. **Final-answer readout attention**：在 thinking 模型的 `<Ans>` 位置，看 16 个 heads 是读 prompt needles、prompt noise，还是读已经生成的 trace tokens。
 2. **Prompt-vs-trace conflict**：构造 prompt count 和 trace count 不一致的输入，问最终答案更跟 prompt 还是更跟 trace。
-3. **Head-mask ablation**：teacher-forced 地 mask 掉候选 retrieval heads / broad heads，看 trace marker 预测和 final answer 预测分别怎么变。
+3. **Head-output ablation**：teacher-forced 地把候选 retrieval heads / broad heads 的 attention output 直接置零，看 trace marker 预测和 final answer 预测分别怎么变。
 
 如果机制是 targeted retrieval + aggregate，我们预期：
 
@@ -1018,7 +1019,7 @@ display(Markdown("\n".join(lines)))
         r"""
 RUN_THINKING_ANSWER_ATTENTION = True
 RUN_PROMPT_TRACE_CONFLICT = True
-RUN_HEAD_MASK_ABLATION = True
+RUN_HEAD_OUTPUT_ABLATION = True
 
 MECHANISM_EXAMPLES_PER_COUNT = min(EXAMPLES_PER_COUNT, 50)
 ABLATION_EXAMPLES_PER_COUNT = min(EXAMPLES_PER_COUNT, 10)
@@ -1299,9 +1300,9 @@ plt.show()
     ),
     md(
         r"""
-### 11.2 Head-Mask Ablation
+### 11.2 Head-Output Ablation
 
-这个实验用 `head_mask` 在 teacher-forced forward 中关掉指定 heads，比较两个输出：
+这个实验用 `c_proj` pre-hook 在 teacher-forced forward 中直接置零指定 head 的 attention output slice，比较两个输出：
 
 - `trace_marker_acc` / `trace_marker_margin`：在每个 trace index token `<k>` 后预测对应 marker 的准确率/边际。这个测试 targeted retrieval 是否必要。
 - `answer_acc` / `answer_count_margin`：在 `<Ans>` 后预测最终 count 的准确率/边际。这个测试 final readout 是否依赖某些 broad/trace heads。
@@ -1311,27 +1312,46 @@ plt.show()
     ),
     code(
         r"""
-def make_head_mask(mask_heads: list[tuple[int, int]]) -> torch.Tensor:
-    n_layer = int(think_model.config.n_layer)
-    n_head = int(think_model.config.n_head)
-    mask = torch.ones(n_layer, n_head, device=DEVICE)
+@contextmanager
+def ablate_gpt2_attention_heads(model: GPT2LMHeadModel, mask_heads: list[tuple[int, int]]):
+    # Zero selected per-head attention outputs before each layer's c_proj.
+    handles = []
+    by_layer: dict[int, list[int]] = {}
     for layer_1based, head in mask_heads:
-        mask[int(layer_1based) - 1, int(head)] = 0.0
-    return mask
+        by_layer.setdefault(int(layer_1based), []).append(int(head))
+
+    head_dim = int(model.config.n_embd) // int(model.config.n_head)
+    for layer_1based, heads in by_layer.items():
+        attn = model.transformer.h[layer_1based - 1].attn
+        spans = [(h * head_dim, (h + 1) * head_dim) for h in heads]
+
+        def pre_hook(module, inputs, spans=spans):
+            x = inputs[0].clone()
+            for start, stop in spans:
+                x[..., start:stop] = 0.0
+            return (x,) + tuple(inputs[1:])
+
+        handles.append(attn.c_proj.register_forward_pre_hook(pre_hook))
+    try:
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
 
 @torch.no_grad()
-def eval_marker_and_answer_with_mask(model, examples: list[BaseExample], condition: str, mask_heads: list[tuple[int, int]]) -> dict[str, float]:
-    head_mask = make_head_mask(mask_heads) if mask_heads else None
+def eval_marker_and_answer_with_ablation(model, examples: list[BaseExample], condition: str, mask_heads: list[tuple[int, int]]) -> dict[str, float]:
     marker_ids = [vocab.token_to_id[t] for t in MARKER_TOKENS]
     answer_correct = []
     answer_margins = []
     marker_correct = []
     marker_margins = []
     model.eval()
-    for ex in tqdm(examples, desc=f"head mask {condition}", leave=False):
+    for ex in tqdm(examples, desc=f"head output ablation {condition}", leave=False):
         r = render_thinking(ex, vocab)
         ids = torch.tensor([r["input_ids"]], device=DEVICE)
-        out = model(ids, head_mask=head_mask)
+        attention_mask = torch.ones_like(ids)
+        with ablate_gpt2_attention_heads(model, mask_heads):
+            out = model(input_ids=ids, attention_mask=attention_mask, use_cache=False)
         logits = out.logits[0]
         ans_logits = logits[r["anchors"]["ans_token"]]
         gold_count_id = vocab.token_to_id[vocab.count_to_token(ex.count)]
@@ -1361,25 +1381,46 @@ def eval_marker_and_answer_with_mask(model, examples: list[BaseExample], conditi
         "trace_marker_margin": float(np.mean(marker_margins)),
     }
 
-ablation_path = TABLE_DIR / "thinking_head_mask_ablation.csv"
+ablation_path = TABLE_DIR / "thinking_head_output_multi_ablation.csv"
 ablation_examples = balanced_examples(int(cfg["seq_len"]), ABLATION_EXAMPLES_PER_COUNT, RANDOM_SEED + 3303)
 
-if RUN_HEAD_MASK_ABLATION:
+if RUN_HEAD_OUTPUT_ABLATION:
     if REUSE_EXISTING_TABLES and ablation_path.exists():
         ablation_df = pd.read_csv(ablation_path)
     else:
-        broad_candidates = (
-            ans_head.sort_values("broad_prompt_aggregate_score", ascending=False)[["layer", "head"]]
-            .head(2)
-            .itertuples(index=False, name=None)
-        )
-        broad_candidates = [(int(l), int(h)) for l, h in broad_candidates]
-        trace_readout_candidates = (
-            ans_head.sort_values("trace_readout_score", ascending=False)[["layer", "head"]]
-            .head(2)
-            .itertuples(index=False, name=None)
-        )
-        trace_readout_candidates = [(int(l), int(h)) for l, h in trace_readout_candidates]
+        n_layer = int(think_model.config.n_layer)
+        n_head = int(think_model.config.n_head)
+
+        def unique_heads(heads: list[tuple[int, int]]) -> list[tuple[int, int]]:
+            out = []
+            seen = set()
+            for layer, head in heads:
+                item = (int(layer), int(head))
+                if item not in seen:
+                    out.append(item)
+                    seen.add(item)
+            return out
+
+        def top_heads(df: pd.DataFrame, score: str, k: int) -> list[tuple[int, int]]:
+            if score not in df.columns:
+                return []
+            rows = df.sort_values(score, ascending=False)[["layer", "head"]].head(k).itertuples(index=False, name=None)
+            return unique_heads([(int(l), int(h)) for l, h in rows])
+
+        def layer_heads(layer: int) -> list[tuple[int, int]]:
+            return [(int(layer), h) for h in range(n_head)]
+
+        index_top1 = top_heads(think_head, "correct_top1_rate", 1)
+        index_top2 = top_heads(think_head, "correct_top1_rate", 2)
+        index_top4 = top_heads(think_head, "correct_top1_rate", 4)
+        index_top8 = top_heads(think_head, "correct_top1_rate", 8)
+        index_mass_top4 = top_heads(think_head, "all_prompt_needles_mass", 4)
+        answer_broad_top2 = top_heads(ans_head, "broad_prompt_aggregate_score", 2)
+        answer_broad_top4 = top_heads(ans_head, "broad_prompt_aggregate_score", 4)
+        answer_trace_top2 = top_heads(ans_head, "trace_readout_score", 2)
+        answer_trace_top4 = top_heads(ans_head, "trace_readout_score", 4)
+        answer_enrich_top4 = top_heads(ans_head, "needle_enrichment", 4)
+
         mask_conditions = [
             ("none", []),
             ("mask_L3H3_main_retrieval", [(3, 3)]),
@@ -1388,10 +1429,28 @@ if RUN_HEAD_MASK_ABLATION:
             ("mask_L3H0_broad_noise", [(3, 0)]),
             ("mask_L3H2_lag_noise", [(3, 2)]),
             ("mask_L3_all", [(3, 0), (3, 1), (3, 2), (3, 3)]),
-            ("mask_top2_answer_broad_prompt", broad_candidates),
-            ("mask_top2_answer_trace_readout", trace_readout_candidates),
+            ("mask_layer1_all", layer_heads(1)),
+            ("mask_layer2_all", layer_heads(2)),
+            ("mask_layer3_all", layer_heads(3)),
+            ("mask_layer4_all", layer_heads(4)),
+            ("mask_index_top1_correct", index_top1),
+            ("mask_index_top2_correct", index_top2),
+            ("mask_index_top4_correct", index_top4),
+            ("mask_index_top8_correct", index_top8),
+            ("mask_index_top4_needle_mass", index_mass_top4),
+            ("mask_top2_answer_broad_prompt", answer_broad_top2),
+            ("mask_top4_answer_broad_prompt", answer_broad_top4),
+            ("mask_top2_answer_trace_readout", answer_trace_top2),
+            ("mask_top4_answer_trace_readout", answer_trace_top4),
+            ("mask_top4_answer_needle_enrichment", answer_enrich_top4),
+            ("mask_index_top4_plus_answer_trace_top4", unique_heads(index_top4 + answer_trace_top4)),
+            ("mask_index_top4_plus_answer_broad_top4", unique_heads(index_top4 + answer_broad_top4)),
+            ("mask_answer_broad_top4_plus_trace_top4", unique_heads(answer_broad_top4 + answer_trace_top4)),
+            ("mask_L3_all_plus_answer_trace_top4", unique_heads(layer_heads(3) + answer_trace_top4)),
+            ("mask_L3_all_plus_answer_broad_top4", unique_heads(layer_heads(3) + answer_broad_top4)),
+            ("mask_all_16_heads_sanity", [(l, h) for l in range(1, n_layer + 1) for h in range(n_head)]),
         ]
-        rows = [eval_marker_and_answer_with_mask(think_model, ablation_examples, name, heads) for name, heads in mask_conditions]
+        rows = [eval_marker_and_answer_with_ablation(think_model, ablation_examples, name, heads) for name, heads in mask_conditions]
         ablation_df = pd.DataFrame(rows)
         ablation_df.to_csv(ablation_path, index=False)
 else:
@@ -1406,15 +1465,27 @@ for col in ["answer_acc", "answer_count_margin", "trace_marker_acc", "trace_mark
 display(Markdown("**Ablation deltas relative to no mask.**"))
 display(delta[["condition", "mask_heads", "delta_answer_acc", "delta_answer_count_margin", "delta_trace_marker_acc", "delta_trace_marker_margin"]])
 
-plot_cols = ["answer_count_margin", "trace_marker_margin", "answer_acc", "trace_marker_acc"]
-fig, axes = plt.subplots(2, 2, figsize=(14, 8), constrained_layout=True)
-for ax, col in zip(axes.flat, plot_cols):
-    sns.barplot(data=ablation_df, x="condition", y=col, ax=ax, color="#2f6fed")
-    ax.set_title(col)
-    ax.set_xlabel("")
-    ax.tick_params(axis="x", rotation=35)
-plt.savefig(FIG_DIR / "thinking_head_mask_ablation.png", bbox_inches="tight", dpi=180)
+delta_plot = delta[delta["condition"] != "none"].copy()
+fig, axes = plt.subplots(1, 2, figsize=(14, max(6, 0.33 * len(delta_plot))), constrained_layout=True)
+for ax, col, title in [
+    (axes[0], "delta_trace_marker_margin", "Trace marker margin change"),
+    (axes[1], "delta_answer_count_margin", "Final answer margin change"),
+]:
+    plot_df = delta_plot.sort_values(col, ascending=True)
+    sns.barplot(data=plot_df, y="condition", x=col, ax=ax, color="#2f6fed")
+    ax.axvline(0.0, color="black", linewidth=1)
+    ax.set_title(title)
+    ax.set_ylabel("")
+    ax.set_xlabel("delta vs no ablation")
+plt.savefig(FIG_DIR / "thinking_head_output_multi_ablation.png", bbox_inches="tight", dpi=180)
 plt.show()
+
+base = ablation_df[ablation_df["condition"] == "none"].iloc[0]
+max_abs_delta = 0.0
+for col in ["answer_count_margin", "trace_marker_margin"]:
+    max_abs_delta = max(max_abs_delta, float((ablation_df[col] - float(base[col])).abs().max()))
+if max_abs_delta < 1e-7:
+    display(Markdown("**Warning:** all head-output ablation deltas are numerically zero. Treat this ablation table as inconclusive and use v3.2 activation patching/autoregressive ablation instead."))
         """
     ),
     code(
@@ -1457,7 +1528,79 @@ if "ablation_df" in globals():
 display(Markdown("\n".join(lines)))
         """
     ),
-    md("## 12. Save Results to Google Drive"),
+    md(
+        r"""
+## 12. Follow-up: successor transition and final aggregation
+
+这一节继续放在 v2.2 里，因为它回答的是同一个机制问题的下一步：
+
+1. `index_token_k` targeted retrieval 到第 k 个 prompt needle 之后，模型怎样生成下一个 trace token？
+2. 下一个 retrieval query 是怎样从第 k 个 marker 过渡到第 k+1 个 index 的？
+3. 最终 `<Ans>` 更像是在读 prompt needles，还是读已经生成出来的 trace？
+
+额外做一个 `trace_length_override` sanity check：固定 prompt 不变，但 teacher-forced 输入不同长度的 trace，看最终答案是否跟随 trace length。
+        """
+    ),
+    code(
+        r"""
+RUN_FOLLOWUP_MECHANISM = True
+FOLLOWUP_EXAMPLES_PER_COUNT = min(50, EXAMPLES_PER_COUNT)
+
+if RUN_FOLLOWUP_MECHANISM:
+    from synthetic_counting_extensions.v2_2_followup import run_v2_2_followup
+
+    followup_outputs = run_v2_2_followup(
+        V2_RUN_DIR,
+        examples_per_count=FOLLOWUP_EXAMPLES_PER_COUNT,
+        device=DEVICE,
+    )
+    FOLLOWUP_DIR = V2_RUN_DIR / "v2_2_followup_mechanism"
+    display(Markdown(f"**Follow-up output dir:** `{FOLLOWUP_DIR}`"))
+    display(Markdown(f"**Follow-up report:** `{FOLLOWUP_DIR / 'report' / 'report.html'}`"))
+
+    display(Markdown("**Top successor-transition heads.** `next_token_margin` is the next-index/close logit margin at the current marker token."))
+    display(
+        followup_outputs["successor_transition_head_summary"]
+        .sort_values("next_token_margin", ascending=False)
+        .head(12)
+    )
+
+    display(Markdown("**Top final-answer trace-attention heads.** `all_trace_marker_mass` measures how much `<Ans>` attends to generated trace markers."))
+    display(
+        followup_outputs["answer_trace_attention_head_summary"]
+        .sort_values("all_trace_marker_mass", ascending=False)
+        .head(12)
+    )
+
+    display(Markdown("**Trace-length override summary.** High `follows_trace` means final answer follows the teacher-forced trace length rather than prompt count."))
+    display(followup_outputs["trace_length_override_summary"].head(20))
+else:
+    FOLLOWUP_DIR = None
+    display(Markdown("Follow-up mechanism diagnostics skipped."))
+        """
+    ),
+    code(
+        r"""
+if RUN_FOLLOWUP_MECHANISM:
+    fig_dir = FOLLOWUP_DIR / "figures"
+    followup_figs = [
+        ("successor_next_token_margin.png", "Successor transition: next-index/close logit margin by layer/head"),
+        ("successor_current_marker_self_mass.png", "Successor transition: attention from marker_k to itself"),
+        ("successor_next_prompt_needle_mass.png", "Successor transition: attention from marker_k to prompt needle k+1"),
+        ("answer_all_trace_marker_mass.png", "Final answer: attention mass from <Ans> to all trace markers"),
+        ("answer_last_trace_marker_mass.png", "Final answer: attention mass from <Ans> to the last trace marker"),
+        ("trace_length_override_follows_trace.png", "Trace-length override: whether final answer follows forced trace length"),
+    ]
+    for filename, caption in followup_figs:
+        path = fig_dir / filename
+        if path.exists():
+            display(Markdown(f"### {caption}\n`{filename}`"))
+            display(Image(filename=str(path)))
+        else:
+            display(Markdown(f"Missing follow-up figure: `{path}`"))
+        """
+    ),
+    md("## 13. Save Results to Google Drive"),
     code(
         r"""
 DRIVE_SAVE_COMPLETED = False
@@ -1473,6 +1616,8 @@ if SAVE_TO_DRIVE:
     dest = DRIVE_RESULTS_ROOT / f"v2_2_attention_diagnostics_seed{RANDOM_SEED}_{stamp}"
     dest.mkdir(parents=True, exist_ok=True)
     shutil.copytree(ANALYSIS_DIR, dest / "analysis", dirs_exist_ok=True)
+    if "FOLLOWUP_DIR" in globals() and FOLLOWUP_DIR is not None and FOLLOWUP_DIR.exists():
+        shutil.copytree(FOLLOWUP_DIR, dest / "followup_mechanism", dirs_exist_ok=True)
     nb_src = ROOT / "notebooks" / "Trace_Count_v2_2_Colab.ipynb"
     if nb_src.exists():
         shutil.copy2(nb_src, dest / nb_src.name)
@@ -1480,6 +1625,8 @@ if SAVE_TO_DRIVE:
         "source_v2_run_dir": str(V2_RUN_DIR),
         "analysis_dir": str(ANALYSIS_DIR),
         "examples_per_count": EXAMPLES_PER_COUNT,
+        "followup_examples_per_count": globals().get("FOLLOWUP_EXAMPLES_PER_COUNT"),
+        "followup_dir": str(FOLLOWUP_DIR) if "FOLLOWUP_DIR" in globals() and FOLLOWUP_DIR is not None else None,
         "focus_layer": FOCUS_LAYER,
         "head_scope": "all heads in focus_layer",
         "created_at": datetime.now().isoformat(),
@@ -1490,7 +1637,7 @@ else:
     display(Markdown(f"Drive save skipped. Local analysis dir: `{ANALYSIS_DIR}`"))
         """
     ),
-    md("## 13. Optional: Disconnect Colab Runtime After Drive Save"),
+    md("## 14. Optional: Disconnect Colab Runtime After Drive Save"),
     code(
         r"""
 AUTO_DISCONNECT_AFTER_SAVE = False
