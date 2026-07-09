@@ -6,7 +6,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "notebooks" / "Trace_Count_v2_2_Colab.ipynb"
-FOLLOWUP_SOURCE = (ROOT / "synthetic_counting_extensions" / "v2_2_followup.py").read_text(encoding="utf-8")
 
 
 def md(source: str) -> dict:
@@ -1566,11 +1565,13 @@ display(Markdown("\n".join(lines)))
     code(
         "RUN_FOLLOWUP_MECHANISM = True\n"
         "FOLLOWUP_EXAMPLES_PER_COUNT = min(50, EXAMPLES_PER_COUNT)\n\n"
-        f"_EMBEDDED_FOLLOWUP_SOURCE = {json.dumps(FOLLOWUP_SOURCE)}\n\n"
+        "FOLLOWUP_CAUSAL_EXAMPLES_PER_COUNT = min(10, FOLLOWUP_EXAMPLES_PER_COUNT)\n\n"
+        "TRY_GIT_PULL_FOR_FOLLOWUP = False\n\n"
         r"""
 if RUN_FOLLOWUP_MECHANISM:
     from pathlib import Path
     import os
+    import subprocess
     import sys
 
     def _resolve_followup_repo_root() -> Path:
@@ -1583,25 +1584,19 @@ if RUN_FOLLOWUP_MECHANISM:
             for candidate in [start, *start.parents]:
                 if (candidate / "synthetic_counting_extensions" / "v2_2_followup.py").exists():
                     return candidate
-                if (candidate / "notebooks").exists() or (candidate / ".git").exists():
-                    target = candidate / "synthetic_counting_extensions" / "v2_2_followup.py"
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    init_path = target.parent / "__init__.py"
-                    if not init_path.exists():
-                        init_path.write_text("", encoding="utf-8")
-                    target.write_text(_EMBEDDED_FOLLOWUP_SOURCE, encoding="utf-8")
-                    print(f"Wrote embedded follow-up module to {target}")
-                    return candidate
+                if TRY_GIT_PULL_FOR_FOLLOWUP and (candidate / ".git").exists():
+                    subprocess.run(["git", "pull"], cwd=candidate, check=False)
+                    if (candidate / "synthetic_counting_extensions" / "v2_2_followup.py").exists():
+                        return candidate
         searched = []
         for start in starts:
             searched.extend(str(p) for p in [start.resolve(), *start.resolve().parents])
-        fallback_root = Path.cwd().resolve()
-        target = fallback_root / "synthetic_counting_extensions" / "v2_2_followup.py"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        (target.parent / "__init__.py").write_text("", encoding="utf-8")
-        target.write_text(_EMBEDDED_FOLLOWUP_SOURCE, encoding="utf-8")
-        print(f"Wrote embedded follow-up module to fallback path {target}")
-        return fallback_root
+        raise FileNotFoundError(
+            "Could not find synthetic_counting_extensions/v2_2_followup.py. "
+            "Please sync the latest repo files in Colab, or set TRY_GIT_PULL_FOR_FOLLOWUP = True "
+            "and rerun this cell. "
+            f"Searched: {searched[:8]}"
+        )
 
     ROOT = _resolve_followup_repo_root()
     os.chdir(ROOT)
@@ -1613,6 +1608,7 @@ if RUN_FOLLOWUP_MECHANISM:
     followup_outputs = run_v2_2_followup(
         V2_RUN_DIR,
         examples_per_count=FOLLOWUP_EXAMPLES_PER_COUNT,
+        causal_examples_per_count=FOLLOWUP_CAUSAL_EXAMPLES_PER_COUNT,
         device=DEVICE,
     )
     FOLLOWUP_DIR = V2_RUN_DIR / "v2_2_followup_mechanism"
@@ -1626,11 +1622,32 @@ if RUN_FOLLOWUP_MECHANISM:
         .head(12)
     )
 
+    display(Markdown("**Top next-index retrieval heads.** This is measured at `index_token_{k+1}`, so it tests whether the next retrieval query points to prompt needle `k+1`."))
+    display(
+        followup_outputs["next_index_retrieval_head_summary"]
+        .sort_values(["correct_top1", "correct_prompt_needle_mass"], ascending=False)
+        .head(12)
+    )
+
+    display(Markdown("**Top causal successor heads.** `margin_drop = clean_margin - masked_margin`; positive values mean masking that single head hurts the next-index/close decision."))
+    display(
+        followup_outputs["successor_head_ablation_head_summary"]
+        .sort_values("margin_drop", ascending=False)
+        .head(12)
+    )
+
     display(Markdown("**Top final-answer trace-attention heads.** `all_trace_marker_mass` measures how much `<Ans>` attends to generated trace markers."))
     display(
         followup_outputs["answer_trace_attention_head_summary"]
         .sort_values("all_trace_marker_mass", ascending=False)
         .head(12)
+    )
+
+    display(Markdown("**Final-answer multi-head masks.** Head groups are masked globally; positive `margin_drop` / `accuracy_drop` means that group supports final count readout."))
+    display(
+        followup_outputs["answer_multihead_mask_summary"]
+        .sort_values("margin_drop", ascending=False)
+        .head(20)
     )
 
     display(Markdown("**Trace-length override summary.** High `follows_trace` means final answer follows the teacher-forced trace length rather than prompt count."))
@@ -1648,8 +1665,13 @@ if RUN_FOLLOWUP_MECHANISM:
         ("successor_next_token_margin.png", "Successor transition: next-index/close logit margin by layer/head"),
         ("successor_current_marker_self_mass.png", "Successor transition: attention from marker_k to itself"),
         ("successor_next_prompt_needle_mass.png", "Successor transition: attention from marker_k to prompt needle k+1"),
+        ("next_index_correct_prompt_needle_mass.png", "Next index token: attention mass to prompt needle k"),
+        ("next_index_correct_top1.png", "Next index token: whether the correct prompt needle is top-1 among prompt needles"),
+        ("successor_margin_drop_by_head.png", "Single-head ablation: drop in successor next-index/close margin"),
         ("answer_all_trace_marker_mass.png", "Final answer: attention mass from <Ans> to all trace markers"),
         ("answer_last_trace_marker_mass.png", "Final answer: attention mass from <Ans> to the last trace marker"),
+        ("answer_multihead_mask_margin_drop.png", "Final answer multi-head mask: count-margin drop"),
+        ("answer_multihead_mask_accuracy_drop.png", "Final answer multi-head mask: accuracy drop"),
         ("trace_length_override_follows_trace.png", "Trace-length override: whether final answer follows forced trace length"),
     ]
     for filename, caption in followup_figs:
@@ -1687,6 +1709,7 @@ if SAVE_TO_DRIVE:
         "analysis_dir": str(ANALYSIS_DIR),
         "examples_per_count": EXAMPLES_PER_COUNT,
         "followup_examples_per_count": globals().get("FOLLOWUP_EXAMPLES_PER_COUNT"),
+        "followup_causal_examples_per_count": globals().get("FOLLOWUP_CAUSAL_EXAMPLES_PER_COUNT"),
         "followup_dir": str(FOLLOWUP_DIR) if "FOLLOWUP_DIR" in globals() and FOLLOWUP_DIR is not None else None,
         "focus_layer": FOCUS_LAYER,
         "head_scope": "all heads in focus_layer",
