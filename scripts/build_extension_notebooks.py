@@ -268,10 +268,14 @@ def build_v7() -> None:
     cells = [
         md(
             """
-# Trace Count v7: find settings where CoT beats non-thinking
+# Trace Count v7: pure context-length extension of v2
 
-这个 notebook 跑同一 synthetic counting task 的 paired models：`nonthinking` 和 `thinking`。
-目标是扫一些更难的 setting，找出 CoT 相比 direct answer 更有说服力的优势区间。
+这个 notebook 只改变 v2 的 prompt 长度，count 始终为 1–10：
+
+- length 1024：non-thinking + thinking；
+- length 2048：non-thinking + thinking。
+
+Main 一共训练四个模型。trace index 与最终答案共享 `<1>...<10>` 数字 token。
 
 评估同时记录 `tf_accuracy` 和 `ar_accuracy`。其中 `tf_accuracy` 是 teacher-forced answer position 上的 final-count readout；`ar_accuracy` 是从 prompt 后 autoregressively 生成到 final answer 后的准确率。报告里的 `accuracy` 默认使用 `ar_accuracy`。
             """
@@ -281,7 +285,7 @@ def build_v7() -> None:
         md("## 2. Runtime settings"),
         code(
             r"""
-PRESET = "debug"  # "debug" or "main"
+PRESET = "main"  # "debug" or "main"
 OUT_ROOT = "runs/trace_count_v7_cot_advantage"
 DEVICE = "cuda" if __import__("torch").cuda.is_available() else "cpu"
 SKIP_COMPLETED = True
@@ -291,7 +295,11 @@ print({"PRESET": PRESET, "OUT_ROOT": OUT_ROOT, "DEVICE": DEVICE})
         md("## 3. Run v7 sweep"),
         code(
             r"""
-from synthetic_counting_extensions.v7_v8_sweeps import run_sweep
+from synthetic_counting_extensions.v7_v8_sweeps import preset_configs, run_sweep
+
+settings = preset_configs("v7", PRESET)
+display(pd.DataFrame([vars(cfg) | {"effective_batch_size": cfg.effective_batch_size} for cfg in settings]))
+display(Markdown(f"**Training runs:** `{len(settings)} settings × 2 models = {2 * len(settings)}`"))
 
 combined = run_sweep("v7", PRESET, OUT_ROOT, skip_completed=SKIP_COMPLETED, device=DEVICE)
 display(combined.head())
@@ -303,10 +311,15 @@ display(combined.groupby(["setting", "mode"], as_index=False)["accuracy"].mean()
             r"""
 for run in Path(OUT_ROOT).glob("v7_*"):
     report = run / "report" / "report.html"
-    fig = run / "figures" / "accuracy_by_count.png"
-    if fig.exists():
+    figures = [
+        run / "figures" / "accuracy_by_count.png",
+        run / "figures" / "accuracy_by_validation_split.png",
+    ]
+    if figures[0].exists():
         display(Markdown(f"## {run.name}\nReport: `{report}`"))
-        display(Image(filename=str(fig)))
+        for fig in figures:
+            if fig.exists():
+                display(Image(filename=str(fig)))
             """
         ),
         md("## 5. Save / GitHub / disconnect"),
@@ -321,16 +334,20 @@ def build_v8() -> None:
     cells = [
         md(
             """
-# Trace Count v8: needle-count stress test
+# Trace Count v8: pure needle-count extension of v2
 
-目标：把 v2-style setting 拉长、needle 数量增多，找出 accuracy 开始下降的 count 区间。
+目标：保持 v2 的 prompt 长度 256，只把 needle count 扩展到 1–30。
+
+Main 只训练两个模型：一个 non-thinking，一个 thinking。训练和验证都覆盖 1–30，
+因此 21–30 不再包含“未训练数字 token”的伪 OOD。trace index 与最终答案共享 `<1>...<30>`。
 
 输出重点：
 
 1. autoregressive final-count accuracy by gold count；
 2. `tf_accuracy` / `ar_accuracy` 同时保存，图和阈值默认使用 `ar_accuracy`；
-3. first count below 0.9 accuracy；
-4. CoT 和 non-thinking 的崩塌阈值是否不同。
+3. `val_1_10`、`val_11_20`、`val_21_30` 三个 balanced validation split；
+4. first count below 0.9 accuracy；
+5. CoT 和 non-thinking 的崩塌阈值是否不同。
             """
         ),
         md("## 1. Setup"),
@@ -338,7 +355,7 @@ def build_v8() -> None:
         md("## 2. Runtime settings"),
         code(
             r"""
-PRESET = "debug"  # "debug" or "main"
+PRESET = "main"  # "debug" or "main"
 OUT_ROOT = "runs/trace_count_v8_many_needles"
 DEVICE = "cuda" if __import__("torch").cuda.is_available() else "cpu"
 SKIP_COMPLETED = True
@@ -348,10 +365,27 @@ print({"PRESET": PRESET, "OUT_ROOT": OUT_ROOT, "DEVICE": DEVICE})
         md("## 3. Run v8 sweep"),
         code(
             r"""
-from synthetic_counting_extensions.v7_v8_sweeps import run_sweep
+from synthetic_counting_extensions.v7_v8_sweeps import preset_configs, run_sweep
+
+settings = preset_configs("v8", PRESET)
+display(pd.DataFrame([vars(cfg) | {"effective_batch_size": cfg.effective_batch_size} for cfg in settings]))
+display(Markdown(f"**Training runs:** `{len(settings)} setting × 2 models = {2 * len(settings)}`"))
 
 combined = run_sweep("v8", PRESET, OUT_ROOT, skip_completed=SKIP_COMPLETED, device=DEVICE)
 display(combined.head())
+split_summary = (
+    combined.groupby(["setting", "mode", "validation_split"], as_index=False)
+    .agg(
+        count_min=("count", "min"),
+        count_max=("count", "max"),
+        tf_accuracy=("tf_accuracy", "mean"),
+        ar_accuracy=("ar_accuracy", "mean"),
+        accuracy=("accuracy", "mean"),
+        mae=("mae", "mean"),
+    )
+)
+display(Markdown("## Validation performance by needle-count range"))
+display(split_summary)
 threshold = []
 for (setting, mode), g in combined.groupby(["setting", "mode"]):
     bad = g[g["accuracy"] < 0.9]
@@ -364,10 +398,15 @@ display(pd.DataFrame(threshold))
             r"""
 for run in Path(OUT_ROOT).glob("v8_*"):
     report = run / "report" / "report.html"
-    fig = run / "figures" / "accuracy_by_count.png"
-    if fig.exists():
+    figures = [
+        run / "figures" / "accuracy_by_count.png",
+        run / "figures" / "accuracy_by_validation_split.png",
+    ]
+    if figures[0].exists():
         display(Markdown(f"## {run.name}\nReport: `{report}`"))
-        display(Image(filename=str(fig)))
+        for fig in figures:
+            if fig.exists():
+                display(Image(filename=str(fig)))
             """
         ),
         md("## 5. Save / GitHub / disconnect"),

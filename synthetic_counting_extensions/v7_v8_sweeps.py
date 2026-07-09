@@ -35,8 +35,10 @@ class SweepConfig:
     marker_vocab_size: int = 10
     train_steps: int = 2000
     batch_size: int = 64
+    grad_accum_steps: int = 1
     lr: float = 3e-4
-    warmup_steps: int = 200
+    warmup_steps: int = 500
+    weight_decay: float = 0.1
     log_every: int = 50
     eval_examples_per_count: int = 100
     ar_examples_per_count: int = 40
@@ -53,15 +55,20 @@ class SweepConfig:
     def n_positions(self) -> int:
         return int(self.seq_len) + 2 * int(self.max_count) + 12
 
+    @property
+    def effective_batch_size(self) -> int:
+        return int(self.batch_size) * int(self.grad_accum_steps)
+
 
 class Vocab:
     def __init__(self, cfg: SweepConfig):
         self.special = ["<PAD>", "<BOS>", "<EOS>", "<Think>", "</Think>", "<Ans>"]
         self.noise = [f"<N{i}>" for i in range(cfg.noise_vocab_size)]
         self.markers = [f"<M{i}>" for i in range(cfg.marker_vocab_size)]
-        self.counts = [f"<C{i}>" for i in range(1, cfg.max_count + 1)]
-        self.indices = [f"<I{i}>" for i in range(1, cfg.max_count + 1)]
-        self.id_to_token = self.special + self.noise + self.markers + self.counts + self.indices
+        # Keep v7/v8 directly comparable with v2: trace indices and final
+        # answers use the same numeric-token embeddings and unembeddings.
+        self.numbers = [f"<{i}>" for i in range(1, cfg.max_count + 1)]
+        self.id_to_token = self.special + self.noise + self.markers + self.numbers
         self.token_to_id = {t: i for i, t in enumerate(self.id_to_token)}
 
     def encode(self, tokens: list[str]) -> list[int]:
@@ -95,17 +102,22 @@ class Vocab:
         return self.token_to_id["<Ans>"]
 
     def count_token(self, value: int) -> str:
-        return f"<C{int(value)}>"
+        return f"<{int(value)}>"
 
     def index_token(self, value: int) -> str:
-        return f"<I{int(value)}>"
+        return self.count_token(value)
 
     @property
     def count_ids(self) -> list[int]:
-        return [self.token_to_id[t] for t in self.counts]
+        return [self.token_to_id[t] for t in self.numbers]
 
     def to_json(self) -> dict[str, Any]:
-        return {"token_to_id": self.token_to_id, "id_to_token": self.id_to_token}
+        return {
+            "token_to_id": self.token_to_id,
+            "id_to_token": self.id_to_token,
+            "numeric_tokens": self.numbers,
+            "shared_trace_and_answer_numbers": True,
+        }
 
 
 @dataclass
@@ -211,25 +223,40 @@ def train_one(cfg: SweepConfig, vocab: Vocab, mode: str, run_dir: Path) -> pd.Da
     torch.manual_seed(cfg.seed + (0 if mode == "nonthinking" else 17))
     rng = random.Random(cfg.seed + (100 if mode == "nonthinking" else 200))
     model = make_model(build_model_cfg(cfg, vocab), cfg.device)
-    opt = AdamW(model.parameters(), lr=cfg.lr, betas=(0.9, 0.95), weight_decay=0.01)
+    opt = AdamW(model.parameters(), lr=cfg.lr, betas=(0.9, 0.95), weight_decay=cfg.weight_decay)
     rows: list[dict[str, Any]] = []
     pbar = tqdm(range(1, cfg.train_steps + 1), desc=f"{cfg.experiment} {mode}", leave=True)
     for step in pbar:
         lr = lr_at(step - 1, cfg)
         for group in opt.param_groups:
             group["lr"] = lr
-        batch = [render(make_example(cfg, vocab, rng), vocab, mode) for _ in range(cfg.batch_size)]
-        ids, labels = collate(batch, vocab, cfg.device)
-        out = model(input_ids=ids, attention_mask=(ids != vocab.pad_id).long())
-        shift_logits = out.logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-        loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=IGNORE_INDEX)
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        mean_loss = 0.0
+        for _ in range(cfg.grad_accum_steps):
+            batch = [render(make_example(cfg, vocab, rng), vocab, mode) for _ in range(cfg.batch_size)]
+            ids, labels = collate(batch, vocab, cfg.device)
+            out = model(input_ids=ids, attention_mask=(ids != vocab.pad_id).long())
+            shift_logits = out.logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=IGNORE_INDEX,
+            )
+            (loss / cfg.grad_accum_steps).backward()
+            mean_loss += float(loss.detach().cpu()) / cfg.grad_accum_steps
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         if step == 1 or step % cfg.log_every == 0 or step == cfg.train_steps:
-            row = {"step": step, "mode": mode, "loss": float(loss.detach().cpu()), "lr": lr}
+            row = {
+                "step": step,
+                "mode": mode,
+                "loss": mean_loss,
+                "lr": lr,
+                "micro_batch_size": cfg.batch_size,
+                "grad_accum_steps": cfg.grad_accum_steps,
+                "effective_batch_size": cfg.effective_batch_size,
+            }
             rows.append(row)
             pbar.set_postfix(loss=f"{row['loss']:.4f}", lr=f"{lr:.1e}")
     torch.save({"model_state_dict": model.state_dict(), "cfg": asdict(cfg), "mode": mode}, ckpt / "model.pt")
@@ -326,17 +353,54 @@ def summarize_eval(dfs: list[pd.DataFrame]) -> pd.DataFrame:
     )
     summary["accuracy"] = summary["ar_accuracy"].fillna(summary["tf_accuracy"])
     summary["mae"] = summary["ar_mae"].fillna(summary["tf_mae"])
+    summary["validation_split"] = summary["count"].map(validation_split)
     return summary
+
+
+def validation_split(count: int) -> str:
+    count = int(count)
+    if count <= 10:
+        return "val_1_10"
+    if count <= 20:
+        return "val_11_20"
+    if count <= 30:
+        return "val_21_30"
+    return "val_31_plus"
+
+
+def summarize_validation_splits(summary: pd.DataFrame) -> pd.DataFrame:
+    return (
+        summary.groupby(["mode", "validation_split"], as_index=False)
+        .agg(
+            count_min=("count", "min"),
+            count_max=("count", "max"),
+            n_counts=("count", "size"),
+            n_tf=("n", "sum"),
+            n_ar=("n_ar", "sum"),
+            tf_accuracy=("tf_accuracy", "mean"),
+            ar_accuracy=("ar_accuracy", "mean"),
+            tf_mae=("tf_mae", "mean"),
+            ar_mae=("ar_mae", "mean"),
+            accuracy=("accuracy", "mean"),
+            mae=("mae", "mean"),
+        )
+        .sort_values(["mode", "count_min"])
+        .reset_index(drop=True)
+    )
 
 
 def preset_configs(experiment: str, preset: str) -> list[SweepConfig]:
     if preset == "debug":
+        debug_max_count = 30 if experiment == "v8" else 10
         base = SweepConfig(
             experiment=experiment,
             preset=preset,
             seq_len=48,
+            train_count_max=debug_max_count,
+            eval_count_max=debug_max_count,
             train_steps=4,
             batch_size=8,
+            grad_accum_steps=1,
             eval_examples_per_count=2,
             ar_examples_per_count=2,
             n_layer=2,
@@ -346,20 +410,55 @@ def preset_configs(experiment: str, preset: str) -> list[SweepConfig]:
         return [base]
     if experiment == "v7":
         return [
-            SweepConfig(experiment=experiment, preset=preset, seq_len=256, train_count_max=10, eval_count_max=10, train_steps=6000, eval_examples_per_count=200, ar_examples_per_count=50),
-            SweepConfig(experiment=experiment, preset=preset, seq_len=512, train_count_max=16, eval_count_max=16, train_steps=8000, eval_examples_per_count=200, ar_examples_per_count=40),
-            SweepConfig(experiment=experiment, preset=preset, seq_len=768, train_count_max=24, eval_count_max=24, train_steps=10000, eval_examples_per_count=150, ar_examples_per_count=30, marker_vocab_size=10),
+            SweepConfig(
+                experiment=experiment,
+                preset=preset,
+                seq_len=1024,
+                train_count_max=10,
+                eval_count_max=10,
+                train_steps=10000,
+                batch_size=32,
+                grad_accum_steps=4,
+                eval_examples_per_count=200,
+                ar_examples_per_count=50,
+            ),
+            SweepConfig(
+                experiment=experiment,
+                preset=preset,
+                seq_len=2048,
+                train_count_max=10,
+                eval_count_max=10,
+                train_steps=10000,
+                batch_size=16,
+                grad_accum_steps=8,
+                eval_examples_per_count=150,
+                ar_examples_per_count=30,
+            ),
         ]
     if experiment == "v8":
         return [
-            SweepConfig(experiment=experiment, preset=preset, seq_len=512, train_count_max=20, eval_count_max=30, train_steps=10000, eval_examples_per_count=120, ar_examples_per_count=30, marker_vocab_size=10),
-            SweepConfig(experiment=experiment, preset=preset, seq_len=1024, train_count_max=20, eval_count_max=40, train_steps=12000, eval_examples_per_count=80, ar_examples_per_count=20, marker_vocab_size=10),
+            SweepConfig(
+                experiment=experiment,
+                preset=preset,
+                seq_len=256,
+                train_count_max=30,
+                eval_count_max=30,
+                train_steps=10000,
+                batch_size=128,
+                grad_accum_steps=1,
+                eval_examples_per_count=200,
+                ar_examples_per_count=50,
+            ),
         ]
     raise ValueError(experiment)
 
 
 def run_one_config(cfg: SweepConfig, out_root: Path, skip_completed: bool = True) -> Path:
-    name = f"{cfg.experiment}_{cfg.preset}_L{cfg.seq_len}_train{cfg.train_count_min}-{cfg.train_count_max}_eval{cfg.eval_count_min}-{cfg.eval_count_max}_seed{cfg.seed}"
+    name = (
+        f"{cfg.experiment}_{cfg.preset}_L{cfg.seq_len}_"
+        f"train{cfg.train_count_min}-{cfg.train_count_max}_"
+        f"eval{cfg.eval_count_min}-{cfg.eval_count_max}_sharednum_seed{cfg.seed}"
+    )
     run_dir = out_root / name
     for sub in ["tables", "figures", "checkpoints", "report"]:
         (run_dir / sub).mkdir(parents=True, exist_ok=True)
@@ -377,12 +476,14 @@ def run_one_config(cfg: SweepConfig, out_root: Path, skip_completed: bool = True
             eval_dfs.append(evaluate_one(cfg, vocab, mode, run_dir))
     summary = summarize_eval(eval_dfs)
     summary.to_csv(run_dir / "tables" / "eval_by_count.csv", index=False)
-    make_plots(run_dir, summary)
-    make_report(run_dir, cfg, summary)
+    split_summary = summarize_validation_splits(summary)
+    split_summary.to_csv(run_dir / "tables" / "eval_by_validation_split.csv", index=False)
+    make_plots(run_dir, summary, split_summary)
+    make_report(run_dir, cfg, summary, split_summary)
     return run_dir
 
 
-def make_plots(run_dir: Path, summary: pd.DataFrame) -> None:
+def make_plots(run_dir: Path, summary: pd.DataFrame, split_summary: pd.DataFrame) -> None:
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(9, 5))
@@ -415,12 +516,42 @@ def make_plots(run_dir: Path, summary: pd.DataFrame) -> None:
     fig.savefig(run_dir / "figures" / "accuracy_heatmap.png", dpi=180)
     plt.close(fig)
 
+    split_order = ["val_1_10", "val_11_20", "val_21_30", "val_31_plus"]
+    available = [name for name in split_order if name in set(split_summary["validation_split"])]
+    fig, ax = plt.subplots(figsize=(8.5, 4.8))
+    width = 0.36
+    x = np.arange(len(available))
+    for offset, (mode, group) in zip(
+        (-width / 2, width / 2), split_summary.groupby("mode", sort=True)
+    ):
+        values = (
+            group.set_index("validation_split")
+            .reindex(available)["accuracy"]
+            .to_numpy(dtype=float)
+        )
+        bars = ax.bar(x + offset, values, width=width, label=mode)
+        ax.bar_label(bars, fmt="%.3f", padding=3, fontsize=9)
+    ax.set_xticks(x, labels=available)
+    ax.set_ylim(0, 1.08)
+    ax.set_xlabel("balanced validation split by gold needle count")
+    ax.set_ylabel("autoregressive final-count accuracy")
+    ax.set_title("Accuracy by validation count range")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(run_dir / "figures" / "accuracy_by_validation_split.png", dpi=180)
+    plt.close(fig)
+
 
 def _img(name: str) -> str:
     return f"<img src='../figures/{name}' style='max-width:100%;border:1px solid #ddd;border-radius:8px'>"
 
 
-def make_report(run_dir: Path, cfg: SweepConfig, summary: pd.DataFrame) -> None:
+def make_report(
+    run_dir: Path,
+    cfg: SweepConfig,
+    summary: pd.DataFrame,
+    split_summary: pd.DataFrame,
+) -> None:
     wide = summary.pivot(index="count", columns="mode", values="accuracy").reset_index()
     if {"thinking", "nonthinking"}.issubset(wide.columns):
         wide["cot_minus_nonthinking"] = wide["thinking"] - wide["nonthinking"]
@@ -432,11 +563,12 @@ def make_report(run_dir: Path, cfg: SweepConfig, summary: pd.DataFrame) -> None:
     html = f"""<!doctype html><html><head><meta charset="utf-8"><title>{cfg.experiment} report</title>
 <style>body{{font-family:Segoe UI,Arial,sans-serif;line-height:1.55;max-width:1050px;margin:32px auto;padding:0 20px;color:#172033}}table{{border-collapse:collapse;width:100%;font-size:14px}}td,th{{border:1px solid #ddd;padding:8px}}th{{background:#f4f7fb}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:18px}}</style></head><body>
 <h1>{cfg.experiment} synthetic counting sweep</h1>
-<p>v7 用来寻找 CoT 明显优于 non-thinking 的 harder setting；v8 用来找 needle count 增多后 accuracy 开始下降的阈值。</p>
+<p>v7 只增加 prompt 长度，保持 count 1–10；v8 固定长度 256，把训练和验证 count 扩展到 1–30，并分别报告 1–10、11–20、21–30。</p>
 <h2>Config</h2><pre>{json.dumps(asdict(cfg), indent=2)}</pre>
-<div class="grid"><div>{_img('accuracy_by_count.png')}</div><div>{_img('accuracy_heatmap.png')}</div></div>
+<div class="grid"><div>{_img('accuracy_by_count.png')}</div><div>{_img('accuracy_heatmap.png')}</div><div>{_img('accuracy_by_validation_split.png')}</div></div>
 <h2>CoT advantage by count</h2>{wide.to_html(index=False)}
 <h2>First count below 0.9 accuracy</h2>{threshold.to_html(index=False)}
+<h2>Balanced validation ranges</h2>{split_summary.to_html(index=False)}
 <h2>Raw summary</h2>{summary.to_html(index=False)}
 </body></html>"""
     (run_dir / "report" / "report.html").write_text(html, encoding="utf-8")
@@ -446,6 +578,7 @@ def run_sweep(experiment: str, preset: str, out_root: str | Path, *, skip_comple
     out_root = Path(out_root)
     out_root.mkdir(parents=True, exist_ok=True)
     all_rows = []
+    all_split_rows = []
     for cfg in preset_configs(experiment, preset):
         if device:
             cfg.device = device
@@ -454,8 +587,17 @@ def run_sweep(experiment: str, preset: str, out_root: str | Path, *, skip_comple
         summary.insert(0, "run_dir", str(run_dir))
         summary.insert(1, "setting", run_dir.name)
         all_rows.append(summary)
+        split_summary = pd.read_csv(run_dir / "tables" / "eval_by_validation_split.csv")
+        split_summary.insert(0, "run_dir", str(run_dir))
+        split_summary.insert(1, "setting", run_dir.name)
+        all_split_rows.append(split_summary)
     combined = pd.concat(all_rows, ignore_index=True)
     combined.to_csv(out_root / f"{experiment}_{preset}_combined_eval_by_count.csv", index=False)
+    combined_splits = pd.concat(all_split_rows, ignore_index=True)
+    combined_splits.to_csv(
+        out_root / f"{experiment}_{preset}_combined_eval_by_validation_split.csv",
+        index=False,
+    )
     return combined
 
 
