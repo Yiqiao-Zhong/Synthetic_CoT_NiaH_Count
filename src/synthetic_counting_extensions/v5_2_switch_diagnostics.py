@@ -11,7 +11,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 
-from synthetic_niah_v5.data import balanced_examples, render_nonthinking, render_thinking
+from synthetic_niah_v5.data import balanced_examples, render_nonthinking, render_thinking, trace_prediction_queries
 from synthetic_niah_v5.model import make_model
 from synthetic_niah_v5.train import load_checkpoint
 from synthetic_niah_v5.vocab import MARKER_TOKENS, Vocab, count_token, index_token
@@ -108,25 +108,10 @@ def load_v5_state(run_dir: Path, device: str | None = None):
 
 
 def _prediction_query_positions(rendered, trace_indices: bool) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    marker_positions = list(rendered.spans.trace_marker_positions)
-    index_positions = list(rendered.spans.trace_index_positions)
-    for k, marker_pos in enumerate(marker_positions):
-        if trace_indices:
-            query_pos = index_positions[k]
-            query_kind = "index_token_k"
-        else:
-            query_pos = rendered.spans.think_open_pos if k == 0 else marker_positions[k - 1]
-            query_kind = "previous_token_predicts_marker_k"
-        rows.append(
-            {
-                "k": k + 1,
-                "target_marker_pos": marker_pos,
-                "prediction_query_pos": query_pos,
-                "post_marker_query_pos": marker_pos,
-                "query_kind": query_kind,
-            }
-        )
+    rows = trace_prediction_queries(rendered)
+    has_indices = bool(rendered.spans.trace_index_positions)
+    if has_indices != bool(trace_indices):
+        raise AssertionError("trace_indices disagrees with rendered trace spans.")
     return rows
 
 

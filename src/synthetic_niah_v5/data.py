@@ -46,6 +46,32 @@ class RenderedExample:
     gold_trace_markers: list[str]
 
 
+def trace_prediction_queries(rendered: RenderedExample) -> list[dict[str, int | str]]:
+    """Return the causal query position that predicts every trace marker."""
+    marker_positions = list(rendered.spans.trace_marker_positions)
+    index_positions = list(rendered.spans.trace_index_positions)
+    if index_positions:
+        if len(index_positions) != len(marker_positions):
+            raise AssertionError("Indexed traces must pair every index with one marker.")
+        query_positions = index_positions
+        query_kind = "index_token_k_predicts_marker_k"
+    else:
+        query_positions = [rendered.spans.think_open_pos, *marker_positions[:-1]]
+        query_kind = "previous_token_predicts_marker_k"
+    if len(query_positions) != len(marker_positions):
+        raise AssertionError("Each trace marker must have exactly one causal prediction query.")
+    return [
+        {
+            "k": k + 1,
+            "prediction_query_pos": query_pos,
+            "target_marker_pos": marker_positions[k],
+            "post_marker_query_pos": marker_positions[k],
+            "query_kind": query_kind,
+        }
+        for k, query_pos in enumerate(query_positions)
+    ]
+
+
 def count_bin(count: int) -> str:
     if count <= 3:
         return "low"

@@ -9,9 +9,9 @@ from synthetic_niah_v5.data import (
     render_nonthinking,
     render_thinking,
     thinking_query,
+    trace_prediction_queries,
     trace_tokens_for_example,
 )
-from synthetic_counting_extensions.v5_2_switch_diagnostics import _prediction_query_positions
 from synthetic_niah_v5.evaluation import parse_thinking_generation, trace_metric_dict
 from synthetic_niah_v5.run_v5 import build_parser
 from synthetic_niah_v5.vocab import Vocab, count_token, index_token
@@ -63,7 +63,7 @@ def test_v5_indexed_trace_and_prediction_queries_are_k_to_k():
     ]
     assert [rendered.token_strs[pos] for pos in rendered.spans.trace_marker_positions] == ex.needle_markers
 
-    queries = _prediction_query_positions(rendered, trace_indices=True)
+    queries = trace_prediction_queries(rendered)
     for k, query in enumerate(queries, start=1):
         assert query["k"] == k
         assert query["prediction_query_pos"] == rendered.spans.trace_index_positions[k - 1]

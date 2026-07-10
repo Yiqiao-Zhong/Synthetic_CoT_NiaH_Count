@@ -12,7 +12,7 @@ For a prompt with `n` needles whose left-to-right marker identities are `M1 ... 
 
 ```text
 thinking:
-<BOS> <THINK_ON> prompt <Think/> M1 ... Mn </Think> <Cn> <EOS>
+<BOS> <THINK_ON> prompt <Think/> <I1> M1 ... <In> Mn </Think> <Cn> <EOS>
 
 non-thinking:
 <BOS> <THINK_OFF> prompt <Think/> </Think> <Cn> <EOS>
@@ -20,10 +20,10 @@ non-thinking:
 
 `<THINK_ON>` and `<THINK_OFF>` are atomic vocabulary tokens. They are control inputs, not generated outputs.
 
-The default thinking trace contains marker tokens only. With `--trace-indices`, it becomes:
+The default thinking trace is indexed so the experiment differs from v2 only by sharing one model and adding the explicit mode switch. The marker-only form remains available as an ablation with `--no-trace-indices`:
 
 ```text
-<Think/> <I1> M1 <I2> M2 ... <In> Mn </Think>
+<Think/> M1 M2 ... Mn </Think>
 ```
 
 ## 3. Vocabulary
@@ -33,10 +33,10 @@ special: <BOS>, <EOS>, <THINK_ON>, <THINK_OFF>, <Think/>, </Think>
 noise:   <N0> ... <N63>
 markers: <A> ... <J>
 counts:  <C1> ... <C10>
-optional trace indices: <I1> ... <I10>
+trace indices: <I1> ... <I10>
 ```
 
-The default vocabulary size is 90, or 100 with trace indices. Legacy 88/98-token v5 checkpoints are intentionally rejected because their embedding and output matrices are incompatible with the explicit-switch vocabulary.
+The default vocabulary size is 100. The marker-only ablation uses 90 tokens. Legacy 88/98-token v5 checkpoints are intentionally rejected because their embedding and output matrices are incompatible with the explicit-switch vocabulary.
 
 ## 4. Data generation
 
@@ -63,7 +63,7 @@ The complete mode-specific continuation is supervised:
 
 ```text
 thinking supervised targets:
-M1 ... Mn </Think> <Cn> <EOS>
+<I1> M1 ... <In> Mn </Think> <Cn> <EOS>
 
 non-thinking supervised targets:
 </Think> <Cn> <EOS>
