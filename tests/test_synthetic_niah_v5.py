@@ -11,8 +11,10 @@ from synthetic_niah_v5.data import (
     thinking_query,
     trace_tokens_for_example,
 )
+from synthetic_counting_extensions.v5_2_switch_diagnostics import _prediction_query_positions
 from synthetic_niah_v5.evaluation import parse_thinking_generation, trace_metric_dict
-from synthetic_niah_v5.vocab import Vocab, count_token
+from synthetic_niah_v5.run_v5 import build_parser
+from synthetic_niah_v5.vocab import Vocab, count_token, index_token
 
 
 def test_v5_tokenizer_round_trip():
@@ -49,6 +51,30 @@ def test_v5_thinking_render_and_mask_marker_only():
     assert rendered.labels[rendered.spans.trace_token_positions[0]] == vocab.token_to_id[ex.needle_markers[0]]
     assert rendered.labels[rendered.spans.think_close_pos] == vocab.think_close_id
     assert rendered.labels[rendered.spans.count_pos] == vocab.count_id(ex.count)
+
+
+def test_v5_indexed_trace_and_prediction_queries_are_k_to_k():
+    vocab = Vocab.build(include_trace_indices=True)
+    ex = make_example(16, 3, random.Random(11))
+    rendered = render_thinking(ex, vocab, trace_indices=True)
+
+    assert [rendered.token_strs[pos] for pos in rendered.spans.trace_index_positions] == [
+        index_token(k) for k in range(1, ex.count + 1)
+    ]
+    assert [rendered.token_strs[pos] for pos in rendered.spans.trace_marker_positions] == ex.needle_markers
+
+    queries = _prediction_query_positions(rendered, trace_indices=True)
+    for k, query in enumerate(queries, start=1):
+        assert query["k"] == k
+        assert query["prediction_query_pos"] == rendered.spans.trace_index_positions[k - 1]
+        assert query["target_marker_pos"] == rendered.spans.trace_marker_positions[k - 1]
+        assert query["target_marker_pos"] == query["prediction_query_pos"] + 1
+
+
+def test_v5_runner_defaults_to_indexed_trace():
+    parser = build_parser()
+    assert parser.parse_args([]).trace_indices is True
+    assert parser.parse_args(["--no-trace-indices"]).trace_indices is False
 
 
 def test_v5_nonthinking_has_explicit_mode_and_supervises_close():

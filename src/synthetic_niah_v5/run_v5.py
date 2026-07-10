@@ -77,7 +77,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--probe-examples-per-count", "--probe_examples_per_count", dest="probe_examples_per_count", type=int, default=None)
     parser.add_argument("--attention-examples-per-count", "--attention_examples_per_count", dest="attention_examples_per_count", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
-    parser.add_argument("--trace-indices", "--trace_indices", dest="trace_indices", action="store_true")
+    trace_group = parser.add_mutually_exclusive_group()
+    trace_group.add_argument(
+        "--trace-indices",
+        "--trace_indices",
+        dest="trace_indices",
+        action="store_true",
+        help="Render indexed traces as <I1> M1 ... <In> Mn (default).",
+    )
+    trace_group.add_argument(
+        "--no-trace-indices",
+        "--no_trace_indices",
+        dest="trace_indices",
+        action="store_false",
+        help="Ablation: render marker-only traces as M1 ... Mn.",
+    )
+    parser.set_defaults(trace_indices=True)
     return parser
 
 

@@ -75,12 +75,22 @@ def run_attention(cfg: dict[str, Any], vocab: Vocab, run_dir: Path) -> pd.DataFr
                     if rendered.variant == "thinking":
                         per_anchor: dict[str, list[dict[str, float]]] = {}
                         mat = np.zeros((len(rendered.spans.trace_marker_positions), len(needle_positions)), dtype=float)
-                        for k, query_pos in enumerate(rendered.spans.trace_marker_positions):
+                        marker_positions = rendered.spans.trace_marker_positions
+                        index_positions = rendered.spans.trace_index_positions
+                        if index_positions:
+                            query_positions = index_positions
+                            query_anchor = "index_token_k_predicts_marker_k"
+                        else:
+                            query_positions = [rendered.spans.think_open_pos, *marker_positions[:-1]]
+                            query_anchor = "previous_token_predicts_marker_k"
+                        if len(query_positions) != len(marker_positions):
+                            raise AssertionError("Each trace marker must have exactly one causal prediction query.")
+                        for k, query_pos in enumerate(query_positions):
                             row = probs[query_pos]
                             if needle_positions:
                                 mat[k, : len(needle_positions)] = row[needle_positions]
                             metrics = _row_metrics(row, needle_positions, noise_positions, k)
-                            per_anchor.setdefault("trace_marker_k", []).append(metrics)
+                            per_anchor.setdefault(query_anchor, []).append(metrics)
                         if mat.size:
                             matrices.setdefault((layer, head), []).append(mat)
                         for query_anchor, vals in per_anchor.items():
