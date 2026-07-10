@@ -5,7 +5,7 @@ import json
 import math
 import random
 import shutil
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +48,9 @@ class SweepConfig:
     n_head: int = 4
     n_embd: int = 256
     n_inner: int | None = None
+    task_variant: str = "plain_marker_count"
+    distractor_min: int = 0
+    distractor_max: int = 0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     @property
@@ -66,6 +69,8 @@ class SweepConfig:
 class Vocab:
     def __init__(self, cfg: SweepConfig):
         self.special = ["<PAD>", "<BOS>", "<EOS>", "<Think>", "</Think>", "<Ans>"]
+        if cfg.task_variant == "conditional_pairs":
+            self.special += ["<Query>", "<Needle>", "<Decoy>"]
         self.noise = [f"<N{i}>" for i in range(cfg.noise_vocab_size)]
         self.markers = [f"<M{i}>" for i in range(cfg.marker_vocab_size)]
         # Keep v7/v8 directly comparable with v2: trace indices and final
@@ -120,6 +125,7 @@ class Vocab:
             "id_to_token": self.id_to_token,
             "numeric_tokens": self.numbers,
             "shared_trace_and_answer_numbers": True,
+            "task_variant": "conditional_pairs" if "<Query>" in self.token_to_id else "plain_marker_count",
         }
 
 
@@ -129,9 +135,115 @@ class Example:
     count: int
     needle_positions: list[int]
     needle_markers: list[str]
+    query_marker: str | None = None
+    distractor_count: int = 0
+    target_pair_positions: list[int] = field(default_factory=list)
+    pair_type_counts: dict[str, int] = field(default_factory=dict)
+    query_marker_budget: int | None = None
+    needle_qualifier_budget: int | None = None
+
+
+def _other_marker(vocab: Vocab, query_marker: str, rng: random.Random) -> str:
+    choices = [marker for marker in vocab.markers if marker != query_marker]
+    if not choices:
+        raise ValueError("conditional_pairs requires at least two marker token types")
+    return rng.choice(choices)
+
+
+def _make_conditional_example(
+    cfg: SweepConfig,
+    vocab: Vocab,
+    rng: random.Random,
+    count: int | None,
+) -> Example:
+    target_count = rng.randint(cfg.train_count_min, cfg.train_count_max) if count is None else int(count)
+    if not 1 <= target_count <= cfg.max_count:
+        raise ValueError(f"count must be in [1, {cfg.max_count}], got {target_count}")
+
+    query_marker = rng.choice(vocab.markers)
+    # Marginal frequencies are sampled independently of the gold count. This
+    # removes both count(query_marker) and count(<Needle>) as answer shortcuts.
+    budget_low = cfg.max_count + 2
+    budget_high = cfg.max_count + 4
+    query_budget = rng.randint(budget_low, budget_high)
+    needle_budget = rng.randint(budget_low, budget_high)
+    query_decoys = query_budget - target_count
+    other_needles = needle_budget - target_count
+
+    required_distractors = query_decoys + other_needles + 2
+    distractor_low = max(int(cfg.distractor_min), required_distractors)
+    if distractor_low > int(cfg.distractor_max):
+        raise ValueError(
+            "distractor_max cannot support count-independent marginals: "
+            f"need at least {distractor_low}, got {cfg.distractor_max}"
+        )
+    distractor_count = rng.randint(distractor_low, int(cfg.distractor_max))
+    other_decoys = distractor_count - query_decoys - other_needles
+
+    target_payloads = rng.sample(vocab.noise, target_count)
+    distractor_payloads = [token for token in vocab.noise if token not in set(target_payloads)]
+
+    blocks: list[tuple[str, list[str]]] = []
+    blocks.extend(
+        ("target", [query_marker, "<Needle>", payload])
+        for payload in target_payloads
+    )
+    blocks.extend(
+        ("query_decoy", [query_marker, "<Decoy>", rng.choice(distractor_payloads)])
+        for _ in range(query_decoys)
+    )
+    blocks.extend(
+        (
+            "other_needle",
+            [_other_marker(vocab, query_marker, rng), "<Needle>", rng.choice(distractor_payloads)],
+        )
+        for _ in range(other_needles)
+    )
+    blocks.extend(
+        (
+            "other_decoy",
+            [_other_marker(vocab, query_marker, rng), "<Decoy>", rng.choice(distractor_payloads)],
+        )
+        for _ in range(other_decoys)
+    )
+    occupied = 2 + 3 * len(blocks)
+    if occupied > cfg.seq_len:
+        raise ValueError(f"seq_len={cfg.seq_len} cannot fit query plus {len(blocks)} event pairs")
+    blocks.extend(("noise", [rng.choice(distractor_payloads)]) for _ in range(cfg.seq_len - occupied))
+    rng.shuffle(blocks)
+
+    sequence = ["<Query>", query_marker]
+    target_positions: list[int] = []
+    ordered_target_payloads: list[str] = []
+    for block_type, block_tokens in blocks:
+        start = len(sequence)
+        sequence.extend(block_tokens)
+        if block_type == "target":
+            target_positions.append(start)
+            ordered_target_payloads.append(block_tokens[2])
+
+    return Example(
+        seq_tokens=sequence,
+        count=target_count,
+        needle_positions=[position + 2 for position in target_positions],
+        needle_markers=ordered_target_payloads,
+        query_marker=query_marker,
+        distractor_count=distractor_count,
+        target_pair_positions=target_positions,
+        pair_type_counts={
+            "target": target_count,
+            "query_decoy": query_decoys,
+            "other_needle": other_needles,
+            "other_decoy": other_decoys,
+        },
+        query_marker_budget=query_budget,
+        needle_qualifier_budget=needle_budget,
+    )
 
 
 def make_example(cfg: SweepConfig, vocab: Vocab, rng: random.Random, count: int | None = None) -> Example:
+    if cfg.task_variant == "conditional_pairs":
+        return _make_conditional_example(cfg, vocab, rng, count)
     c = rng.randint(cfg.train_count_min, cfg.train_count_max) if count is None else int(count)
     if c > cfg.seq_len:
         raise ValueError("count cannot exceed seq_len")
@@ -166,8 +278,12 @@ def render(ex: Example, vocab: Vocab, mode: str) -> dict[str, Any]:
         anchors = {"ans_pos": ans_pos, "count_pos": ans_pos + 1}
     elif mode == "thinking":
         trace: list[str] = []
-        for k, marker in enumerate(ex.needle_markers, start=1):
-            trace.extend([vocab.index_token(k), marker])
+        if ex.query_marker is not None:
+            for k, payload in enumerate(ex.needle_markers, start=1):
+                trace.extend([vocab.index_token(k), payload])
+        else:
+            for k, marker in enumerate(ex.needle_markers, start=1):
+                trace.extend([vocab.index_token(k), marker])
         tokens = ["<BOS>"] + ex.seq_tokens + ["<Think>"] + trace + ["</Think>", "<Ans>", vocab.count_token(ex.count), "<EOS>"]
         think_pos = 1 + len(ex.seq_tokens)
         close_pos = think_pos + 1 + len(trace)
@@ -566,18 +682,21 @@ def summarize_validation_splits(summary: pd.DataFrame) -> pd.DataFrame:
 
 def preset_configs(experiment: str, preset: str) -> list[SweepConfig]:
     if preset == "debug":
-        debug_max_count = 30 if experiment == "v8" else 10
+        debug_max_count = 30 if experiment == "v8" else (4 if experiment == "v9" else 10)
         debug_model = (
-            {"n_layer": 3, "n_head": 4, "n_embd": 128, "n_inner": 384}
+            {"n_layer": 3, "n_head": 3, "n_embd": 48, "n_inner": 96}
             if experiment == "v9"
             else {"n_layer": 2, "n_head": 2, "n_embd": 64}
         )
         base = SweepConfig(
             experiment=experiment,
             preset=preset,
-            seq_len=48,
+            seq_len=64 if experiment == "v9" else 48,
             train_count_max=debug_max_count,
             eval_count_max=debug_max_count,
+            task_variant="conditional_pairs" if experiment == "v9" else "plain_marker_count",
+            distractor_min=8 if experiment == "v9" else 0,
+            distractor_max=16 if experiment == "v9" else 0,
             train_steps=4,
             batch_size=8,
             grad_accum_steps=1,
@@ -634,9 +753,12 @@ def preset_configs(experiment: str, preset: str) -> list[SweepConfig]:
                 eval_examples_per_count=200,
                 ar_examples_per_count=50,
                 n_layer=3,
-                n_head=4,
-                n_embd=128,
-                n_inner=384,
+                n_head=3,
+                n_embd=48,
+                n_inner=96,
+                task_variant="conditional_pairs",
+                distractor_min=32,
+                distractor_max=64,
             ),
         ]
     raise ValueError(experiment)
@@ -648,10 +770,17 @@ def run_one_config(
     skip_completed: bool = True,
     checkpoint_sync_root: Path | None = None,
 ) -> Path:
+    capacity_suffix = (
+        f"_cap{cfg.n_layer}L{cfg.n_head}H_d{cfg.n_embd}_ff{cfg.n_inner}"
+        if cfg.experiment == "v9"
+        else ""
+    )
+    task_suffix = "_conditional_pairs" if cfg.task_variant == "conditional_pairs" else ""
     name = (
         f"{cfg.experiment}_{cfg.preset}_L{cfg.seq_len}_"
         f"train{cfg.train_count_min}-{cfg.train_count_max}_"
-        f"eval{cfg.eval_count_min}-{cfg.eval_count_max}_sharednum_seed{cfg.seed}"
+        f"eval{cfg.eval_count_min}-{cfg.eval_count_max}{task_suffix}"
+        f"{capacity_suffix}_sharednum_seed{cfg.seed}"
     )
     run_dir = out_root / name
     sync_run_dir = checkpoint_sync_root / name if checkpoint_sync_root is not None else None
@@ -761,17 +890,31 @@ def make_report(
         threshold_rows.append({"mode": mode, "first_count_below_0.9": int(bad["count"].iloc[0]) if not bad.empty else "none"})
     threshold = pd.DataFrame(threshold_rows)
     descriptions = {
-        "v7": "v7 只增加 prompt 长度，保持 count 1–10。",
-        "v8": "v8 扩展 needle count，并按 count range 分别报告结果。",
+        "v7": "v7 increases prompt length while keeping count 1-10.",
+        "v8": "v8 increases the needle-count range and reports balanced count bins.",
         "v9": (
-            "v9 保持 v2 的 length=256、count=1–10，只把模型缩小为 "
-            "3 layers、4 heads、d_model=128、MLP=384。"
+            "v9 uses a query-conditioned pair-counting task at length 256 and target "
+            "count 1-10. It counts only <M_q> <Needle> pairs while rejecting query "
+            "decoys, other-marker needles, and other decoys. Query-marker and Needle "
+            "marginal frequencies are sampled independently of the answer. The model "
+            "has 3 layers, 3 heads, d_model 48, and MLP 96."
         ),
     }
+    task_details = ""
+    if cfg.task_variant == "conditional_pairs":
+        task_details = pd.DataFrame(
+            [
+                {"record type": "target", "form": "<M_q> <Needle> payload", "counted": "yes"},
+                {"record type": "query decoy", "form": "<M_q> <Decoy> payload", "counted": "no"},
+                {"record type": "other needle", "form": "<M_j> <Needle> payload", "counted": "no"},
+                {"record type": "other decoy", "form": "<M_j> <Decoy> payload", "counted": "no"},
+            ]
+        ).to_html(index=False)
     html = f"""<!doctype html><html><head><meta charset="utf-8"><title>{cfg.experiment} report</title>
 <style>body{{font-family:Segoe UI,Arial,sans-serif;line-height:1.55;max-width:1050px;margin:32px auto;padding:0 20px;color:#172033}}table{{border-collapse:collapse;width:100%;font-size:14px}}td,th{{border:1px solid #ddd;padding:8px}}th{{background:#f4f7fb}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:18px}}</style></head><body>
 <h1>{cfg.experiment} synthetic counting sweep</h1>
 <p>{descriptions[cfg.experiment]}</p>
+<h2>Task semantics</h2>{task_details}
 <h2>Config</h2><pre>{json.dumps(asdict(cfg), indent=2)}</pre>
 <div class="grid"><div>{_img('accuracy_by_count.png')}</div><div>{_img('accuracy_heatmap.png')}</div><div>{_img('accuracy_by_validation_split.png')}</div></div>
 <h2>CoT advantage by count</h2>{wide.to_html(index=False)}

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import shutil
+import random
 from dataclasses import replace
 
 from synthetic_counting_extensions.v7_v8_sweeps import (
     SweepConfig,
     Vocab,
+    make_example,
     preset_configs,
     render,
     train_one,
@@ -145,7 +147,7 @@ def test_v8_debug_exercises_all_three_validation_ranges() -> None:
     assert cfg.eval_count_max == 30
 
 
-def test_v9_main_keeps_v2_data_and_reduces_model_capacity() -> None:
+def test_v9_main_uses_conditional_pairs_and_ultrasmall_model() -> None:
     configs = preset_configs("v9", "main")
 
     assert len(configs) == 1
@@ -153,7 +155,43 @@ def test_v9_main_keeps_v2_data_and_reduces_model_capacity() -> None:
     assert cfg.seq_len == 256
     assert (cfg.train_count_min, cfg.train_count_max) == (1, 10)
     assert (cfg.eval_count_min, cfg.eval_count_max) == (1, 10)
-    assert (cfg.n_layer, cfg.n_head, cfg.n_embd, cfg.n_inner) == (3, 4, 128, 384)
+    assert (cfg.n_layer, cfg.n_head, cfg.n_embd, cfg.n_inner) == (3, 3, 48, 96)
+    assert cfg.task_variant == "conditional_pairs"
+    assert (cfg.distractor_min, cfg.distractor_max) == (32, 64)
     assert cfg.train_steps == 10000
     assert cfg.effective_batch_size == 128
     assert cfg.checkpoint_every == 2000
+
+
+def test_v9_marginal_token_frequencies_do_not_reveal_gold_count() -> None:
+    cfg = preset_configs("v9", "main")[0]
+    vocab = Vocab(cfg)
+
+    for count in range(1, 11):
+        example = make_example(cfg, vocab, random.Random(1000 + count), count=count)
+        # Remove the one query-marker occurrence in the query prefix itself.
+        query_occurrences_in_body = example.seq_tokens.count(example.query_marker) - 1
+        needle_occurrences = example.seq_tokens.count("<Needle>")
+        assert len(example.seq_tokens) == 256
+        assert query_occurrences_in_body == example.query_marker_budget
+        assert needle_occurrences == example.needle_qualifier_budget
+        assert query_occurrences_in_body > count
+        assert needle_occurrences > count
+        assert all(example.pair_type_counts[name] > 0 for name in [
+            "query_decoy", "other_needle", "other_decoy"
+        ])
+
+
+def test_v9_thinking_trace_lists_only_valid_query_needle_pairs() -> None:
+    cfg = preset_configs("v9", "debug")[0]
+    vocab = Vocab(cfg)
+    example = make_example(cfg, vocab, random.Random(8), count=2)
+    rendered = render(example, vocab, "thinking")
+    think_pos = rendered["anchors"]["think_pos"]
+
+    assert rendered["tokens"][:3] == ["<BOS>", "<Query>", example.query_marker]
+    assert rendered["tokens"][think_pos + 1 : think_pos + 5] == [
+        "<1>", example.needle_markers[0],
+        "<2>", example.needle_markers[1],
+    ]
+    assert all(example.seq_tokens.count(payload) == 1 for payload in example.needle_markers)

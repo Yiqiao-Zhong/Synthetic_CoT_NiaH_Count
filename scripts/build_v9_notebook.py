@@ -38,19 +38,25 @@ cells = [
     markdown(
         "v9-title",
         """
-# Trace Count v9: Reduced-Capacity v2
+# Trace Count v9: Query-Conditioned Pair Counting
 
-v9 keeps the v2 task fixed and changes only model capacity.
+The earlier v9 saturated because the answer was exactly the total number of marker
+tokens. This version keeps length 256 and count 1-10, but removes that shortcut.
 
-- **Data:** prompt length 256; 1–10 needles; 64 noise tokens; 10 marker tokens.
+- **Query:** every prompt starts with `<Query> <M_q>`.
+- **Positive record:** only `<M_q> <Needle> payload` is counted.
+- **Hard negatives:** query decoys, other-marker needles, and other-marker decoys.
+- **Distractors:** 32-64 negative pairs, mixed with noise in a length-256 prompt.
+- **Thinking trace:** `<1> payload_1 ... <n> payload_n`, forcing target retrieval.
 - **Targets:** trace indices and final answers share the same `<1>...<10>` tokens.
 - **Models:** one non-thinking model and one thinking model.
-- **Small architecture:** 3 layers, 4 heads, `d_model=128`, `MLP=384`.
+- **Ultra-small architecture:** 3 layers, 3 heads, `d_model=48`, `MLP=96`.
 - **Training:** 10,000 steps, effective batch size 128, no loss weighting.
 - **Reliability:** recoverable checkpoints are synced to Google Drive every 2,000 steps.
 
-The goal is to test whether reducing excess capacity creates a regime where explicit
-thinking traces improve final-count accuracy or learning speed.
+The query-marker frequency and `<Needle>` frequency are sampled independently of the
+gold count. Solving the task therefore requires conjunction, selective retrieval, and
+aggregation rather than global marker-frequency estimation.
 """,
     ),
     markdown(
@@ -142,11 +148,11 @@ display(Markdown(f"**Repo root:** `{ROOT}`  \\n**Device:** `{torch.cuda.get_devi
         "v9-runtime",
         """
 PRESET = "main"  # use "debug" for a four-step pipeline check
-OUT_ROOT = "runs/trace_count_v9_small_capacity"
+OUT_ROOT = "runs/trace_count_v9_conditional_ultrasmall"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SKIP_COMPLETED = True
 
-LIVE_CHECKPOINT_ROOT = DRIVE_RESULTS_ROOT / "v9_live_checkpoints" if DRIVE_MOUNTED else None
+LIVE_CHECKPOINT_ROOT = DRIVE_RESULTS_ROOT / "v9_conditional_ultrasmall_live_checkpoints" if DRIVE_MOUNTED else None
 if LIVE_CHECKPOINT_ROOT is not None:
     LIVE_CHECKPOINT_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -164,8 +170,9 @@ print({
 ## 3. Capacity Check
 
 The table below constructs both architectures on CPU and reports their exact trainable
-parameter counts. The v2 reference uses 4 layers, 4 heads, `d_model=256`, and `MLP=1024`;
-the v9 row changes only capacity while retaining the same vocabulary and context length.
+parameter counts. The capacity reference uses 4 layers, 4 heads, `d_model=256`, and
+`MLP=1024`; the v9 row uses the same conditional-pair task and vocabulary but reduces
+capacity much more aggressively.
 """,
     ),
     code(
@@ -176,7 +183,9 @@ from dataclasses import replace
 from synthetic_counting_extensions.v7_v8_sweeps import (
     Vocab,
     build_model_cfg,
+    make_example,
     preset_configs,
+    render,
 )
 from synthetic_niah_v5.model import make_model
 
@@ -204,7 +213,7 @@ v9_params = exact_parameter_count(v9_cfg)
 
 capacity_table = pd.DataFrame([
     {
-        "model": "v2 reference",
+        "model": "4L capacity reference",
         "layers": 4,
         "heads": 4,
         "d_model": 256,
@@ -229,9 +238,51 @@ display(pd.DataFrame([vars(cfg) | {"effective_batch_size": cfg.effective_batch_s
 """,
     ),
     markdown(
+        "v9-data-check-heading",
+        """
+## 4. Conditional-Count Shortcut Audit
+
+The answer counts only `<M_q> <Needle> payload` records. The two tempting marginal shortcuts are
+invalid by construction: total `<M_q>` occurrences and total `<Needle>` occurrences
+are sampled independently of the gold count. All three hard-negative pair types must
+also be present.
+""",
+    ),
+    code(
+        "v9-data-check",
+        """
+import random
+
+preview_vocab = Vocab(v9_cfg)
+preview_count = min(5, v9_cfg.max_count)
+preview = make_example(v9_cfg, preview_vocab, random.Random(123), count=preview_count)
+preview_render = render(preview, preview_vocab, "thinking")
+query_occurrences_in_body = preview.seq_tokens.count(preview.query_marker) - 1
+preview_stats = pd.DataFrame([{
+    "gold_count": preview.count,
+    "query_marker": preview.query_marker,
+    "query_marker_occurrences_in_body": query_occurrences_in_body,
+    "needle_qualifier_occurrences": preview.seq_tokens.count("<Needle>"),
+    "query_decoys": preview.pair_type_counts["query_decoy"],
+    "other_marker_needles": preview.pair_type_counts["other_needle"],
+    "other_marker_decoys": preview.pair_type_counts["other_decoy"],
+    "total_distractor_pairs": preview.distractor_count,
+    "prompt_length": len(preview.seq_tokens),
+}])
+display(preview_stats)
+think_pos = preview_render["anchors"]["think_pos"]
+display(Markdown("**Prompt prefix:** `" + " ".join(preview.seq_tokens[:2]) + "`"))
+display(Markdown("**First trace event:** `" + " ".join(preview_render["tokens"][think_pos + 1:think_pos + 3]) + "`"))
+assert query_occurrences_in_body > preview.count
+assert preview.seq_tokens.count("<Needle>") > preview.count
+assert all(preview.pair_type_counts[name] > 0 for name in ["query_decoy", "other_needle", "other_decoy"])
+assert preview_stats.loc[0, "prompt_length"] == 256
+""",
+    ),
+    markdown(
         "v9-run-heading",
         """
-## 4. Train and Evaluate
+## 5. Train and Evaluate
 
 This runs exactly two independently initialized models. At steps 2k, 4k, 6k, 8k,
 and 10k, each model writes a recoverable checkpoint containing model weights,
@@ -243,7 +294,7 @@ optimizer state, step, and RNG state, then immediately syncs it to Drive.
         """
 from synthetic_counting_extensions.v7_v8_sweeps import run_sweep
 
-display(Markdown("**Training runs:** `1 setting × 2 models = 2`"))
+display(Markdown("**Training runs:** `1 setting x 2 models = 2`"))
 combined = run_sweep(
     "v9",
     PRESET,
@@ -255,7 +306,7 @@ combined = run_sweep(
 display(combined)
 """,
     ),
-    markdown("v9-results-heading", "## 5. Results"),
+    markdown("v9-results-heading", "## 6. Results"),
     code(
         "v9-results",
         """
@@ -273,7 +324,7 @@ for run in sorted(result_root.glob("v9_*")):
         display(Markdown(f"Generated report: `{report}`"))
 """,
     ),
-    markdown("v9-save-heading", "## 6. Save Complete Results to Google Drive"),
+    markdown("v9-save-heading", "## 7. Save Complete Results to Google Drive"),
     code(
         "v9-save",
         """
@@ -285,7 +336,7 @@ DRIVE_SAVE_COMPLETED = False
 if SAVE_TO_DRIVE and ensure_google_drive_mounted():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     source = Path(OUT_ROOT)
-    destination = DRIVE_RESULTS_ROOT / f"v9_small_capacity_{PRESET}_{timestamp}"
+    destination = DRIVE_RESULTS_ROOT / f"v9_conditional_ultrasmall_{PRESET}_{timestamp}"
     shutil.copytree(source, destination, dirs_exist_ok=True)
     manifest = {
         "experiment": "v9",
@@ -301,7 +352,7 @@ else:
     print("Drive result save skipped.")
 """,
     ),
-    markdown("v9-github-heading", "## 7. Optional GitHub Result Upload"),
+    markdown("v9-github-heading", "## 8. Optional GitHub Result Upload"),
     code(
         "v9-github",
         """
@@ -311,13 +362,13 @@ GIT_BRANCH = "v9-results"
 if PUSH_RESULTS_TO_GITHUB:
     subprocess.run(["git", "checkout", "-B", GIT_BRANCH], check=True)
     subprocess.run(["git", "add", OUT_ROOT], check=True)
-    subprocess.run(["git", "commit", "-m", "Add v9 reduced-capacity results"], check=False)
+    subprocess.run(["git", "commit", "-m", "Add v9 conditional-count results"], check=False)
     subprocess.run(["git", "push", "-u", "origin", GIT_BRANCH], check=True)
 else:
     print("PUSH_RESULTS_TO_GITHUB is False")
 """,
     ),
-    markdown("v9-disconnect-heading", "## 8. Optional Runtime Disconnect"),
+    markdown("v9-disconnect-heading", "## 9. Optional Runtime Disconnect"),
     code(
         "v9-disconnect",
         """
@@ -332,6 +383,18 @@ else:
 """,
     ),
 ]
+
+# Normalize this legacy text cell explicitly because an older Windows save left
+# invalid bytes in its source. The generated notebook remains clean and portable.
+for cell in cells:
+    if cell.get("id") == "google-drive-login-heading":
+        cell["source"] = lines(
+            """
+## Google Drive Login
+
+Mount Google Drive before training. Periodic checkpoints and final results reuse this mount.
+"""
+        )
 
 notebook = {
     "cells": cells,
