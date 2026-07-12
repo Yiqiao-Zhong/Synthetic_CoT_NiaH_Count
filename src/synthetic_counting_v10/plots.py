@@ -86,6 +86,11 @@ def _heatmap_from_heads(
     vmin: float = 0.0,
     vmax: float | None = None,
 ) -> None:
+    if frame.empty or metric not in frame.columns or not np.isfinite(frame[metric].to_numpy(dtype=float)).any():
+        ax.text(0.5, 0.5, "No finite data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title)
+        ax.set_axis_off()
+        return
     pivot = frame.pivot(index="layer", columns="head", values=metric).reindex(
         index=range(cfg.n_layer), columns=range(cfg.n_head)
     )
@@ -104,19 +109,19 @@ def plot_attention(run_dir: Path, cfg: V10Config) -> None:
     if not summary.empty:
         panels = [
             (
-                summary[(summary.mode == "nonthinking") & (summary.query_kind == "final_count_query")],
+                summary[(summary["mode"] == "nonthinking") & (summary["query_kind"] == "final_count_query")],
                 "broad_attention_score",
                 "Non-thinking: broad needle attention",
                 None,
             ),
             (
-                summary[(summary.mode == "thinking") & (summary.query_kind == "targeted_retrieval_query")],
+                summary[(summary["mode"] == "thinking") & (summary["query_kind"] == "targeted_retrieval_query")],
                 "correct_prompt_needle_mass",
                 "Thinking: targeted k-to-k retrieval",
                 1.0,
             ),
             (
-                summary[(summary.mode == "thinking") & (summary.query_kind == "final_count_query")],
+                summary[(summary["mode"] == "thinking") & (summary["query_kind"] == "final_count_query")],
                 "trace_markers_mass",
                 "Thinking final readout: trace-marker mass",
                 1.0,
@@ -139,9 +144,14 @@ def plot_attention(run_dir: Path, cfg: V10Config) -> None:
             "other_or_query_self_mass",
         ]
         final_rows = summary[summary.query_kind == "final_count_query"].copy()
-        final_rows["head_label"] = "L" + (final_rows.layer.astype(int) + 1).astype(str) + "H" + final_rows.head.astype(int).astype(str)
+        final_rows["head_label"] = (
+            "L"
+            + (final_rows["layer"].astype(int) + 1).astype(str)
+            + "H"
+            + final_rows["head"].astype(int).astype(str)
+        )
         for mode in ("nonthinking", "thinking"):
-            frame = final_rows[final_rows.mode == mode]
+            frame = final_rows[final_rows["mode"] == mode]
             if frame.empty:
                 continue
             long = frame.melt(id_vars=["head_label"], value_vars=categories, var_name="category", value_name="mass")
