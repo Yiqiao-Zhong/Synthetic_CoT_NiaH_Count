@@ -358,6 +358,144 @@ def _random_orthogonal(direction: np.ndarray, seed: int) -> np.ndarray:
     return (value / max(float(np.linalg.norm(value)), 1e-12)).astype(np.float32)
 
 
+def make_count_manifold_plots(
+    centroids: dict[tuple[str, int, int], np.ndarray],
+    out_dir: Path,
+) -> pd.DataFrame:
+    """Plot count-centroid trajectories and quantify low-dimensional fidelity."""
+    figures = out_dir / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, Any]] = []
+    projections: dict[tuple[str, int], tuple[np.ndarray, np.ndarray]] = {}
+    sites = (SITE_NONTHINKING, SITE_THINKING_FIXED)
+    n_layers = max(layer for _, layer, _ in centroids) + 1
+
+    for site in sites:
+        for layer in range(n_layers):
+            values = np.stack([centroids[(site, layer, count)] for count in range(1, 11)])
+            centered = values - values.mean(axis=0, keepdims=True)
+            _, singular, components = np.linalg.svd(centered, full_matrices=False)
+            variance = singular**2
+            raw_variance_ratio = variance / max(float(variance.sum()), 1e-12)
+            variance_ratio = np.pad(raw_variance_ratio, (0, max(0, 6 - len(raw_variance_ratio))))
+            raw_coordinates = centered @ components[:6].T
+            coordinates = np.pad(raw_coordinates, ((0, 0), (0, max(0, 6 - raw_coordinates.shape[1]))))
+            projections[(site, layer)] = (coordinates, variance_ratio)
+            deltas = np.diff(values, axis=0)
+            consecutive_cosines = np.sum(deltas[:-1] * deltas[1:], axis=1) / np.maximum(
+                np.linalg.norm(deltas[:-1], axis=1) * np.linalg.norm(deltas[1:], axis=1),
+                1e-12,
+            )
+            turning_angles = np.degrees(np.arccos(np.clip(consecutive_cosines, -1.0, 1.0)))
+            cumulative = np.cumsum(variance_ratio)
+            rows.append(
+                {
+                    "site": site,
+                    "layer": layer,
+                    "pc1_variance": float(variance_ratio[0]),
+                    "pc1_pc2_variance": float(cumulative[min(1, len(cumulative) - 1)]),
+                    "pc1_pc2_pc3_variance": float(cumulative[min(2, len(cumulative) - 1)]),
+                    "pc1_to_pc6_variance": float(cumulative[min(5, len(cumulative) - 1)]),
+                    "pcs_for_90pct": int(np.searchsorted(cumulative, 0.90) + 1),
+                    "effective_dimension": float(variance.sum() ** 2 / max(float(np.sum(variance**2)), 1e-12)),
+                    "mean_turning_angle_degrees": float(turning_angles.mean()),
+                    "path_to_chord_ratio": float(
+                        np.linalg.norm(deltas, axis=1).sum()
+                        / max(float(np.linalg.norm(values[-1] - values[0])), 1e-12)
+                    ),
+                }
+            )
+
+    sns.set_theme(style="whitegrid", context="notebook")
+    fig, axes = plt.subplots(len(sites), n_layers, figsize=(4.2 * n_layers, 7.6), constrained_layout=True)
+    for row_idx, site in enumerate(sites):
+        for layer in range(n_layers):
+            ax = axes[row_idx, layer]
+            coordinates, variance_ratio = projections[(site, layer)]
+            ax.plot(coordinates[:, 0], coordinates[:, 1], color="C0", alpha=0.45, linewidth=1.5)
+            for idx, count in enumerate(range(1, 11)):
+                ax.scatter(coordinates[idx, 0], coordinates[idx, 1], color="C0", s=34, zorder=3)
+                ax.annotate(str(count), coordinates[idx, :2], xytext=(5, 4), textcoords="offset points", fontsize=9)
+                if idx < 9:
+                    delta = coordinates[idx + 1, :2] - coordinates[idx, :2]
+                    ax.arrow(
+                        coordinates[idx, 0],
+                        coordinates[idx, 1],
+                        delta[0],
+                        delta[1],
+                        width=0.0,
+                        head_width=max(float(np.linalg.norm(delta)) * 0.08, 0.015),
+                        length_includes_head=True,
+                        color="C1",
+                        alpha=0.75,
+                    )
+            ax.axhline(0, color="0.75", linewidth=0.8)
+            ax.axvline(0, color="0.75", linewidth=0.8)
+            ax.set_title(f"{site}, Layer {layer + 1}\n2D variance={variance_ratio[:2].sum():.1%}")
+            ax.set_xlabel("centroid PCA 1")
+            ax.set_ylabel("centroid PCA 2")
+    fig.suptitle("Count-centroid trajectories; arrows are adjacent count differences", fontsize=15)
+    fig.savefig(figures / "count_centroid_manifold_2d.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+    selected_layers = sorted(set([0, n_layers - 1]))
+    fig = plt.figure(figsize=(7.2 * len(selected_layers), 6.2 * len(sites)), constrained_layout=True)
+    plot_idx = 1
+    for site in sites:
+        for layer in selected_layers:
+            ax = fig.add_subplot(len(sites), len(selected_layers), plot_idx, projection="3d")
+            plot_idx += 1
+            coordinates, variance_ratio = projections[(site, layer)]
+            ax.plot(coordinates[:, 0], coordinates[:, 1], coordinates[:, 2], color="C0", alpha=0.55)
+            for idx, count in enumerate(range(1, 11)):
+                ax.scatter(*coordinates[idx, :3], color="C0", s=35)
+                ax.text(*coordinates[idx, :3], str(count), fontsize=9)
+                if idx < 9:
+                    delta = coordinates[idx + 1, :3] - coordinates[idx, :3]
+                    ax.quiver(*coordinates[idx, :3], *delta, color="C1", arrow_length_ratio=0.15, alpha=0.8)
+            ax.set_title(f"{site}, Layer {layer + 1}; 3D variance={variance_ratio[:3].sum():.1%}")
+            ax.set_xlabel("PC1")
+            ax.set_ylabel("PC2")
+            ax.set_zlabel("PC3")
+    fig.suptitle("Early versus late count-centroid geometry in 3D", fontsize=15)
+    fig.savefig(figures / "count_centroid_manifold_3d.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+    final_layer = n_layers - 1
+    fig = plt.figure(figsize=(14.5, 11.5), constrained_layout=True)
+    plot_idx = 1
+    for site in sites:
+        coordinates, variance_ratio = projections[(site, final_layer)]
+        for start_pc in (0, 3):
+            ax = fig.add_subplot(len(sites), 2, plot_idx, projection="3d")
+            plot_idx += 1
+            subspace = coordinates[:, start_pc : start_pc + 3]
+            ax.plot(subspace[:, 0], subspace[:, 1], subspace[:, 2], color="C0", alpha=0.55)
+            for idx, count in enumerate(range(1, 11)):
+                ax.scatter(*subspace[idx], color="C0", s=35)
+                ax.text(*subspace[idx], str(count), fontsize=9)
+                if idx < 9:
+                    delta = subspace[idx + 1] - subspace[idx]
+                    ax.quiver(*subspace[idx], *delta, color="C1", arrow_length_ratio=0.15, alpha=0.8)
+            retained = variance_ratio[start_pc : start_pc + 3].sum()
+            ax.set_title(
+                f"{site}, Layer {final_layer + 1}; "
+                f"PC{start_pc + 1}-{start_pc + 3} variance={retained:.1%}"
+            )
+            ax.set_xlabel(f"PC{start_pc + 1}")
+            ax.set_ylabel(f"PC{start_pc + 2}")
+            ax.set_zlabel(f"PC{start_pc + 3}")
+    six_variance = [projections[(site, final_layer)][1][:6].sum() for site in sites]
+    fig.suptitle(
+        "Layer-4 count geometry across two 3D subspaces; "
+        f"PC1-6 retain {six_variance[0]:.1%} / {six_variance[1]:.1%}",
+        fontsize=15,
+    )
+    fig.savefig(figures / "count_centroid_six_pc_3d.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return pd.DataFrame(rows)
+
+
 @torch.no_grad()
 def run_direction_steering(
     model,
@@ -668,14 +806,17 @@ def make_plots(outputs: dict[str, pd.DataFrame], out_dir: Path) -> None:
     sns.set_theme(style="whitegrid", context="notebook")
 
     geometry = outputs["direction_geometry"]
-    part = geometry[geometry.method.isin(["adjacent_mean", "ridge"])]
+    part = geometry[geometry.method.isin(["adjacent_mean", "ridge"])].copy()
+    part["layer_display"] = part["layer"].astype(int) + 1
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.6), constrained_layout=True)
     r2_metric = "projection_r2_heldout" if "projection_r2_heldout" in part.columns else "projection_r2_train"
-    sns.lineplot(data=part, x="layer", y=r2_metric, hue="site", style="method", marker="o", ax=axes[0])
+    sns.lineplot(data=part, x="layer_display", y=r2_metric, hue="site", style="method", marker="o", ax=axes[0])
     axes[0].set_title("Count-direction linear readability")
+    axes[0].set_xlabel("Layer")
     axes[0].set_ylabel("held-out projection R²")
-    sns.lineplot(data=part, x="layer", y="adjacent_delta_cosine_mean", hue="site", style="method", marker="o", ax=axes[1])
+    sns.lineplot(data=part, x="layer_display", y="adjacent_delta_cosine_mean", hue="site", style="method", marker="o", ax=axes[1])
     axes[1].set_title("Are adjacent count differences parallel?")
+    axes[1].set_xlabel("Layer")
     axes[1].set_ylabel("mean cosine among μ(n+1)-μ(n)")
     fig.savefig(figures / "count_direction_geometry.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -685,38 +826,48 @@ def make_plots(outputs: dict[str, pd.DataFrame], out_dir: Path) -> None:
         steering.direction_method.isin(
             ["adjacent_mean", "cross_adjacent_mean", "centroid_transport", "cross_centroid_transport", "random_orthogonal"]
         )
-        & steering.layer.eq(0)
     ]
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), constrained_layout=True, sharey=True)
-    for ax, site in zip(axes, (SITE_NONTHINKING, SITE_THINKING_FIXED, SITE_THINKING_NATURAL)):
-        sns.lineplot(data=selected[selected.target_site == site], x="alpha", y="causal_expected_shift", hue="direction_method", marker="o", ax=ax)
-        ax.axhline(0, color="black", lw=1)
-        ax.set_title(site)
-        ax.set_ylabel("mean expected-count shift")
+    sites = (SITE_NONTHINKING, SITE_THINKING_FIXED, SITE_THINKING_NATURAL)
+    shown_layers = (0, int(steering.layer.max()))
+    fig, axes = plt.subplots(2, 3, figsize=(16, 8.2), constrained_layout=True, sharex=True, sharey=True)
+    for row, layer in enumerate(shown_layers):
+        for col, site in enumerate(sites):
+            ax = axes[row, col]
+            panel = selected[(selected.target_site == site) & (selected.layer == layer)]
+            sns.lineplot(data=panel, x="alpha", y="causal_expected_shift", hue="direction_method", marker="o", ax=ax)
+            ax.axhline(0, color="black", lw=1)
+            ax.set_title(f"{site}, Layer {layer + 1}")
+            ax.set_ylabel("mean expected-count shift")
+            if row != 0 and ax.get_legend() is not None:
+                ax.get_legend().remove()
     fig.savefig(figures / "count_direction_steering.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
 
-    swaps = outputs["state_swap_summary"]
+    swaps = outputs["state_swap_summary"].copy()
+    swaps["layer_display"] = swaps["layer"].astype(int) + 1
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), constrained_layout=True, sharey=True)
     for ax, site in zip(axes, PRIMARY_SITES):
-        sns.lineplot(data=swaps[swaps.site == site], x="layer", y="follows_donor", hue="control", marker="o", ax=ax)
+        sns.lineplot(data=swaps[swaps.site == site], x="layer_display", y="follows_donor", hue="control", marker="o", ax=ax)
         ax.set_ylim(-0.03, 1.03)
         ax.set_title(site)
+        ax.set_xlabel("Layer")
         ax.set_ylabel("prediction follows donor count")
     fig.savefig(figures / "count_state_swap.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
 
     mediation = outputs["mediation_summary"]
     residual = mediation[mediation.component_type == "residual"].copy()
-    residual["layer"] = residual.component_name.str.extract(r"(\d+)").astype(int)
+    residual["layer_display"] = residual.component_name.str.extract(r"(\d+)").astype(int) + 1
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), constrained_layout=True)
-    sns.lineplot(data=residual, x="layer", y="state_step_units", hue="site", marker="o", ax=axes[0])
+    sns.lineplot(data=residual, x="layer_display", y="state_step_units", hue="site", marker="o", ax=axes[0])
     axes[0].axhline(1, color="gray", ls="--", lw=1)
     axes[0].set_title("Needle deletion projected onto count direction")
+    axes[0].set_xlabel("Layer")
     axes[0].set_ylabel("clean−corrupt projection / one count step")
-    sns.lineplot(data=residual, x="layer", y="normalized_recovery", hue="site", marker="o", ax=axes[1])
+    sns.lineplot(data=residual, x="layer_display", y="normalized_recovery", hue="site", marker="o", ax=axes[1])
     axes[1].axhline(1, color="gray", ls="--", lw=1)
     axes[1].set_title("Clean residual restores the deleted-needle answer")
+    axes[1].set_xlabel("Layer")
     axes[1].set_ylabel("normalized logit-margin recovery")
     fig.savefig(figures / "count_residual_mediation.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -810,6 +961,7 @@ def run_v5_4_count_state_causal(
             for (site, layer, count), value in centroids.items()
         },
     )
+    manifold_geometry = make_count_manifold_plots(centroids, out_dir)
 
     print("[v5.4] causal direction steering in non-thinking and thinking", flush=True)
     steering_rows, steering_summary = run_direction_steering(
@@ -850,6 +1002,7 @@ def run_v5_4_count_state_causal(
     outputs = {
         "baseline_accuracy": pd.concat(baseline_frames, ignore_index=True),
         "direction_geometry": geometry,
+        "manifold_geometry": manifold_geometry,
         "cross_mode_direction_cosine": cross,
         "steering_rows": steering_rows,
         "steering_summary": steering_summary,

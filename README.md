@@ -24,6 +24,7 @@ Importable code follows a standard `src/` layout. Public module names are unchan
 | `synthetic_niah_v5` | v5 mixed thinking-mode model |
 | `synthetic_counting_v6` | v6 separator-trace experiment |
 | `synthetic_counting_extensions` | v2.2, v5.2, and v7-v9 extensions |
+| `synthetic_counting_v10` | v10 two-model count-30 dynamics, attention causality, and count-state interventions |
 
 Commands such as `python -m synthetic_niah_v4.run_v4` therefore remain valid after
 `pip install -e .`.
@@ -87,6 +88,24 @@ python -m synthetic_counting_v6.run_v6_experiment --preset main --stage all --de
 ```
 
 v6 is directly comparable to v2, except the thinking trace removes numeric index tokens. Instead of `<Think/> <1> <A> <2> <B> ...`, it uses `<Think/> <Sep> <A> <Sep> <B> ...`. The final answer still uses numeric tokens `<1>` through `<10>`. This tests whether the targeted-retrieval/counting behavior survives without explicit prefix-count leakage in the trace.
+
+For v10, use `notebooks/Trace_Count_v10_Colab.ipynb` or run:
+
+```bash
+python -m synthetic_counting_v10.run_v10 \
+  --preset main --stage all --device cuda \
+  --out-root runs/synthetic_counting_v10 \
+  --run-name v10_main_seed1234 \
+  --skip-completed
+```
+
+v10 returns to two separately trained v2-style Transformers, extends the balanced
+needle range to `1..30`, records full learning dynamics and resumable checkpoints,
+then runs cumulative top-1 through top-16 attention-head ablations, multi-offset
+head-output patching, per-Layer 2/3/6-PC count manifolds, geometry steering, final-state
+`m -> n` transplants, and within-CoT progress/early-stop transplants. The full protocol
+and mathematical definitions are in
+`docs/pipelines/pipeline_v10_two_model_count30_causal.md`.
 
 To rebuild the v3 notebook after editing its generator:
 

@@ -13,6 +13,7 @@ from synthetic_counting_extensions.v5_4_count_state_causal import (
     capture_block_residuals,
     estimate_directions,
     forward_with_residual_intervention,
+    make_count_manifold_plots,
     make_site_batch,
     render_fixed_trace_prefix,
 )
@@ -88,6 +89,21 @@ def test_direction_estimation_returns_count_specific_centroids():
     assert np.allclose(centroids[(SITE_NONTHINKING, 0, 4)], np.array([4.0, 16.0, 1.0]))
     assert len(geometry) == 6
     assert len(cross) == 2
+
+
+def test_count_manifold_plot_reports_dimensionality(tmp_path):
+    centroids = {}
+    for site_offset, site in enumerate((SITE_NONTHINKING, SITE_THINKING_FIXED)):
+        for layer in range(2):
+            for count in range(1, 11):
+                centroids[(site, layer, count)] = np.array(
+                    [float(count), float(count * count), float(site_offset), float(layer)]
+                )
+    summary = make_count_manifold_plots(centroids, tmp_path)
+    assert len(summary) == 4
+    assert summary["pc1_pc2_variance"].min() > 0.999
+    assert (tmp_path / "figures" / "count_centroid_manifold_2d.png").exists()
+    assert (tmp_path / "figures" / "count_centroid_manifold_3d.png").exists()
 
 
 def test_block_residual_capture_and_additive_intervention_run_end_to_end():

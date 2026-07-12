@@ -184,6 +184,12 @@ from IPython.display import Image, Markdown, display
 display(outputs['direction_geometry'].sort_values(['site', 'layer', 'method']))
 display(outputs['cross_mode_direction_cosine'])
 display(Image(filename=str(OUT_DIR / 'figures' / 'count_direction_geometry.png')))
+display(Markdown('**Count-centroid manifold diagnostics.** `pc1_pc2_variance` and `pc1_pc2_pc3_variance` quantify projection fidelity; `pcs_for_90pct`, turning angle, and path/chord ratio diagnose whether the trajectory is a low-dimensional smooth curve or a folded high-dimensional class geometry.'))
+display(outputs['manifold_geometry'].sort_values(['site', 'layer']))
+display(Image(filename=str(OUT_DIR / 'figures' / 'count_centroid_manifold_2d.png')))
+display(Image(filename=str(OUT_DIR / 'figures' / 'count_centroid_manifold_3d.png')))
+display(Markdown('**Six-PC view.** A static 3D plot cannot contain six orthogonal coordinates. The next figure therefore shows block-4 PC1-3 and PC4-6 as paired 3D subspaces; the title reports cumulative variance retained by all six PCs.'))
+display(Image(filename=str(OUT_DIR / 'figures' / 'count_centroid_six_pc_3d.png')))
 """
     ),
     md(

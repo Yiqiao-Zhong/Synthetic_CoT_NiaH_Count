@@ -60,6 +60,19 @@ adjacent cosine = mean cosine between all mu_(n+1)-mu_n vectors
 
 High held-out R2 means readable geometry. High adjacent cosine is stronger evidence that one approximately shared `+1` direction exists. Neither is yet causal.
 
+The pipeline also runs PCA on the ten class centroids at each site/layer and draws the ordered trajectory `mu_1 -> ... -> mu_10` in 2D and 3D. Each arrow is the projected adjacent difference `mu_(n+1)-mu_n`. Reported diagnostics are:
+
+- cumulative variance represented by PC1-2 and PC1-3;
+- cumulative variance represented by PC1-6, plus separate 3D views of PC1-3 and PC4-6 at the final block;
+- number of principal components required for 90% variance;
+- effective dimension `(sum eigenvalue)^2 / sum(eigenvalue^2)`;
+- mean turning angle between consecutive adjacent-difference vectors;
+- path-to-chord ratio, where `1` is straight and larger values indicate a curved or folded trajectory.
+
+A visually smooth 2D path is credible only when PC1-2 captures most variance. If later layers require many PCs, the plot is a projection of a higher-dimensional class manifold, not evidence for a literal two-dimensional counter.
+
+Six PCs cannot be represented losslessly in one static 3D coordinate system. The paired final-block plot therefore shows `PC1-3` and `PC4-6` as two explicit 3D subspaces. Together they expose all six retained coordinates without using a nonlinear embedding that could manufacture apparent neighborhood structure.
+
 ## Experiment 2: causal direction steering
 
 At one block output and one query token, add:
@@ -132,6 +145,7 @@ This locates where a `+1 needle` difference first becomes aligned with the count
 `v5_4_count_state_causal/tables/` contains per-example and summary CSVs:
 
 - `direction_geometry.csv`
+- `manifold_geometry.csv`
 - `cross_mode_direction_cosine.csv`
 - `steering_rows.csv`, `steering_summary.csv`
 - `state_swap_rows.csv`, `state_swap_summary.csv`

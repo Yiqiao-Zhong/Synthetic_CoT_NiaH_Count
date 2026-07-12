@@ -47,6 +47,93 @@ def figure(path: Path, title: str, caption: str, *, wide: bool = False) -> str:
     </figure>"""
 
 
+def six_pc_tour(npz_path: Path) -> str:
+    """Return a self-contained interactive 3D tour through the first six PCs."""
+    if not npz_path.exists():
+        return ""
+    archive = np.load(npz_path)
+    payload: dict[str, dict[str, object]] = {}
+    for site in ("nonthinking_close", "thinking_fixed_trace_close"):
+        values = np.stack([archive[f"{site}__L3__C{count}"] for count in range(1, 11)])
+        centered = values - values.mean(axis=0, keepdims=True)
+        _, singular, components = np.linalg.svd(centered, full_matrices=False)
+        coordinates = centered @ components[:6].T
+        variance = singular**2
+        payload[site] = {
+            "pc6": np.round(coordinates, 4).tolist(),
+            "variance6": float(variance[:6].sum() / variance.sum()),
+        }
+    data_json = json.dumps(payload, separators=(",", ":"))
+    template = """
+    <figure class="interactive-figure wide">
+      <h3>交互式 3D：Layer 4 的六主成分 count-state 视图</h3>
+      <div class="tour-controls">
+        <label>Mode
+          <select id="v54-tour-mode">
+            <option value="nonthinking_close">THINK_OFF / non-thinking</option>
+            <option value="thinking_fixed_trace_close">THINK_ON / fixed trace</option>
+          </select>
+        </label>
+        <label>PC1-3 to PC4-6 mixing angle
+          <input id="v54-tour-angle" type="range" min="0" max="90" step="1" value="0">
+        </label>
+        <span id="v54-tour-angle-value">0 degrees</span>
+        <button id="v54-tour-play" type="button">Play tour</button>
+        <span id="v54-tour-retained"></span>
+      </div>
+      <canvas id="v54-tour-canvas" aria-label="Rotatable projection through the first six count-centroid principal components"></canvas>
+      <figcaption><b>How to read.</b> Each numbered point is the mean 256-dimensional close-token residual for one gold count. Lines connect counts 1 through 10. At 0 degrees, the displayed axes are PC1-3; at 90 degrees they are PC4-6. Intermediate frames use the orthonormal projection x=cos(theta)PC1+sin(theta)PC4, and likewise for PC2/5 and PC3/6. Drag the canvas to rotate the camera. The animation does not use t-SNE/UMAP and therefore does not manufacture nonlinear neighborhoods; it is a sequence of honest 3D views through the retained six-dimensional PCA subspace.</figcaption>
+    </figure>
+    <script>
+    (() => {
+      const data = __DATA__;
+      const canvas = document.getElementById('v54-tour-canvas');
+      const ctx = canvas.getContext('2d');
+      const mode = document.getElementById('v54-tour-mode');
+      const angle = document.getElementById('v54-tour-angle');
+      const angleValue = document.getElementById('v54-tour-angle-value');
+      const retained = document.getElementById('v54-tour-retained');
+      const play = document.getElementById('v54-tour-play');
+      let yaw = -0.65, pitch = 0.42, dragging = false, lastX = 0, lastY = 0, timer = null;
+
+      function projectedPoints() {
+        const theta = Number(angle.value) * Math.PI / 180;
+        const c = Math.cos(theta), s = Math.sin(theta);
+        return data[mode.value].pc6.map(p => [c*p[0]+s*p[3], c*p[1]+s*p[4], c*p[2]+s*p[5]]);
+      }
+      function camera(point) {
+        const cy=Math.cos(yaw), sy=Math.sin(yaw), cp=Math.cos(pitch), sp=Math.sin(pitch);
+        const x1=cy*point[0]+sy*point[2], z1=-sy*point[0]+cy*point[2];
+        return [x1, cp*point[1]-sp*z1, sp*point[1]+cp*z1];
+      }
+      function draw() {
+        const rect=canvas.getBoundingClientRect(), dpr=window.devicePixelRatio||1;
+        canvas.width=Math.max(1,Math.round(rect.width*dpr)); canvas.height=Math.max(1,Math.round(rect.height*dpr));
+        ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,rect.width,rect.height);
+        const raw=projectedPoints(), rotated=raw.map(camera);
+        const extent=Math.max(...rotated.flatMap(p=>[Math.abs(p[0]),Math.abs(p[1])]),1);
+        const scale=0.39*Math.min(rect.width,rect.height)/extent, cx=rect.width/2, cy=rect.height/2;
+        const pts=rotated.map((p,i)=>({x:cx+scale*p[0],y:cy-scale*p[1],z:p[2],label:String(i+1)}));
+        ctx.strokeStyle='#94a3b8'; ctx.lineWidth=1;
+        ctx.beginPath(); ctx.moveTo(24,cy); ctx.lineTo(rect.width-24,cy); ctx.moveTo(cx,24); ctx.lineTo(cx,rect.height-24); ctx.stroke();
+        ctx.strokeStyle='#2563eb'; ctx.lineWidth=2.2; ctx.beginPath();
+        pts.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)); ctx.stroke();
+        [...pts].sort((a,b)=>a.z-b.z).forEach(p=>{ctx.beginPath();ctx.fillStyle='#ea580c';ctx.arc(p.x,p.y,6,0,2*Math.PI);ctx.fill();ctx.fillStyle='#172033';ctx.font='13px sans-serif';ctx.fillText(p.label,p.x+8,p.y-7);});
+        angleValue.textContent=angle.value+' degrees';
+        retained.textContent='PC1-6 retained variance: '+(100*data[mode.value].variance6).toFixed(1)+'%';
+      }
+      mode.addEventListener('change',draw); angle.addEventListener('input',draw);
+      canvas.addEventListener('pointerdown',e=>{dragging=true;lastX=e.clientX;lastY=e.clientY;canvas.setPointerCapture(e.pointerId);});
+      canvas.addEventListener('pointermove',e=>{if(!dragging)return;yaw+=(e.clientX-lastX)*0.01;pitch=Math.max(-1.35,Math.min(1.35,pitch+(e.clientY-lastY)*0.01));lastX=e.clientX;lastY=e.clientY;draw();});
+      canvas.addEventListener('pointerup',()=>{dragging=false;});
+      play.addEventListener('click',()=>{if(timer){clearInterval(timer);timer=null;play.textContent='Play tour';return;}play.textContent='Pause';timer=setInterval(()=>{angle.value=(Number(angle.value)+2)%91;draw();},120);});
+      new ResizeObserver(draw).observe(canvas); draw();
+    })();
+    </script>
+    """
+    return template.replace("__DATA__", data_json)
+
+
 def table(rows: list[dict[str, object]], columns: list[tuple[str, str]]) -> str:
     head = "".join(f"<th>{html.escape(label)}</th>" for _, label in columns)
     body = []
@@ -109,7 +196,7 @@ def save_probe_panel(probes: pd.DataFrame, path: Path) -> None:
         data = best[best["mode"] == mode].pivot(index="anchor_name", columns="layer", values="accuracy").reindex(anchors)
         sns.heatmap(data, vmin=0, vmax=1, cmap="Blues", annot=True, fmt=".2f", ax=ax, cbar=mode == "thinking")
         ax.set_title(mode)
-        ax.set_xlabel("hidden-state index (0=embedding, 1-4=blocks)")
+        ax.set_xlabel("hidden-state index (0=embedding, 1-4=Layers)")
         ax.set_ylabel("anchor")
     fig.suptitle("Linear classification accuracy for final count", fontsize=15, fontweight="bold")
     fig.savefig(path, dpi=180, bbox_inches="tight")
@@ -186,12 +273,12 @@ def build_report(run_dir: Path) -> str:
     sim_embedding = float(mode_similarity.sort_values("layer").iloc[0]["mean"])
     sim_final = float(mode_similarity.sort_values("layer").iloc[-1]["mean"])
     sim_rows = [
-        {"state": "embedding" if int(r.layer) == 0 else f"after block {int(r.layer)}", "mean": fmt(r["mean"]), "std": fmt(r["std"])}
+        {"state": "embedding" if int(r.layer) == 0 else f"after Layer {int(r.layer)}", "mean": fmt(r["mean"]), "std": fmt(r["std"])}
         for _, r in mode_similarity.iterrows()
     ]
     head_rows = [
         {
-            "head": f"L{int(r['layer'])}H{int(r['head'])} (block {int(r['layer'])+1})",
+            "head": f"L{int(r['layer'])}H{int(r['head'])} (Layer {int(r['layer'])+1})",
             "top1": fmt(r.correct_top1),
             "diag": fmt(r.diagonal_dominance),
             "mass": fmt(r.needle_mass),
@@ -403,7 +490,7 @@ def build_report(run_dir: Path) -> str:
                 "trace": pct(value(targeted_behavior2, "trace_exact")),
             },
             {
-                "test": "thinking / targeted top-4 (= all block-2 heads)",
+                "test": "thinking / targeted top-4 (= Layer 2 的全部 heads)",
                 "target": "marker",
                 "heads": code(heads_text("targeted_top4")),
                 "tf": fmt(value(targeted_top4, "drop_trace_marker_accuracy")),
@@ -483,7 +570,7 @@ def build_report(run_dir: Path) -> str:
             f"free-running trace exact 降到 {pct(value(targeted_behavior4, 'trace_exact'))}，显示明显冗余。"
         )
         retrieval_patch_caption = (
-            "左图横轴为 head-output patch 的 normalized recovery，纵轴为 patched group；右图为 patch 某层 block 输出 residual 的 recovery。"
+            "左图横轴为 head-output patch 的 normalized recovery，纵轴为 patched group；右图为 patch 某个 Transformer layer 输出 residual 的 recovery。"
             f"targeted top-2 已恢复 {pct(value(retrieval_patch2, 'normalized_recovery'))}，top-4 恢复约 100%；"
             f"把同一 heads 从错误 donor token position 搬来只恢复 {pct(value(retrieval_wrong_pos, 'normalized_recovery'))}，"
             "支持“正确 head + 正确 query 位置”的特异性。"
@@ -507,7 +594,7 @@ def build_report(run_dir: Path) -> str:
             "模型总体更依赖 prompt，但冲突会显著扰动答案，因此 trace 既不是唯一读出源，也不是完全被忽略。"
         )
         progress_caption = (
-            "横轴是被替换的 block 输出层 0–3；纵轴是 donor-next-index logit margin 相对未 patch receiver 的变化；"
+            "横轴是被替换的 Transformer layer（代码编号 0–3）；纵轴是 donor-next-index logit margin 相对未 patch receiver 的变化；"
             f"颜色区分 donor progress k−1 与 k+1。所有层 patch 后 donor-next prediction rate 均为 {pct(progress_success)}，"
             f"而不同 prompt、相同 progress control 保持 receiver-next 的比例为 {pct(progress_control_success)}。"
             "这说明 trace marker position 的 residual 携带足以决定下一 index 的 progress state。"
@@ -516,12 +603,12 @@ def build_report(run_dir: Path) -> str:
 
         v53_section = f"""
     <h2>6. v5.3 因果机制实验：从 attention 相关性走向 intervention</h2>
-    <div class="callout good"><b>因果结论摘要。</b>结果支持三点：第一，non-thinking 的 count 直接依赖 block 1 的 broad-aggregation heads；第二，thinking 的 block 2 retrieval circuit 对正确 marker trace 有因果作用，但至少有四头协同/冗余，mask 最强两个头仍不够破坏行为；第三，最终 count 并不完全从显式 trace 读取，模型保留了强 prompt-direct 旁路。也就是说，当前 CoT 是一个真实运行的检索过程，但不是最终答案唯一的信息通道。</div>
+    <div class="callout good"><b>因果结论摘要。</b>结果支持三点：第一，non-thinking 的 count 直接依赖 Layer 1 的 broad-aggregation heads；第二，thinking 的 Layer 2 retrieval circuit 对正确 marker trace 有因果作用，但至少有四头协同/冗余，mask 最强两个头仍不够破坏行为；第三，最终 count 并不完全从显式 trace 读取，模型保留了强 prompt-direct 旁路。也就是说，当前 CoT 是一个真实运行的检索过程，但不是最终答案唯一的信息通道。</div>
 
     <h3>6.1 统一设置、样本规模与 head group 选择</h3>
     {table(v53_setting_rows, [('item','实验'),('setting','精确定义')])}
     {table(group_rows,[('role','机制角色'),('top1','top-1'),('top2','top-2'),('top4','top-4'),('selection','选择规则')])}
-    <p class="small">注意：所有层/头均为 0-based。<code>L1</code> 是第 2 个 Transformer block。<code>targeted_top4</code> 在本次 checkpoint 中恰好等于整个 L1 的四个 heads；因此 top-4 ablation 不能把“retrieval head 数量效应”和“整层被 mask”完全分开。随机组也允许与候选 heads 重叠，主要用于观察背景波动，不应视为严格 matched control。</p>
+    <p class="small">注意：head 名称采用代码中的 0-based layer/head 编号，因此 <code>L1</code> 是正文的 Layer 2。<code>targeted_top4</code> 在本次 checkpoint 中恰好等于整个 L1 的四个 heads；因此 top-4 ablation 不能把“retrieval head 数量效应”和“整层 attention 被 mask”完全分开。随机组也允许与候选 heads 重叠，主要用于观察背景波动，不应视为严格 matched control。</p>
 
     <div class="protocol"><p><b>Sequence。</b>对同一批 base prompts 同时渲染完整 gold THINK_OFF 与 indexed THINK_ON sequence，并在 eager-attention 模式下一次读取全部 4×4 heads。</p><p><b>三个 query。</b>① non-thinking <code>final_count_query</code>：读取 <code>&lt;/Think&gt;</code> 的 attention row，该位置预测 <code>&lt;C_n&gt;</code>；② thinking <code>trace_marker_query</code>：读取每个 <code>&lt;I_k&gt;</code> row，该位置预测 <code>M_k</code>；③ thinking <code>successor_query</code>：读取每个 <code>M_k</code> row，该位置预测 <code>&lt;I_(k+1)&gt;</code> 或末尾 <code>&lt;/Think&gt;</code>。另外也读取 thinking close row 作为 final-count query。</p><p><b>Attention categories。</b>对每个 row 分别求 BOS、switch、prompt needles、prompt noise、Think-open、trace indices、trace markers、last trace marker 的 raw mass；这些互斥位置集合的 mass 都相对于整条 causal context。Targeted score 采用正确第 k 个 prompt needle 的 raw mass。Broad score 定义为 <code>prompt_needles_mass × H_normalized(needle weights)</code>，其中 entropy 只在 n 个 needle positions 内归一化并除以 <code>log(n)</code>；因此它偏好“总 mass 高且覆盖多个 needles”的 heads。</p><p><b>聚合。</b>Attention detail 共 62,400 行；每个 mode×query×layer×head 对对应 rows 直接求均值，得到 64 行 head summary。Trace query 的每个 k 是独立一行，因此高-count 样本贡献更多 query rows；这是 query-weighted 而不是 example-weighted 汇总。候选 top-1/2/4 groups 由该 summary 排序确定。</p></div>
 
@@ -535,15 +622,15 @@ def build_report(run_dir: Path) -> str:
     <p>Teacher-forced marker accuracy 只在 10 个 marker tokens 内取 argmax；successor accuracy 只在 <code>&lt;I1&gt;...&lt;I10&gt;</code> 与 <code>&lt;/Think&gt;</code> 内取 argmax；count accuracy 只在 10 个 count tokens 内取 argmax。Free-running 指标则从开关后的 prefix 开始真正 greedy 生成，不给 gold trace。</p>
     {table(ablation_rows,[('test','路径 / mask'),('target','teacher-forced target'),('heads','被 mask heads'),('tf','teacher-forced accuracy drop'),('margin','mean margin drop'),('free','free-running final accuracy'),('trace','free-running marker-trace exact')])}
     <div class="figure-grid">
-      {figure(v53_figures/'nonthinking_ablation.png','Figure 10. Non-thinking teacher-forced count-margin drop','横轴是 clean count margin 减去 masked count margin，越大表示该 mask 越破坏正确 count；纵轴为不同候选、整层和随机 head groups。L0H1 单头和 L0 全层效果最大，说明 direct broad 路径集中在第 1 个 block。')}
+      {figure(v53_figures/'nonthinking_ablation.png','Figure 10. Non-thinking teacher-forced count-margin drop','横轴是 clean count margin 减去 masked count margin，越大表示该 mask 越破坏正确 count；纵轴为不同候选、整层和随机 head groups。L0H1 单头和 L0 全层效果最大，说明 direct broad 路径集中在 Layer 1。')}
       {figure(v53_figures/'thinking_retrieval_ablation.png','Figure 11. Thinking marker-retrieval margin drop',retrieval_ablation_caption)}
       {figure(v53_figures/'thinking_readout_ablation.png','Figure 12. Thinking final-count margin drop','横轴是 thinking 条件下 final count margin 的下降；纵轴为 mask group。最大的 effect 来自 direct-broad/L0 groups，而仅按 final query 的 trace-marker attention 选出的 heads 对 final count 影响较小。这提示“高 attention 到 trace”不等于“trace 是最终读出的唯一因果来源”。')}
       {figure(v53_figures/'behavioral_head_ablation.png','Figure 13. Free-running head ablation','左右分别是 THINK_OFF 与 THINK_ON；横轴为 autoregressive final-count accuracy，纵轴为 mask group。右图文本额外给 trace exact。THINK_ON targeted top-4 让 trace exact 从 1.00 降至 0.07，但 final accuracy 仍为 1.00；这是“trace 生成 circuit 被破坏，而 final answer 由旁路保住”的直接证据。',wide=True)}
     </div>
-    <div class="callout result-line"><b>必要性结果。</b>Non-thinking 中，L0H1 单头使 teacher-forced count accuracy 平均下降 {pct(value(direct_top1, 'drop_count_accuracy'))}，mask direct top-2 后 free-running final accuracy 只剩 {pct(value(direct_behavior2, 'final_accuracy'))}。Thinking 中，targeted top-2 仍保留 100% marker-trace 与 final count，说明高-attention heads 之间有冗余；只有加入第四个 L1H3、等价于 mask 整个 block-2 attention 层时 marker-trace exact 才降到 {pct(value(targeted_behavior4, 'trace_exact'))}。与此同时 final count 保持 {pct(value(targeted_behavior4, 'final_accuracy'))}。相反，mask 早期 direct-broad top-2 会把 thinking final accuracy 降到 {pct(value(thinking_direct_behavior2, 'final_accuracy'))}。因此 retrieval circuit 对 trace 必要，但 final answer 主要由共享的早期 direct path 保底。</div>
+    <div class="callout result-line"><b>必要性结果。</b>Non-thinking 中，L0H1 单头使 teacher-forced count accuracy 平均下降 {pct(value(direct_top1, 'drop_count_accuracy'))}，mask direct top-2 后 free-running final accuracy 只剩 {pct(value(direct_behavior2, 'final_accuracy'))}。Thinking 中，targeted top-2 仍保留 100% marker-trace 与 final count，说明高-attention heads 之间有冗余；只有加入第四个 L1H3、等价于 mask 整个 Layer 2 attention 时 marker-trace exact 才降到 {pct(value(targeted_behavior4, 'trace_exact'))}。与此同时 final count 保持 {pct(value(targeted_behavior4, 'final_accuracy'))}。相反，mask 早期 direct-broad top-2 会把 thinking final accuracy 降到 {pct(value(thinking_direct_behavior2, 'final_accuracy'))}。因此 retrieval circuit 对 trace 必要，但 final answer 主要由共享的早期 direct path 保底。</div>
 
     <h3>6.3 充分性：clean-to-corrupt activation patching</h3>
-    <div class="protocol"><p><b>Patched tensor。</b>GPT-2 每层四个 head outputs 在 attention <code>c_proj</code> 前拼成 256 维向量；每头占连续 64 维。Head patch 先缓存 clean run 的 pre-<code>c_proj</code> 输入，只在指定 donor/query token 位置复制候选 head 的 64 维 slice 到 corrupt run，再让 <code>c_proj</code>、residual addition、后续 blocks 与 unembedding 正常运行。Residual patch 则在指定 block 输出后，把该 token 的完整 256 维 residual 替换为 clean donor。</p><p><b>Retrieval corruption。</b>对 count 2–10 每 count 10 个样本，令 k=n，只把 prompt 中最后一个 needle 的 marker identity 从原 token 换成词表中第一个不同 marker；needle 位置、count、sequence 长度、<code>&lt;I_k&gt;</code> 绝对位置完全不变。读取 <code>&lt;I_k&gt;</code> logits，比较 clean marker 与 corrupt marker。错误位置 control 使用相同 targeted heads，但 donor 取 <code>&lt;I_k&gt;</code> 前一个 token。</p><p><b>Count corruption。</b>把 prompt 最后一个 needle 替换为确定性的 noise token，使 n→n−1。THINK_OFF 的 close 绝对位置不变；THINK_ON 因 gold trace 少一对 <code>&lt;I&gt;,M</code> 而缩短 2 tokens，所以 clean donor close 与 corrupt receiver close 位置不同。读取 close logits，比较 <code>&lt;C_n&gt;</code> 与 <code>&lt;C_(n−1)&gt;</code>。</p><p><b>计算。</b>每个 pair 分别算 clean、corrupt、patched target margin，再逐 pair 计算 normalized recovery，最后对 90 pairs 平均。Recovery=1 表示恢复到 clean margin，0 表示没有超过 corrupt，负值表示反向，超过 1 表示过度恢复。</p></div>
+    <div class="protocol"><p><b>Patched tensor。</b>GPT-2 每层四个 head outputs 在 attention <code>c_proj</code> 前拼成 256 维向量；每头占连续 64 维。Head patch 先缓存 clean run 的 pre-<code>c_proj</code> 输入，只在指定 donor/query token 位置复制候选 head 的 64 维 slice 到 corrupt run，再让 <code>c_proj</code>、residual addition、后续 layers 与 unembedding 正常运行。Residual patch 则在指定 Transformer layer 输出后，把该 token 的完整 256 维 residual 替换为 clean donor。</p><p><b>Retrieval corruption。</b>对 count 2–10 每 count 10 个样本，令 k=n，只把 prompt 中最后一个 needle 的 marker identity 从原 token 换成词表中第一个不同 marker；needle 位置、count、sequence 长度、<code>&lt;I_k&gt;</code> 绝对位置完全不变。读取 <code>&lt;I_k&gt;</code> logits，比较 clean marker 与 corrupt marker。错误位置 control 使用相同 targeted heads，但 donor 取 <code>&lt;I_k&gt;</code> 前一个 token。</p><p><b>Count corruption。</b>把 prompt 最后一个 needle 替换为确定性的 noise token，使 n→n−1。THINK_OFF 的 close 绝对位置不变；THINK_ON 因 gold trace 少一对 <code>&lt;I&gt;,M</code> 而缩短 2 tokens，所以 clean donor close 与 corrupt receiver close 位置不同。读取 close logits，比较 <code>&lt;C_n&gt;</code> 与 <code>&lt;C_(n−1)&gt;</code>。</p><p><b>计算。</b>每个 pair 分别算 clean、corrupt、patched target margin，再逐 pair 计算 normalized recovery，最后对 90 pairs 平均。Recovery=1 表示恢复到 clean margin，0 表示没有超过 corrupt，负值表示反向，超过 1 表示过度恢复。</p></div>
     <div class="formula">normalized recovery = (patched_margin − corrupt_margin) / (clean_margin − corrupt_margin)</div>
     <p><b>Retrieval identity corruption：</b>固定 count、needle 位置和 trace 长度，只把最后一个 prompt needle 的 marker identity 换成另一类。clean 与 corrupt 的 &lt;I_k&gt; query 绝对位置相同；把 clean run 指定 heads 在该 query 的 pre-<code>c_proj</code> head slice patch 到 corrupt run，测 clean marker 相对 corrupt marker 的 logit margin。<b>Count-readout corruption：</b>删除 prompt 最后一个 needle，使 count 从 n 变成 n−1；在 <code>&lt;/Think&gt;</code> 的 count-prediction state patch clean head output/residual，测 &lt;C_n&gt; 相对 &lt;C_n−1&gt; 的 margin。</p>
     {table(patch_rows,[('path','因果路径'),('intervention','patched component'),('recovery','normalized recovery'),('control','关键对照')])}
@@ -559,7 +646,7 @@ def build_report(run_dir: Path) -> str:
     {figure(v53_figures/'trace_conflict_pred_count.png','Figure 17. Prompt count 与 forced trace count 冲突时的预测',conflict_caption,wide=True)}
 
     <h3>6.5 Trace progress state transplant</h3>
-    <div class="protocol"><p><b>Sequence 与 receiver。</b>仅保留 count≥4 的 gold THINK_ON sequences。固定 receiver 为 trace 中第 k=2 个 marker token <code>M2</code>；正常情况下该 token 的 hidden state 应预测下一个 index <code>&lt;I3&gt;</code>。</p><p><b>Donor。</b>同一 sequence 内选择 k=1 的 <code>M1</code> 或 k=3 的 <code>M3</code> 作为 donor。对每个 block layer=0–3，提取 <code>hidden_states[layer+1]</code> 中 donor token 的完整 256 维 block-output residual，并在该层 forward hook 中替换 receiver <code>M2</code> residual。这样 k=1 donor 希望把下一 token 推向 <code>&lt;I2&gt;</code>，k=3 donor 推向 <code>&lt;I4&gt;</code>。</p><p><b>Readout。</b>在 receiver token 的 logits 上，计算 donor-next token 相对 receiver-next token 的 pairwise margin；同时在 10 个 index tokens+close 的候选集合内判断 argmax。<code>margin_shift_toward_donor = patched pairwise margin − unpatched pairwise margin</code>。</p><p><b>Control。</b>从另一条 prompt 的相同 k=2 marker position提取 residual，patch 到 receiver 的同一 absolute position；该 donor 的 marker identity/context 不同，但 progress 相同。观察是否仍预测 receiver-next <code>&lt;I3&gt;</code>。</p><p><b>结果与限制。</b>所有四层的 k−1/k+1 donor patch 都使 donor-next argmax rate 达到 {pct(progress_success)}，same-progress control 保持 receiver-next 也为 {pct(progress_control_success)}。但 donor progress 与绝对 token position相差两个位置，且 residual 已包含 learned absolute-position 信息；因此结果证明“该 residual 足以携带下一步状态”，尚不能证明这是与位置无关的抽象 counter。</p></div>
+    <div class="protocol"><p><b>Sequence 与 receiver。</b>仅保留 count≥4 的 gold THINK_ON sequences。固定 receiver 为 trace 中第 k=2 个 marker token <code>M2</code>；正常情况下该 token 的 hidden state 应预测下一个 index <code>&lt;I3&gt;</code>。</p><p><b>Donor。</b>同一 sequence 内选择 k=1 的 <code>M1</code> 或 k=3 的 <code>M3</code> 作为 donor。对代码编号 layer=0–3，提取 <code>hidden_states[layer+1]</code> 中 donor token 的完整 256 维 layer-output residual，并在该层 forward hook 中替换 receiver <code>M2</code> residual。这样 k=1 donor 希望把下一 token 推向 <code>&lt;I2&gt;</code>，k=3 donor 推向 <code>&lt;I4&gt;</code>。</p><p><b>Readout。</b>在 receiver token 的 logits 上，计算 donor-next token 相对 receiver-next token 的 pairwise margin；同时在 10 个 index tokens+close 的候选集合内判断 argmax。<code>margin_shift_toward_donor = patched pairwise margin − unpatched pairwise margin</code>。</p><p><b>Control。</b>从另一条 prompt 的相同 k=2 marker position提取 residual，patch 到 receiver 的同一 absolute position；该 donor 的 marker identity/context 不同，但 progress 相同。观察是否仍预测 receiver-next <code>&lt;I3&gt;</code>。</p><p><b>结果与限制。</b>所有四个 layers 的 k−1/k+1 donor patch 都使 donor-next argmax rate 达到 {pct(progress_success)}，same-progress control 保持 receiver-next 也为 {pct(progress_control_success)}。但 donor progress 与绝对 token position相差两个位置，且 residual 已包含 learned absolute-position 信息；因此结果证明“该 residual 足以携带下一步状态”，尚不能证明这是与位置无关的抽象 counter。</p></div>
     {figure(v53_figures/'progress_state_transplant.png','Figure 18. Progress-state residual transplant',progress_caption,wide=True)}
     """
 
@@ -578,7 +665,7 @@ def build_report(run_dir: Path) -> str:
     <div class="callout good"><b>现有最稳妥结论。</b>模型内部存在一个可移植的 progress state，它在 marker token 的 residual 中足以控制下一 index；但这个 state 可能是 learned absolute-position lookup，也可能是由前一个 index token 驱动的有限状态机，还没有被证明为位置无关的 successor counter。</div>
 
     <h3>问题 2：count 数值如何做加减法，存在哪里？</h3>
-    <div class="protocol"><p><b>输出表示。</b>模型不输出十进制字符并执行显式算术，而是在十个独立类别 token <code>&lt;C1&gt;...&lt;C10&gt;</code> 中选择一个。最终 readout 读取 <code>&lt;/Think&gt;</code> 位置的 hidden state，经共享 unembedding 得到十个 count logits。因此“准确输出 n+1”既可能来自连续 count direction，也可能只是十类 lookup。</p><p><b>Probe 已经说明什么。</b>在固定 absolute position 的 THINK_OFF close token，提取 hidden-state index 0–4 的 256 维 residual；用训练集标准化后做 nearest-centroid 分类与 ridge count regression。第一个 block 后 count 已可被线性/质心 probe 高精度读出，而 position baseline 很低。这说明 count 信息存在于 residual population code 中，不等于存在某一个 neuron 或某一个专用标量槽。</p><p><b>Causal evidence。</b>把 prompt 的一个 needle 替换为 noise，使 count 从 n 变成 n−1，但 sequence 长度不变。将 clean n run 的 direct-broad head outputs patch 到 corrupt n−1 run 的固定 THINK_OFF close query，可恢复大部分 <code>C_n</code> 相对 <code>C_(n−1)</code> 的 logit margin；全 residual patch 近乎完全恢复。这定位了“一个 needle 的差分信息”流经早期 broad-aggregation heads 并写入 residual，但仍没有证明该 residual 采用线性加法编码。</p><p><b>CoT 条件的额外混淆。</b>THINK_ON close 的 absolute position 是 <code>259+2n</code>，所以仅凭 close-state probe 可从位置直接读出 n；其 100% probe 不能用来证明模型在 trace 中累加了一个抽象 counter。要研究 arithmetic，应优先在固定位置的 <code>&lt;Think/&gt;</code>、THINK_OFF close，或经过位置匹配的 counterfactual anchors 上进行。</p></div>
+    <div class="protocol"><p><b>输出表示。</b>模型不输出十进制字符并执行显式算术，而是在十个独立类别 token <code>&lt;C1&gt;...&lt;C10&gt;</code> 中选择一个。最终 readout 读取 <code>&lt;/Think&gt;</code> 位置的 hidden state，经共享 unembedding 得到十个 count logits。因此“准确输出 n+1”既可能来自连续 count direction，也可能只是十类 lookup。</p><p><b>Probe 已经说明什么。</b>在固定 absolute position 的 THINK_OFF close token，提取 hidden-state index 0–4 的 256 维 residual；用训练集标准化后做 nearest-centroid 分类与 ridge count regression。经过 Layer 1 后 count 已可被线性/质心 probe 高精度读出，而 position baseline 很低。这说明 count 信息存在于 residual population code 中，不等于存在某一个 neuron 或某一个专用标量槽。</p><p><b>Causal evidence。</b>把 prompt 的一个 needle 替换为 noise，使 count 从 n 变成 n−1，但 sequence 长度不变。将 clean n run 的 direct-broad head outputs patch 到 corrupt n−1 run 的固定 THINK_OFF close query，可恢复大部分 <code>C_n</code> 相对 <code>C_(n−1)</code> 的 logit margin；全 residual patch 近乎完全恢复。这定位了“一个 needle 的差分信息”流经早期 broad-aggregation heads 并写入 residual，但仍没有证明该 residual 采用线性加法编码。</p><p><b>CoT 条件的额外混淆。</b>THINK_ON close 的 absolute position 是 <code>259+2n</code>，所以仅凭 close-state probe 可从位置直接读出 n；其 100% probe 不能用来证明模型在 trace 中累加了一个抽象 counter。要研究 arithmetic，应优先在固定位置的 <code>&lt;Think/&gt;</code>、THINK_OFF close，或经过位置匹配的 counterfactual anchors 上进行。</p></div>
     <div class="callout warn"><b>当前没有证据证明“做了加减法”。</b>我们已经知道 count 可从 hidden state 读出，也知道相关 heads/residual 对答案有因果作用；但还没有证明相邻 count states 满足 <code>h_(n+1) ≈ h_n + d</code>，也没有证明对 hidden state 加/减同一方向会稳定令答案变成 n±1。</div>
 
     <h3>能够真正回答这两个问题的下一组实验</h3>
@@ -586,9 +673,282 @@ def build_report(run_dir: Path) -> str:
       <li><b>Same-position successor counterfactual。</b>保持 prompt、sequence 长度与 <code>M_k</code> absolute position 不变，只把前一 token 从 <code>&lt;I_k&gt;</code> 改为 <code>&lt;I_j&gt;</code>，分别读取每层 <code>M_k</code> residual 和 index-subset logits。若输出变为 <code>&lt;I_(j+1)&gt;</code>，支持 token-driven successor；若仍为 <code>&lt;I_(k+1)&gt;</code>，更支持 position/context-driven transition。</li>
       <li><b>Position-controlled residual patch。</b>构造两条等长 counterfactual prefix，使 donor 与 receiver query 位于同一 absolute position、但其显式 progress token 不同；逐层 patch 256 维 residual，并加入“同 progress、不同 marker”和“同 marker、不同 progress”两个 controls。这样才能把 progress 从 position 与 marker identity 中分离。</li>
       <li><b>Adjacent-difference geometry。</b>在固定 anchor 和每个 layer 计算各 count 的均值状态 <code>mu_n</code>，令 <code>d_n=mu_(n+1)-mu_n</code>；报告所有 <code>cos(d_n,d_m)</code>、方向长度及 held-out split。只有相邻差分近似平行，才有资格讨论统一 count direction。</li>
-      <li><b>Arithmetic steering。</b>只用训练样本估计 <code>d=mean_n d_n</code>，在 held-out 样本同一 layer/position 注入 <code>h'=h+alpha*d</code>，继续运行剩余 blocks；测试 alpha=−2...2 时 count-subset 期望值和 exact prediction 是否单调移动，并重点检验 <code>n→n±1</code>。随机正交方向、shuffled-label direction 和等范数 direction 是必要 controls。</li>
+      <li><b>Arithmetic steering。</b>只用训练样本估计 <code>d=mean_n d_n</code>，在 held-out 样本同一 layer/position 注入 <code>h'=h+alpha*d</code>，继续运行剩余 layers；测试 alpha=−2...2 时 count-subset 期望值和 exact prediction 是否单调移动，并重点检验 <code>n→n±1</code>。随机正交方向、shuffled-label direction 和等范数 direction 是必要 controls。</li>
       <li><b>Needle add/delete trajectory。</b>在不改变 sequence 长度的前提下将一个 noise token 与 needle token互换，形成 n 与 n±1 配对；逐层比较固定 query residual 差异并做 clean-to-corrupt head/residual patch，定位“+1 信息”第一次出现在哪层、由哪些 heads 写入，以及后续层是否只负责分类 readout。</li>
     </ol>
+    """
+
+    v54_dir = run_dir / "v5_4_count_state_causal"
+    v54_tables = v54_dir / "tables"
+    v54_figures = v54_dir / "figures"
+    v54_section = ""
+    v54_integrated_support = ""
+    v54_integrated_nonsupport = ""
+    v54_mechanism_callout = ""
+    if (v54_tables / "manifold_geometry.csv").exists():
+        v54_config = json.loads((v54_dir / "run_config.json").read_text(encoding="utf-8"))
+        v54_baseline = pd.read_csv(v54_tables / "baseline_accuracy.csv")
+        v54_geometry = pd.read_csv(v54_tables / "direction_geometry.csv")
+        v54_manifold = pd.read_csv(v54_tables / "manifold_geometry.csv")
+        v54_steering = pd.read_csv(v54_tables / "steering_summary.csv")
+        v54_swap = pd.read_csv(v54_tables / "state_swap_summary.csv")
+        v54_mediation = pd.read_csv(v54_tables / "mediation_summary.csv")
+
+        def v54_pick(frame: pd.DataFrame, **filters: object) -> pd.Series:
+            selected = frame
+            for key, wanted in filters.items():
+                selected = selected[selected[key] == wanted]
+            return selected.iloc[0] if not selected.empty else pd.Series(dtype=object)
+
+        def v54_number(row: pd.Series, key: str) -> float:
+            return float(row[key]) if key in row and pd.notna(row[key]) else math.nan
+
+        baseline_rows = (
+            v54_baseline.groupby(["site", "split"], as_index=False)
+            .accuracy.mean()
+            .to_dict("records")
+        )
+        v54_baseline_rows = [
+            {"site": code(row["site"]), "split": row["split"], "accuracy": pct(row["accuracy"])}
+            for row in baseline_rows
+        ]
+        geometry_rows = []
+        for site in ("nonthinking_close", "thinking_fixed_trace_close"):
+            for layer in (0, 3):
+                ridge = v54_pick(v54_geometry, site=site, layer=layer, method="ridge")
+                adjacent = v54_pick(v54_geometry, site=site, layer=layer, method="adjacent_mean")
+                geometry_rows.append(
+                    {
+                        "site": code(site),
+                        "layer": layer + 1,
+                        "ridge_r2": fmt(v54_number(ridge, "projection_r2_heldout"), 4),
+                        "adjacent_r2": fmt(v54_number(adjacent, "projection_r2_heldout"), 4),
+                        "cosine": fmt(v54_number(adjacent, "adjacent_delta_cosine_mean"), 4),
+                    }
+                )
+        manifold_rows = [
+            {
+                "site": code(row.site),
+                "layer": int(row.layer) + 1,
+                "pc2": pct(row.pc1_pc2_variance),
+                "pc3": pct(row.pc1_pc2_pc3_variance),
+                "pc6": pct(row.pc1_to_pc6_variance),
+                "pcs90": int(row.pcs_for_90pct),
+                "dimension": fmt(row.effective_dimension, 2),
+                "angle": f"{fmt(row.mean_turning_angle_degrees, 1)} degrees",
+                "path": fmt(row.path_to_chord_ratio, 2),
+            }
+            for row in v54_manifold.itertuples(index=False)
+        ]
+        steering_specs = [
+            ("nonthinking_close", "centroid_transport", 0),
+            ("nonthinking_close", "centroid_transport", 3),
+            ("thinking_natural_close", "cross_centroid_transport", 0),
+            ("thinking_natural_close", "cross_centroid_transport", 3),
+            ("thinking_fixed_trace_close", "centroid_transport", 3),
+            ("nonthinking_close", "adjacent_mean", 3),
+        ]
+        steering_rows = []
+        for site, method, layer in steering_specs:
+            for alpha in (-1.0, 1.0):
+                row = v54_pick(
+                    v54_steering,
+                    target_site=site,
+                    direction_method=method,
+                    layer=layer,
+                    alpha=alpha,
+                )
+                steering_rows.append(
+                    {
+                        "target": code(site),
+                        "intervention": code(method),
+                        "layer": layer + 1,
+                        "alpha": f"{alpha:+.0f}",
+                        "shift": fmt(v54_number(row, "causal_expected_shift"), 3),
+                        "desired": pct(v54_number(row, "desired_accuracy")),
+                    }
+                )
+        swap_rows = [
+            {
+                "site": code(row.site),
+                "control": code(row.control),
+                "layer": int(row.layer) + 1,
+                "follows": pct(row.follows_donor),
+                "shift": fmt(row.causal_expected_shift, 3),
+            }
+            for row in v54_swap.itertuples(index=False)
+        ]
+        mediation_rows = [
+            {
+                "site": code(row.site),
+                "component": code(row.component_name),
+                "type": row.component_type,
+                "step": fmt(row.state_step_units, 3),
+                "recovery": fmt(row.normalized_recovery, 3),
+            }
+            for row in v54_mediation.itertuples(index=False)
+        ]
+        non_late_plus = v54_pick(
+            v54_steering,
+            target_site="nonthinking_close",
+            direction_method="centroid_transport",
+            layer=3,
+            alpha=1.0,
+        )
+        natural_late_plus = v54_pick(
+            v54_steering,
+            target_site="thinking_natural_close",
+            direction_method="cross_centroid_transport",
+            layer=3,
+            alpha=1.0,
+        )
+        global_late_plus = v54_pick(
+            v54_steering,
+            target_site="nonthinking_close",
+            direction_method="adjacent_mean",
+            layer=3,
+            alpha=1.0,
+        )
+        non_swap_final = v54_pick(
+            v54_swap,
+            site="nonthinking_close",
+            control="plus_one_donor",
+            layer=3,
+        )
+        non_broad4 = v54_pick(
+            v54_mediation,
+            site="nonthinking_close",
+            component_type="head_group",
+            component_name="direct_broad_top4",
+        )
+        fixed_broad4 = v54_pick(
+            v54_mediation,
+            site="thinking_fixed_trace_close",
+            component_type="head_group",
+            component_name="direct_broad_top4",
+        )
+        non_targeted4 = v54_pick(
+            v54_mediation,
+            site="nonthinking_close",
+            component_type="head_group",
+            component_name="targeted_top4",
+        )
+        fixed_targeted4 = v54_pick(
+            v54_mediation,
+            site="thinking_fixed_trace_close",
+            component_type="head_group",
+            component_name="targeted_top4",
+        )
+        non_broad2 = v54_pick(
+            v54_mediation,
+            site="nonthinking_close",
+            component_type="head_group",
+            component_name="direct_broad_top2",
+        )
+        fixed_broad2 = v54_pick(
+            v54_mediation,
+            site="thinking_fixed_trace_close",
+            component_type="head_group",
+            component_name="direct_broad_top2",
+        )
+        non_trace4 = v54_pick(
+            v54_mediation,
+            site="nonthinking_close",
+            component_type="head_group",
+            component_name="trace_readout_top4",
+        )
+        fixed_trace4 = v54_pick(
+            v54_mediation,
+            site="thinking_fixed_trace_close",
+            component_type="head_group",
+            component_name="trace_readout_top4",
+        )
+        ridge_rows = v54_geometry[v54_geometry.method == "ridge"]
+        ridge_r2_min = float(ridge_rows.projection_r2_heldout.min())
+        ridge_r2_max = float(ridge_rows.projection_r2_heldout.max())
+        non_manifold_first = v54_pick(v54_manifold, site="nonthinking_close", layer=0)
+        non_manifold_last = v54_pick(v54_manifold, site="nonthinking_close", layer=3)
+        fixed_manifold_first = v54_pick(v54_manifold, site="thinking_fixed_trace_close", layer=0)
+        fixed_manifold_last = v54_pick(v54_manifold, site="thinking_fixed_trace_close", layer=3)
+        tour_html = six_pc_tour(v54_dir / "count_centroids.npz")
+        v54_integrated_support = (
+            f"<li>Non-thinking count 主要依赖 Layer 1 的 broad-aggregation heads；v5.4 的 position-matched "
+            f"needle deletion 中，direct-broad top-4 恢复 {pct(v54_number(non_broad4,'normalized_recovery'))} 的 count margin。</li>"
+            "<li>Count-state geometry 在 Layer 1 近似低维弯曲轨迹，在 Layer 4 展开为约六维的 class-specific states；"
+            "count-specific centroid transport 与完整 residual swap 都能因果改变最终答案。</li>"
+            "<li>由 THINK_OFF 学得的 centroid displacement 可以跨模式控制自然 THINK_ON，支持两种模式共享 prompt-count state；"
+            "targeted retrieval heads 则主要服务 trace 中的 marker identity 检索。</li>"
+        )
+        v54_integrated_nonsupport = (
+            "<li>不支持一个全局、translation-invariant 的 +1 direction：相邻 centroid differences 不平行，"
+            "把九个相邻差向量平均后进行 steering 基本不能改变答案。</li>"
+        )
+        v54_mechanism_callout = (
+            '<div class="callout good"><b>v5.4 对 count representation 的修正。</b>'
+            'Layer 1 residual 中十个 count centroids 形成接近二维的弯曲轨迹；到 Layer 4，它们展开成约六维、明显折叠的 '
+            'class-specific states。一个全局平均 +1 direction 即使具有很高线性可读性，也不能因果推动答案；'
+            '按当前 count 选择的 centroid displacement、完整 residual swap 与 needle-delete mediation 才能稳定改变或恢复 count。'
+            '因此更准确的机制是“早期 broad aggregation 写入共享的 count-state manifold，后续 layers 将它展开为离散 answer states”，'
+            '而不是“沿同一个固定向量反复加一”。</div>'
+        )
+        v54_setting_rows = [
+            {"item": "模型与 checkpoint", "setting": "冻结同一个 v5 explicit-switch 最终 checkpoint；不继续训练，也不重新拟合 Transformer 参数"},
+            {"item": "方向拟合集", "setting": f"count 1–10 每个 count {v54_config['train_examples_per_count']} 个独立 prompt；每个 site 共 1,000 个样本，只用于拟合 centroid、PCA 与 ridge"},
+            {"item": "因果测试集", "setting": f"count 1–10 每个 count {v54_config['eval_examples_per_count']} 个全新 held-out prompt；steering 使用 count 2–9，共 160 个样本，使 n±1 仍在 1–10 词表内"},
+            {"item": "needle-delete mediation", "setting": f"count 2–10 每个 count {v54_config['mediation_examples_per_count']} 个 clean/corrupt pair，共 90 对；只删除最后一个 needle，prompt 总长度不变"},
+            {"item": "fixed-trace 对照", "setting": f"所有 prompt 强制使用同一组 {v54_config['fixed_trace_count']} 对 index/marker 模板；prompt count 改变，但 trace 内容、trace 长度与 close token 绝对位置保持不变"},
+            {"item": "Layer 与向量", "setting": "正文使用 1-based Layer 1–4；代码 CSV 使用 0-based layer=0–3。每次干预的是对应 Transformer layer 后、指定 query token 的完整 256 维 residual"},
+        ]
+        v54_section = f"""
+    <h2>7. v5.4 Count-state 因果分析：可读性不等于模型实际使用</h2>
+    <div class="callout good"><b>本节要回答的问题。</b>前面的 probe 说明 count 可以从 residual 中被线性读出，但仍不能回答模型是否真的沿某个“+1 方向”计算。v5.4 冻结同一 checkpoint，通过位置匹配的 centroid、steering、state swap 和 clean-to-corrupt patching，区分三种可能：①一个全局共享的 +1 向量；②依赖当前 count 的 class-specific state transition；③只有 probe 可读、但对输出没有因果作用。结果支持第②种，不支持第①种，也排除了纯粹的 probe 假象。</div>
+
+    <h3>7.1 编号、样本与三个 count readout site</h3>
+    <div class="protocol"><p><b>Layer 编号。</b>本报告正文统一使用 <code>Layer 1–4</code>，表示模型从输入到输出依次经过的四个 Transformer layers。原始 CSV 的 <code>layer=0..3</code> 与正文的 Layer 1–4 一一对应。Head 名称仍按代码采用 0-based，例如 <code>L0H1</code> 表示 Layer 1 的 head 1。</p><p><b>Residual 定义。</b>这里的 layer residual 是指定 token 经过某个 Transformer layer 的 attention、MLP 与两次 residual addition 后得到的完整 256 维 residual-stream 向量。所有 v5.4 干预都只替换或平移这个向量，然后让后续 layers 和 unembedding 正常运行。</p></div>
+    {table(v54_setting_rows, [('item','项目'),('setting','正式实验设置')])}
+    <div class="protocol"><p><b><code>nonthinking_close</code>。</b>输入截断为 <code>&lt;BOS&gt; &lt;THINK_OFF&gt; prompt[256] &lt;Think/&gt; &lt;/Think&gt;</code>。Query 是最后的 <code>&lt;/Think&gt;</code>，绝对位置始终为 259；该位置的 logits 直接预测 <code>&lt;C_n&gt;</code>，因此是无位置泄漏的主要 count readout。</p><p><b><code>thinking_natural_close</code>。</b>使用训练分布内的完整 trace：<code>... &lt;Think/&gt; &lt;I1&gt;M1 ... &lt;In&gt;Mn &lt;/Think&gt;</code>。其 close 位置为 <code>259+2n</code>，位置本身泄漏 count，因此本 site 只作为 cross-mode steering 的自然 THINK_ON 目标，不用于拟合 count geometry。</p><p><b><code>thinking_fixed_trace_close</code>。</b>无论 prompt 中有多少 needle，都强制放入同一个五对模板 <code>&lt;I1&gt;A ... &lt;I5&gt;E</code>，使 close 固定在位置 269。Prompt count 改变时，trace 内容、trace 长度和 query 位置均不变，所以此 site 能隔离 prompt count；代价是它是 counterfactual/OOD 输入，原始准确率不能当作正常 THINK_ON benchmark。</p><p><b>数据隔离。</b>Centroid、PCA 和 ridge 只在 1,000 个 direction-train prompts/site 上拟合；所有 steering 和 swap 在独立 held-out prompts 上评估；needle deletion 再使用单独生成的 90 对 clean/corrupt samples。不存在用测试样本拟合方向后再在同一批样本上报告效果的问题。</p></div>
+    {table(v54_baseline_rows,[('site','site'),('split','数据 split'),('accuracy','未干预 final-count accuracy')])}
+
+    <h3>7.2 表示几何：为什么高 Ridge R² 不等于一个统一算术轴</h3>
+    <div class="protocol"><p><b>提取什么。</b>对 site <code>s</code>、正文 Layer <code>l</code>、count <code>n</code>，在方向拟合集上提取 query residual <code>h(s,l,x)</code>，并对同一 count 的 100 个样本求均值得到 class centroid <code>mu(s,l,n)</code>。</p><p><b>Ridge 可读性。</b>用 256 维 residual 预测连续数值 count，在独立 held-out split 上报告 R²。R² 接近 1 只表示存在某个线性读出，不表示语言模型沿该方向移动 hidden state。</p><p><b>相邻差向量。</b>定义 <code>delta_n=mu_(n+1)-mu_n</code>。如果模型真的通过同一方向重复 +1，则九个 <code>delta_n</code> 应大致平行，pairwise cosine 应接近 1。若 cosine 接近 0 或为负，则不同 count transition 朝向不同方向。</p><p><b>全局平均方向。</b>再令 <code>d=mean_n(delta_n)</code>，把 residual 投影到 d 上计算 held-out R²。这个值仍是相关性指标；第 7.4 节会直接把 d 注入模型检验因果作用。</p></div>
+    <div class="formula">mu_(s,l,n)=mean[h_(s,l)(x) | count(x)=n]；delta_n=mu_(n+1)-mu_n；adjacent cosine=mean_(i&lt;j) cos(delta_i,delta_j)</div>
+    {table(geometry_rows,[('site','site'),('layer','Layer'),('ridge_r2','held-out Ridge R²'),('adjacent_r2','平均相邻方向 R²'),('cosine','相邻差向量平均 cosine')])}
+    {figure(v54_figures/'count_direction_geometry.png','Figure 19. 线性可读性与相邻 count transition 是否平行','左图横轴为 Layer 1–4，纵轴为 held-out projection R²；颜色表示 site，线型表示 ridge、平均相邻方向或 shuffled control。右图横轴同样为 Layer，纵轴为九个相邻 centroid 差向量两两 cosine 的平均值。Ridge 一直接近 1，但 cosine 到后层接近 0 或为负，说明十个 count 类可以被线性读出，却没有排成一条共享的 +1 直线。',wide=True)}
+    <div class="callout result-line"><b>几何结果。</b>两个 position-matched sites、四个 layers 的 held-out Ridge R² 均在 {fmt(ridge_r2_min,4)}–{fmt(ridge_r2_max,4)} 之间；但 THINK_OFF 的相邻差向量平均 cosine 从 Layer 1 的 {fmt(v54_number(v54_pick(v54_geometry,site='nonthinking_close',layer=0,method='adjacent_mean'),'adjacent_delta_cosine_mean'),3)} 下降到 Layer 4 的 {fmt(v54_number(v54_pick(v54_geometry,site='nonthinking_close',layer=3,method='adjacent_mean'),'adjacent_delta_cosine_mean'),3)}。因此“count 可线性预测”与“存在统一 +1 运算方向”是两件不同的事。</div>
+
+    <h3>7.3 Manifold：早层是弯曲低维轨迹，晚层展开为约六维类别状态</h3>
+    <div class="protocol"><p><b>PCA 输入。</b>每个 site、每个 Layer 单独对十个 class centroids 做 PCA，而不是对所有 individual examples 做 PCA。因为只有十个 centroid，最多只有九个非零主成分。图中编号 1–10 是 gold count；相邻连线是投影后的 <code>delta_n</code>。</p><p><b>累计解释方差。</b><code>PC1-k variance</code> 是前 k 个 PC 解释的 centroid 总方差比例；<code>PCs for 90%</code> 是达到 90% 所需的最少 PC 数。</p><p><b>Effective dimension。</b>按特征值计算 <code>(sum lambda)^2/sum(lambda²)</code>。它不是神经元数量，而是 centroid variance 实际分布在多少个正交方向上的连续估计。</p><p><b>Turning angle。</b>计算相邻 <code>delta_n</code> 与 <code>delta_(n+1)</code> 的夹角并平均；0° 是直线同向，90° 表示连续转弯，超过 90° 表示轨迹出现回折。</p><p><b>Path/chord。</b>分子是 1→2→...→10 的相邻路径总长度，分母是 count 1 到 count 10 的直线距离。值为 1 才是一条直线，数值越大表示 manifold 越弯曲或折叠。</p></div>
+    {table(manifold_rows,[('site','site'),('layer','Layer'),('pc2','PC1–2 方差'),('pc3','PC1–3 方差'),('pc6','PC1–6 方差'),('pcs90','90% 所需 PC'),('dimension','effective dimension'),('angle','平均转角'),('path','path/chord')])}
+    {figure(v54_figures/'count_centroid_manifold_2d.png','Figure 20. 十个 count centroid 的二维轨迹','列对应 Layer 1–4，行对应 THINK_OFF 与 fixed-trace THINK_ON。每个 panel 都独立拟合 PCA；横轴为 centroid PC1，纵轴为 centroid PC2，标题给出该二维投影保留的方差。Layer 1 的二维图保留约 97%，可作为真实几何近似；Layer 4 只保留约 50%，二维交叉主要是高维折叠的投影，不能按平面路径直接解释。',wide=True)}
+    {figure(v54_figures/'count_centroid_six_pc_3d.png','Figure 21. Layer 4 的 PC1–3 与 PC4–6 两个三维子空间','左列展示 PC1、PC2、PC3，右列展示 PC4、PC5、PC6；两行是两个 position-matched sites。Layer 4 前三个 PC 只解释约 66%，前六个 PC 解释约 94%。因此右列不是可忽略的噪声，而是晚层 count-class geometry 的重要组成部分。使用两个正交三维子空间也比 t-SNE/UMAP 更保真，因为没有引入非线性邻域扭曲。',wide=True)}
+    {tour_html}
+    <div class="protocol"><p><b>交互式 3D 怎么读。</b>Mode 下拉框切换 THINK_OFF 与 fixed-trace THINK_ON；滑块的 0° 显示 PC1–3，90° 显示 PC4–6，中间角度用正交旋转连续混合两组三维坐标。拖动鼠标只改变观察相机，不改变数据；播放按钮自动扫过六个 PC。编号点仍是 count 1–10，连线只连接相邻 count。</p></div>
+    <div class="callout result-line"><b>Manifold 结果。</b>Layer 1 的前两 PC 对 THINK_OFF/fixed-trace THINK_ON 分别解释 {pct(v54_number(non_manifold_first,'pc1_pc2_variance'))}/{pct(v54_number(fixed_manifold_first,'pc1_pc2_variance'))}；Layer 4 降到 {pct(v54_number(non_manifold_last,'pc1_pc2_variance'))}/{pct(v54_number(fixed_manifold_last,'pc1_pc2_variance'))}。Layer 4 需要 6 个 PC 才超过 90%，effective dimension 为 {fmt(v54_number(non_manifold_last,'effective_dimension'),2)}/{fmt(v54_number(fixed_manifold_last,'effective_dimension'),2)}，平均转角为 {fmt(v54_number(non_manifold_last,'mean_turning_angle_degrees'),1)}°/{fmt(v54_number(fixed_manifold_last,'mean_turning_angle_degrees'),1)}°。这支持“早层弯曲低维 count trajectory，晚层展开为折叠的离散 answer states”。</div>
+
+    <h3>7.4 因果 steering：全局 +1 direction 与 count-specific centroid transport</h3>
+    <div class="protocol"><p><b>实验目的。</b>如果一个方向只是 probe 可读但模型不用，沿它移动 residual 不一定改变输出；如果它是实际 causal variable，干预后 count-token 分布应按干预剂量移动。</p><p><b>Global adjacent steering。</b>在指定 Layer 后把 query residual 改为 <code>h'=h+alpha*step_size*d</code>。<code>d</code> 是九个相邻差向量的归一化平均方向；<code>step_size</code> 是相邻 transition 在 d 上的平均投影。测试 <code>alpha=-2,-1,0,1,2</code>。</p><p><b>Centroid transport。</b>对真实 count 为 n 的样本，加入 <code>mu_(clip(n+alpha))-mu_n</code>。它保留该样本自己的 residual，只加入训练集估计的 class-specific 平均 transition。这个干预使用 gold n，因此不是部署时可直接使用的算法；它用于检验“正确 count state 是否足以控制答案”。</p><p><b>Cross-mode transport。</b>在自然 THINK_ON residual 上加入由 THINK_OFF centroids 得到的 displacement。如果仍能按 n±1 改变答案，说明两种模式至少共享一部分 prompt-count geometry。</p><p><b>Readout 指标。</b>只在十个 count tokens 上归一化 softmax，计算 <code>E[count]=sum_k k*p(C_k)</code>。<code>causal expected shift</code> 是同一样本干预后 E[count] 减去 alpha=0；<code>desired-count accuracy</code> 是 argmax 是否等于 <code>clip(n+alpha)</code>。随机正交方向是等范数负对照。</p></div>
+    {table(steering_rows,[('target','目标 site'),('intervention','干预方向'),('layer','Layer'),('alpha','alpha'),('shift','因果期望 count 位移'),('desired','目标 count accuracy')])}
+    {figure(v54_figures/'count_direction_steering.png','Figure 22. 全局方向与 count-specific transport 的剂量响应','三列依次是 THINK_OFF、fixed-trace THINK_ON 和 natural THINK_ON；上排为 Layer 1 干预，下排为 Layer 4 干预。横轴 alpha 为 -2 到 2，纵轴为相对 alpha=0 的概率加权期望 count 位移。理想的 +1/-1 因果响应应接近 y=alpha；不同线表示平均相邻方向、centroid transport、跨模式 transport 与随机正交 control。',wide=True)}
+    <div class="callout result-line"><b>Steering 结果。</b>在 Layer 4，THINK_OFF 的全局平均相邻方向在 alpha=+1 时只产生 {fmt(v54_number(global_late_plus,'causal_expected_shift'),3)} 的期望位移；count-specific centroid transport 则产生 {fmt(v54_number(non_late_plus,'causal_expected_shift'),3)} 位移，目标 count accuracy 为 {pct(v54_number(non_late_plus,'desired_accuracy'))}。把 THINK_OFF centroid transition 注入自然 THINK_ON，同样产生 {fmt(v54_number(natural_late_plus,'causal_expected_shift'),3)} 位移和 {pct(v54_number(natural_late_plus,'desired_accuracy'))} accuracy。也就是说，模型使用的是可跨模式迁移、但依赖当前 count 的 class-specific transition，不是一个对所有 n 都相同的全局 +1 向量。</div>
+
+    <h3>7.5 完整 residual state swap：某个 count state 是否足以接管答案</h3>
+    <div class="protocol"><p><b>Receiver 与 donor。</b>在 held-out split 中，将 count n 的 receiver 与 count n+1 的 donor 配对。在同一 site、同一绝对 token 位置和同一 Layer，把 receiver 的完整 256 维 residual 替换成 donor residual，再运行后续 layers。</p><p><b>主要指标。</b><code>follows_donor</code> 是最终 count argmax 是否变成 donor 的 n+1；<code>causal expected shift</code> 是 swap 后 E[count] 减去未 swap receiver 的 E[count]。</p><p><b>Same-count control。</b>另取不同 prompt、但 count 同为 n 的 donor。若只是“替换任意向量”就会破坏输出，该 control 也应改变 count；若 count state 是关键，same-count donor 应保持 n。</p></div>
+    {table(swap_rows,[('site','site'),('control','donor/control'),('layer','Layer'),('follows','预测跟随 donor'),('shift','因果期望 count 位移')])}
+    {figure(v54_figures/'count_state_swap.png','Figure 23. 位置匹配的完整 residual state swap','横轴为 Layer 1–4，纵轴为 receiver 最终预测等于 donor count 的比例。plus-one donor 表示 n→n+1；same-count donor 是不同 prompt、相同 n 的负对照。THINK_OFF 在 Layer 3–4 达到完全 donor following；fixed-trace THINK_ON 较低，主要受该 OOD counterfactual site 自身 baseline 不完美影响。',wide=True)}
+    <div class="callout result-line"><b>State-swap 结果。</b>THINK_OFF 的 plus-one donor 在 Layer 1/2 已分别使 {pct(float(v54_pick(v54_swap,site='nonthinking_close',control='plus_one_donor',layer=0).follows_donor))}/{pct(float(v54_pick(v54_swap,site='nonthinking_close',control='plus_one_donor',layer=1).follows_donor))} 的预测跟随 donor；Layer 3/4 均达到 100%。Same-count donor 保持原 count，说明效果来自 donor 携带的 count state，而不是无差别替换 residual 所造成的随机破坏。</div>
+
+    <h3>7.6 Needle deletion mediation：哪些 heads 把 prompt count 写进 residual</h3>
+    <div class="protocol"><p><b>Clean/corrupt pair。</b>Clean prompt 的 count 为 n；corrupt prompt 只把最后一个 needle token 替换成确定性的 noise token，使 count 变成 n−1，但 256-token prompt 长度和所有其他 token 完全不变。固定 trace site 还保证两次运行的 trace 内容与 close 位置完全相同。</p><p><b>Count logit margin。</b>在 close query 读取 <code>margin=logit(C_n)-logit(C_(n-1))</code>。Clean margin 通常为正，corrupt margin 通常为负。Patch 后 margin 越接近 clean，说明被 patch 的 component 越能传递“被删除的一个 needle”对答案的因果贡献。</p><p><b>Residual patch。</b>把 clean run 在某一 Layer 后的完整 256 维 close residual 放入 corrupt run 的同一位置，测试该 Layer 的 state 是否足以恢复 clean count。</p><p><b>Head-group patch。</b>缓存 clean attention 在 <code>c_proj</code> 前的多头拼接向量，只替换指定 heads 的 64 维 slices，再让 projection、residual addition 与后续 layers 正常运行。候选包括 direct-broad、targeted-retrieval 与 trace-readout groups。</p><p><b>Normalized recovery。</b><code>(patched margin-corrupt margin)/(clean margin-corrupt margin)</code>。1 表示完全恢复 clean margin，0 表示没有优于 corrupt，负值表示朝错误方向移动，超过 1 表示 over-recovery。<code>state-step units</code> 则把 clean-corrupt residual difference 投影到 fitted count readout，并除以训练集中一个 count step 的平均尺度。</p></div>
+    {table(mediation_rows,[('site','site'),('component','patched component'),('type','component 类型'),('step','state-step units'),('recovery','normalized recovery')])}
+    <div class="figure-grid">
+      {figure(v54_figures/'count_residual_mediation.png','Figure 24. 删除一个 needle 后的 residual mediation','左图横轴为 Layer，纵轴为 clean-corrupt residual difference 在 fitted count readout 上对应多少个 count step；右图横轴为 Layer，纵轴为 patch 完整 clean residual 后的 normalized recovery。接近 1 表示该 Layer 的 close residual 已包含足以恢复 clean answer 的完整差分状态。')}
+      {figure(v54_figures/'count_head_mediation.png','Figure 25. 哪些 attention head groups 写入 answer-relevant count state','横轴为从 clean run patch 的 head group，纵轴为 count-margin normalized recovery；颜色区分 THINK_OFF 与 fixed-trace THINK_ON。Direct-broad groups 恢复显著，targeted retrieval groups 接近 0，说明负责 k-to-k marker 检索的 heads 并不是把最终 prompt count 写入 close residual 的主要组件。')}
+    </div>
+    <div class="callout result-line"><b>Mediation 结果。</b>THINK_OFF 中，direct-broad top-2/top-4 分别恢复 {pct(v54_number(non_broad2,'normalized_recovery'))}/{pct(v54_number(non_broad4,'normalized_recovery'))} 的 clean count margin；fixed-trace THINK_ON 中对应为 {pct(v54_number(fixed_broad2,'normalized_recovery'))}/{pct(v54_number(fixed_broad4,'normalized_recovery'))}。Targeted top-4 只有 {pct(v54_number(non_targeted4,'normalized_recovery'))}/{pct(v54_number(fixed_targeted4,'normalized_recovery'))}，trace-readout top-4 为 {pct(v54_number(non_trace4,'normalized_recovery'))}/{pct(v54_number(fixed_trace4,'normalized_recovery'))}。因此 retrieval circuit 与 count-state writing circuit 可以被因果分离：前者负责逐项取回 marker identity，后者主要由早期 broad aggregation 写入 answer-relevant count state。</div>
+
+    <h3>7.7 目前可以下的结论与不能下的结论</h3>
+    <div class="callout good"><b>得到支持。</b><ul><li>Count 不只是 probe 可读：centroid transport、完整 residual swap 和 clean-to-corrupt mediation 都能稳定改变或恢复最终 count。</li><li>Layer 1 的 count centroids 接近一条弯曲低维轨迹；后续 layers 将它展开成约六维、class-specific 的 answer geometry。</li><li>THINK_OFF 学到的 centroid displacement 可以控制自然 THINK_ON，说明两种模式共享 prompt-derived count state。</li><li>Direct-broad heads 对 count-state 写入有强 mediation；targeted retrieval heads 对 marker trace 重要，但不是最终 count state 的主要写入者。</li></ul></div>
+    <div class="callout warn"><b>仍不能声称。</b><ul><li>不能声称模型沿一个全局标量 accumulator 每次 +1：相邻差向量不平行，平均方向 steering 无效。</li><li>Centroid transport 使用 gold count 选择位移，因此证明的是 state 的因果充分性，不是模型在线找到该位移的具体算法。</li><li>Fixed-trace THINK_ON 是刻意构造的 OOD 对照，百分比不能替代自然 THINK_ON accuracy；它的价值是消除 trace length、trace content 与 absolute position 的混淆。</li><li>这些结果定位了 count-state 写入与 readout，但还没有把每个 broad head 的 value vectors、MLP 变换和 LayerNorm 贡献完全分解。</li></ul></div>
     """
 
     styles = """
@@ -598,6 +958,7 @@ def build_report(run_dir: Path) -> str:
     code{background:#edf1f7;border-radius:4px;padding:1px 5px;font-family:Consolas,monospace}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.card{background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:14px}.label{color:var(--muted);font-size:12px}.value{font-size:22px;font-weight:750}.callout{border-left:5px solid var(--blue);background:#eef4ff;padding:14px 18px;border-radius:7px;margin:20px 0}.good{border-left-color:var(--green);background:#edf9f0}.warn{border-left-color:var(--amber);background:#fff7e6}
     .format-grid,.figure-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.format,.figure{border:1px solid var(--line);border-radius:8px;padding:15px;background:#fff}.sequence{font:14px Consolas,monospace;overflow-wrap:anywhere}.figure{margin:0 0 18px}.figure.wide{grid-column:1/-1}.figure img{display:block;width:100%;height:390px;object-fit:contain}.figure.wide img{height:500px}figcaption{font-size:13.5px;color:var(--muted);margin-top:10px}.on{color:#08783e;font-weight:700}.off{color:#b45309;font-weight:700}.target{color:#b42318;font-weight:700}
     .table-wrap{overflow-x:auto;margin:14px 0 24px}table{border-collapse:collapse;width:100%;font-size:13.5px}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:#eef2f8}.formula{font:13.5px Consolas,monospace;background:#f7f8fb;border:1px solid var(--line);border-radius:7px;padding:12px 14px;margin:10px 0}.diagram{border:1px solid var(--line);border-radius:8px;padding:18px;background:#fbfcfe}.arrow{color:var(--blue);font-weight:800}.small{font-size:13px;color:var(--muted)}.protocol{border:1px solid var(--line);border-left:4px solid #64748b;border-radius:8px;padding:14px 16px;margin:14px 0 20px;background:#fbfcfe}.protocol p{margin:5px 0}.protocol b{display:inline-block;min-width:112px;color:#334155}.result-line{border-left-color:var(--green);background:#f3faf5}
+    .interactive-figure{border:1px solid var(--line);border-radius:8px;padding:15px;margin:0 0 20px;background:#fff}.tour-controls{display:flex;align-items:end;gap:14px;flex-wrap:wrap;margin:6px 0 10px}.tour-controls label{display:grid;gap:3px;font-size:13px}.tour-controls select,.tour-controls input,.tour-controls button{font:inherit}.tour-controls span{font-size:13px;color:var(--muted)}#v54-tour-canvas{display:block;width:100%;height:520px;border:1px solid var(--line);border-radius:6px;touch-action:none;background:#fbfcfe}
     @media(max-width:900px){main{padding:24px 14px}.cards,.format-grid,.figure-grid{grid-template-columns:1fr}.figure.wide{grid-column:auto}.figure img,.figure.wide img{height:auto}}
     """
 
@@ -612,7 +973,7 @@ def build_report(run_dir: Path) -> str:
       <p><b>Candidate-subset accuracy。</b>Count accuracy 只比较十个 <code>&lt;C1&gt;...&lt;C10&gt;</code> logits；marker accuracy 只比较十个 marker-token logits；successor accuracy 只比较十个 <code>&lt;I1&gt;...&lt;I10&gt;</code> 与 <code>&lt;/Think&gt;</code> logits。若正确 token 在该子集内的 logit 最大，该 query 记为 1，否则为 0，再对 queries/examples 求均值。它比“全 vocabulary argmax 正确”更宽松。</p>
       <p><b>Autoregressive / free-running。</b>只输入 <code>&lt;BOS&gt; + switch + prompt + &lt;Think/&gt;</code>，之后每一步把模型的 greedy argmax 追加回输入，直到 <code>&lt;EOS&gt;</code> 或达到长度上限。<code>final-count exact accuracy</code> 是最终解析出的 count 是否严格等于 gold count；这是本报告最接近真实使用方式的端到端准确率。</p>
       <p><b>Trace exact。</b>从自由生成文本中抽取 marker-token 序列，并与 prompt 中按从左到右排列的 gold marker 序列逐项比较；完全相同记为 1。当前实现不逐项检查每个 <code>&lt;I_k&gt;</code> 是否正确，因此它准确地说是 <i>marker-trace exact</i>。</p>
-      <p><b>Hidden state / residual。</b>这里的 residual 不是预测误差，而是 <i>residual stream</i>：每个 token 在模型内部携带的一条 256 维“工作向量”。<code>hidden-state index 0</code> 是 token embedding 与 learned absolute-position embedding 的和。每个 GPT-2 block 先让 attention 从先前 tokens 读信息并把增量加回该向量，再让 MLP 做逐 token 变换并再次加回；所以同一个 token position 的向量会沿层数不断更新。index 1/2/3 分别是 block 0/1/2 后的 residual；index 4 是 block 3 后再经过 GPT-2 最终 LayerNorm <code>ln_f</code> 的 hidden state。说“count 可从 hidden state 读出”只表示 probe 能利用该向量预测 count，不自动意味着模型在生成时因果使用同一方向。</p>
+      <p><b>Hidden state / residual。</b>这里的 residual 不是预测误差，而是 <i>residual stream</i>：每个 token 在模型内部携带的一条 256 维“工作向量”。<code>hidden-state index 0</code> 是 token embedding 与 learned absolute-position embedding 的和。每个 GPT-2 Layer 先让 attention 从先前 tokens 读信息并把增量加回该向量，再让 MLP 做逐 token 变换并再次加回；所以同一个 token position 的向量会沿层数不断更新。index 1/2/3 分别是 Layer 1/2/3 后的 residual；index 4 是 Layer 4 后再经过 GPT-2 最终 LayerNorm <code>ln_f</code> 的 hidden state。说“count 可从 hidden state 读出”只表示 probe 能利用该向量预测 count，不自动意味着模型在生成时因果使用同一方向。</p>
       <div class="formula">u_l = x_l + Attention_l(LN₁(x_l))；x_(l+1) = u_l + MLP_l(LN₂(u_l))</div>
       <p><b>Attention row 与 mass。</b>某 query token 的 attention row 是一个对所有先前可见 token positions 的概率分布，和为 1。某类位置的 <code>attention mass</code> 是这些位置权重之和。例如 <code>prompt_needles_mass</code> 是投向所有 prompt needle positions 的权重总和；raw mass 的分母始终是全部可见 context。</p>
       <p><b>Correct top-1 与 diagonal dominance。</b>对 <code>&lt;I_k&gt;</code> query，仅在该样本的 n 个 prompt needle positions 中寻找 attention 最大值；最大值位于第 k 个 needle 时 <code>correct_top1=1</code>。<code>diagonal_dominance=A(I_k,needle_k)/sum_j A(I_k,needle_j)</code>，只描述 needle 子集内部的集中程度，必须与 raw needle mass 一起看。</p>
@@ -620,7 +981,7 @@ def build_report(run_dir: Path) -> str:
       <p><b>Head mask / ablation。</b>将指定 attention head 的输出乘以 0，再测性能下降。本报告使用的 Hugging Face <code>head_mask</code> 在整个 sequence 的所有 query positions、以及自由生成的每一步都生效，因此是全局必要性实验，不是只删除图中某一个 token 上的 attention。</p>
       <p><b>Activation patching。</b>先在 clean input 上缓存指定 token/层的 head output 或 residual，再把它替换到 corrupt input 的指定位置，观察正确 logit 是否恢复。它测试该 activation 对恢复行为是否具有局部充分性。<code>normalized recovery=(patched−corrupt)/(clean−corrupt)</code>；1 表示恢复到 clean，0 表示没有改善，负值表示进一步恶化。</p>
       <p><b>Probe。</b>冻结模型，只把某 token/层的 hidden vector 当作特征训练简单的 nearest-centroid 或 ridge predictor。Probe accuracy/R² 衡量信息是否可线性读取，不等于该信息是模型实际使用的因果变量；position baseline 与 shuffled/control probe 用于检查泄漏。</p>
-      <p><b>编号。</b>全文 layer/head 均采用代码中的 0-based 编号：L0 是第一个 Transformer block，H0 是该层第一个 head。</p>
+      <p><b>编号。</b>正文叙述使用 1-based 的 Layer 1–4。Head 标签沿用代码的 0-based 形式：<code>L0H0</code> 是 Layer 1 的第一个 head，<code>L1H0</code> 是 Layer 2 的第一个 head。表格中若直接展示原始 <code>layer</code> 字段会明确注明代码编号。</p>
     </div>
     <div class="cards">
       <div class="card"><div class="label">THINK_OFF final accuracy</div><div class="value">{pct(summary['nonthinking']['final'])}</div></div>
@@ -628,11 +989,11 @@ def build_report(run_dir: Path) -> str:
       <div class="card"><div class="label">THINK_ON marker-trace exact</div><div class="value">{pct(summary['thinking']['trace'])}</div></div>
       <div class="card"><div class="label">Perfect indexed-retrieval heads</div><div class="value">{len(perfect)}</div></div>
     </div>
-    <div class="callout good"><b>核心结论。</b>同一个 Transformer 已经可靠学会显式模式路由：<code>THINK_OFF</code> 立即关闭 trace，<code>THINK_ON</code> 以 indexed 格式生成正确 marker 序列，再输出 count；两条路径在当前 ID 测试上均为 100%。v5.3 的 mask 与 activation patching 进一步表明：block 2 的 k-to-k retrieval heads 确实因果控制 marker trace，但最终 count 仍保留一条强 prompt-direct aggregation 旁路。因此，显式 CoT 在本模型中是真实执行的检索过程，却不是最终答案唯一的信息来源。</div>
+    <div class="callout good"><b>核心结论。</b>同一个 Transformer 已经可靠学会显式模式路由：<code>THINK_OFF</code> 立即关闭 trace，<code>THINK_ON</code> 以 indexed 格式生成正确 marker 序列，再输出 count；两条路径在当前 ID 测试上均为 100%。v5.3 的 mask 与 activation patching 进一步表明：Layer 2 的 k-to-k retrieval heads 确实因果控制 marker trace，但最终 count 仍保留一条强 prompt-direct aggregation 旁路。因此，显式 CoT 在本模型中是真实执行的检索过程，却不是最终答案唯一的信息来源。</div>
 
     <h2>1. 实验设定</h2>
     {table([
-      {'item':'模型','setting':f"随机初始化 GPT-2；4 blocks × 4 heads；d_model={model['n_embd']}；MLP={model['n_inner']}；learned absolute position embedding；context={model['n_positions']}；dropout=0"},
+      {'item':'模型','setting':f"随机初始化 GPT-2；4 Transformer layers × 4 heads；d_model={model['n_embd']}；MLP={model['n_inner']}；learned absolute position embedding；context={model['n_positions']}；dropout=0"},
       {'item':'词表','setting':f"vocab={vocab_size}；包含 64 noise、10 marker、10 count、10 trace-index token 及 special/switch tokens"},
       {'item':'数据','setting':f"prompt body 长度 {train['seq_len']}；count 均匀取 {train['count_min']}–{train['count_max']}；needle 位置无放回均匀采样；marker identity 从 10 类中有放回采样"},
       {'item':'单模型混合训练','setting':f"thinking_fraction={train['thinking_fraction']}；每个 batch 中 THINK_ON/OFF 样本随机混合；不是两个独立模型"},
@@ -642,7 +1003,7 @@ def build_report(run_dir: Path) -> str:
     ], [('item','项目'),('setting','具体设置')])}
     <div class="format-grid">
       <div class="format"><b>THINK_ON</b><div class="sequence">&lt;BOS&gt; <span class="on">&lt;THINK_ON&gt;</span> prompt &lt;Think/&gt; <span class="target">{html.escape(trace_format)} &lt;/Think&gt; &lt;Cn&gt; &lt;EOS&gt;</span></div><p>所有 trace index、trace marker、关闭符、最终 count 与 EOS 都进入 next-token cross-entropy。</p></div>
-      <div class="format"><b>THINK_OFF</b><div class="sequence">&lt;BOS&gt; <span class="off">&lt;THINK_OFF&gt;</span> prompt &lt;Think/&gt; <span class="target">&lt;/Think&gt; &lt;Cn&gt; &lt;EOS&gt;</span></div><p>模型被监督立即关闭 thinking block，然后输出 count；没有伪造空 trace token。</p></div>
+      <div class="format"><b>THINK_OFF</b><div class="sequence">&lt;BOS&gt; <span class="off">&lt;THINK_OFF&gt;</span> prompt &lt;Think/&gt; <span class="target">&lt;/Think&gt; &lt;Cn&gt; &lt;EOS&gt;</span></div><p>模型被监督立即关闭 thinking span，然后输出 count；没有伪造空 trace token。</p></div>
     </div>
     <div class="callout warn"><b>任务边界。</b>这是固定长度 256、count 1–10 的 ID 实验。最终饱和不能证明 length/count OOD，也不能证明 thinking 比 non-thinking 更准确；本实验主要检验显式开关是否可学、两条路径是否共存，以及 indexed trace 是否形成可解释 retrieval。</div>
 
@@ -670,25 +1031,25 @@ def build_report(run_dir: Path) -> str:
     </div>
 
     <h3>3.3 实验 C：显式 switch 的第一步路由</h3>
-    <div class="protocol"><p><b>Sequence 与 query。</b>仍使用两种 prefix，但只做一次 batched forward；读取最后一个输入 token <code>&lt;Think/&gt;</code> 位置的 logits，因为该 hidden state 预测 thinking block 的第一个 token。</p><p><b>目标。</b>THINK_ON 的 desired next token 是 <code>&lt;I1&gt;</code>；THINK_OFF 的 desired next token 是 <code>&lt;/Think&gt;</code>。对完整 100-token vocabulary 做 softmax，记录 desired token 概率与全词表 argmax 是否等于 desired token。</p><p><b>结果。</b>最终两种模式的 argmax routing accuracy 都为 {pct(summary['thinking']['switch'])}/{pct(summary['nonthinking']['switch'])}，平均 desired-token probability 分别为 {fmt(summary['thinking']['p_desired'],6)}/{fmt(summary['nonthinking']['p_desired'],6)}。这证明 switch token 能控制 trace 是否开启，但尚未说明 trace 内部如何完成检索。</p></div>
+    <div class="protocol"><p><b>Sequence 与 query。</b>仍使用两种 prefix，但只做一次 batched forward；读取最后一个输入 token <code>&lt;Think/&gt;</code> 位置的 logits，因为该 hidden state 预测 thinking span 的第一个 token。</p><p><b>目标。</b>THINK_ON 的 desired next token 是 <code>&lt;I1&gt;</code>；THINK_OFF 的 desired next token 是 <code>&lt;/Think&gt;</code>。对完整 100-token vocabulary 做 softmax，记录 desired token 概率与全词表 argmax 是否等于 desired token。</p><p><b>结果。</b>最终两种模式的 argmax routing accuracy 都为 {pct(summary['thinking']['switch'])}/{pct(summary['nonthinking']['switch'])}，平均 desired-token probability 分别为 {fmt(summary['thinking']['p_desired'],6)}/{fmt(summary['nonthinking']['p_desired'],6)}。这证明 switch token 能控制 trace 是否开启，但尚未说明 trace 内部如何完成检索。</p></div>
     {figure(report_figures/'switch_probability.png','Figure 5. 显式开关的路由置信度','横轴为 checkpoint step；纵轴为完整 prompt 后 &lt;Think/&gt; query 对 desired first token 的平均 softmax probability。THINK_OFF 的目标是 &lt;/Think&gt;，THINK_ON 的目标是 &lt;I1&gt;；颜色区分请求模式。该指标只测第一步路由，不等同于整段 trace 或最终 count 正确。',wide=True)}
 
     <h2>4. Indexed trace attention：三个近乎完美的 retrieval heads</h2>
-    <div class="protocol"><p><b>Sequence。</b>加载最终 checkpoint，对完整 gold THINK_ON sequence 做 teacher-forced forward：<code>&lt;BOS&gt; &lt;THINK_ON&gt; prompt[256] &lt;Think/&gt; &lt;I1&gt; M1 ... &lt;In&gt; Mn &lt;/Think&gt; &lt;C_n&gt; &lt;EOS&gt;</code>。每个 count 1–10 各 100 个独立样本，共 1,000 个 prompts。</p><p><b>Attention row。</b>对每个 k，读取每层每头在 <code>&lt;I_k&gt;</code> token 位置的 causal attention row。这个位置的 residual/logits 用来预测紧随其后的 <code>M_k</code>；读取 <code>M_k</code> 自己的 row 会回答“生成 M_k 后看哪里”，不是“如何预测 M_k”。Prompt needle positions 由原始 256-token prompt 中所有 marker 位置按从左到右排序得到。</p><p><b>计算。</b><code>correct_top1</code>：只在该样本的 n 个 prompt needle positions 中取 attention argmax，检查是否为第 k 个；<code>diagonal_dominance = A(I_k,needle_k)/Σ_j A(I_k,needle_j)</code>；<code>needle_mass = Σ_j A(I_k,needle_j)</code> 是相对全部可见 context 的 raw mass。先在同一 example 的所有 k queries 上平均，再在 1,000 个 examples 上平均。Count 均匀时，随机在 n 个 needles 中选择的期望 top-1 baseline 为 <code>mean_n(1/n)={fmt(random_top1)}</code>。</p><p><b>结果。</b>L1H0、L1H1、L1H2（0-based；第 2 个 block）均达到约 1.0 correct top-1 和约 0.99–1.00 raw correct-needle mass。这意味着这些 heads 不是只在 needle 子集内部排序正确，而是把几乎全部 attention 集中到正确第 k 个 needle。第 6 节再检验它们是否具有因果作用。</p></div>
-    <div class="callout good"><b>最强结果。</b>{code(f"L{int(best['layer'])}H{int(best['head'])}")}（第 {int(best['layer'])+1} 个 block）在 <code>&lt;I_k&gt; → M_k</code> query 上的 correct top-1={fmt(best.correct_top1)}、diagonal dominance={fmt(best.diagonal_dominance)}、all-needle mass={fmt(best.needle_mass)}。共有 {len(perfect)} 个 heads 同时满足 top-1≥0.999 且 needle mass≥0.99：{', '.join(f'L{int(r["layer"])}H{int(r["head"])}' for _,r in perfect.iterrows())}。</div>
-    {figure(report_figures/'indexed_retrieval_metrics.png','Figure 6. 16 个 heads 的 indexed retrieval 三种指标','三幅热图的横轴均为 head 0–3，纵轴均为 layer 0–3（均为代码中的 0-based 编号；layer 1 即第 2 个 Transformer block）。左：第 k 个 prompt needle 是否在 needle 子集中获得 top-1；中：投向所有 prompt needles 的质量中，正确第 k 个所占比例；右：投向全部 prompt needles 的原始 attention mass。block 2 的 H0/H1/H2 在三项上都接近 1，说明它们不是只在 needle 子集中勉强排序，而是几乎把全部 attention 放到正确 needle。',wide=True)}
+    <div class="protocol"><p><b>Sequence。</b>加载最终 checkpoint，对完整 gold THINK_ON sequence 做 teacher-forced forward：<code>&lt;BOS&gt; &lt;THINK_ON&gt; prompt[256] &lt;Think/&gt; &lt;I1&gt; M1 ... &lt;In&gt; Mn &lt;/Think&gt; &lt;C_n&gt; &lt;EOS&gt;</code>。每个 count 1–10 各 100 个独立样本，共 1,000 个 prompts。</p><p><b>Attention row。</b>对每个 k，读取每层每头在 <code>&lt;I_k&gt;</code> token 位置的 causal attention row。这个位置的 residual/logits 用来预测紧随其后的 <code>M_k</code>；读取 <code>M_k</code> 自己的 row 会回答“生成 M_k 后看哪里”，不是“如何预测 M_k”。Prompt needle positions 由原始 256-token prompt 中所有 marker 位置按从左到右排序得到。</p><p><b>计算。</b><code>correct_top1</code>：只在该样本的 n 个 prompt needle positions 中取 attention argmax，检查是否为第 k 个；<code>diagonal_dominance = A(I_k,needle_k)/Σ_j A(I_k,needle_j)</code>；<code>needle_mass = Σ_j A(I_k,needle_j)</code> 是相对全部可见 context 的 raw mass。先在同一 example 的所有 k queries 上平均，再在 1,000 个 examples 上平均。Count 均匀时，随机在 n 个 needles 中选择的期望 top-1 baseline 为 <code>mean_n(1/n)={fmt(random_top1)}</code>。</p><p><b>结果。</b>L1H0、L1H1、L1H2（代码 0-based，对应正文 Layer 2）均达到约 1.0 correct top-1 和约 0.99–1.00 raw correct-needle mass。这意味着这些 heads 不是只在 needle 子集内部排序正确，而是把几乎全部 attention 集中到正确第 k 个 needle。第 6 节再检验它们是否具有因果作用。</p></div>
+    <div class="callout good"><b>最强结果。</b>{code(f"L{int(best['layer'])}H{int(best['head'])}")}（正文 Layer {int(best['layer'])+1}）在 <code>&lt;I_k&gt; → M_k</code> query 上的 correct top-1={fmt(best.correct_top1)}、diagonal dominance={fmt(best.diagonal_dominance)}、all-needle mass={fmt(best.needle_mass)}。共有 {len(perfect)} 个 heads 同时满足 top-1≥0.999 且 needle mass≥0.99：{', '.join(f'L{int(r["layer"])}H{int(r["head"])}' for _,r in perfect.iterrows())}。</div>
+    {figure(report_figures/'indexed_retrieval_metrics.png','Figure 6. 16 个 heads 的 indexed retrieval 三种指标','三幅热图的横轴均为 head 0–3，纵轴均为代码中的 layer 0–3；layer 1 对应正文 Layer 2。左：第 k 个 prompt needle 是否在 needle 子集中获得 top-1；中：投向所有 prompt needles 的质量中，正确第 k 个所占比例；右：投向全部 prompt needles 的原始 attention mass。Layer 2 的 H0/H1/H2 在三项上都接近 1，说明它们不是只在 needle 子集内部勉强排序，而是几乎把全部 attention 放到正确 needle。',wide=True)}
     {table(head_rows,[('head','head'),('top1','correct top-1'),('diag','diagonal dominance'),('mass','all-needle mass'),('entropy','attention entropy')])}
-    <div class="diagram"><b>由 v5.3 修正后的机制图景</b><p><b>THINK_ON trace：</b><code>&lt;I_k&gt;</code> <span class="arrow">→</span> block-2 多头 retrieval circuit 定位 prompt 第 k 个 needle <span class="arrow">→</span> marker identity 写入 residual <span class="arrow">→</span> 输出 <code>M_k</code>。<br><b>最终 count：</b>prompt needles <span class="arrow">→</span> block-1 broad aggregation <span class="arrow">→</span> count state；显式 trace 会扰动并可能辅助该状态，但 conflict 与 ablation 显示它不是唯一读出路径。</p></div>
+    <div class="diagram"><b>由 v5.3 修正后的机制图景</b><p><b>THINK_ON trace：</b><code>&lt;I_k&gt;</code> <span class="arrow">→</span> Layer 2 多头 retrieval circuit 定位 prompt 第 k 个 needle <span class="arrow">→</span> marker identity 写入 residual <span class="arrow">→</span> 输出 <code>M_k</code>。<br><b>最终 count：</b>prompt needles <span class="arrow">→</span> Layer 1 broad aggregation <span class="arrow">→</span> count state；显式 trace 会扰动并可能辅助该状态，但 conflict 与 ablation 显示它不是唯一读出路径。</p></div>
     <p><b>证据强度。</b>Figure 6 本身仍只是相关性；attention weight 高不自动等于该 head output 对 logit 必要。对应的 global head-mask 必要性和 clean-to-corrupt activation-patching 充分性检验在第 6.2–6.3 节给出。</p>
 
     <h2>5. 两种模式的 hidden state 与线性 probe</h2>
     <h3>5.1 实验 D：THINK_ON/OFF close-state cosine similarity</h3>
-    <div class="protocol"><p><b>配对 sequence。</b>对同一个 base prompt 分别渲染 THINK_ON 与 THINK_OFF。两个输入都截断在各自 <code>&lt;/Think&gt;</code>（包含 close token），不把 <code>&lt;C_n&gt;</code> 放入模型；因此比较的是“即将预测 count”的最后一个 hidden state。每个 count 1–10 各 500 个 prompts，共 5,000 个配对。</p><p><b>提取位置。</b>每个模式都取序列最后一个 token，即 <code>think_close_pos/pre_count_pos</code>。提取 hidden-state index 0（token embedding + learned absolute-position embedding）、index 1–3（分别经过 block 0–2 后的 residual）和 index 4（block 3 后再经过最终 <code>ln_f</code> 的 hidden state）。</p><p><b>计算。</b>对每个样本、每个 hidden-state index 计算 <code>cos(h_THINK_ON(close), h_THINK_OFF(close))</code>，再对 5,000 个配对求均值和标准差。</p><p><b>结果。</b>平均 cosine 从 embedding 层的 {fmt(sim_embedding)} 上升到最终 <code>ln_f</code> 后的 {fmt(sim_final)}；两种模式在最终 count readout 前不是完全分离的表示，反而经过 blocks 后更接近。</p><p><b>解释边界。</b>THINK_OFF close 固定在绝对位置 259；THINK_ON close 在 259+2n，因为 trace 含 n 对 index/marker。因此 cosine 同时混合了 switch 模式、trace context 和 learned absolute position 差异，不能单独解释成“推理机制距离”。</p></div>
-    {figure(source_figures/'mode_hidden_similarity.png','Figure 7. THINK_ON/OFF 在 close anchor 的 hidden cosine','横轴是 hidden-state index：0=embedding+position，1–3=block 0–2 后的 residual，4=block 3 后再经过最终 ln_f 的 hidden state；纵轴是同一 prompt 两种模式在各自 close token hidden state 的平均 cosine similarity。点越低表示表示方向越不同，但差异包含 trace 与绝对位置两种混淆。',wide=True)}
+    <div class="protocol"><p><b>配对 sequence。</b>对同一个 base prompt 分别渲染 THINK_ON 与 THINK_OFF。两个输入都截断在各自 <code>&lt;/Think&gt;</code>（包含 close token），不把 <code>&lt;C_n&gt;</code> 放入模型；因此比较的是“即将预测 count”的最后一个 hidden state。每个 count 1–10 各 500 个 prompts，共 5,000 个配对。</p><p><b>提取位置。</b>每个模式都取序列最后一个 token，即 <code>think_close_pos/pre_count_pos</code>。提取 hidden-state index 0（token embedding + learned absolute-position embedding）、index 1–3（分别经过 Layer 1–3 后的 residual）和 index 4（Layer 4 后再经过最终 <code>ln_f</code> 的 hidden state）。</p><p><b>计算。</b>对每个样本、每个 hidden-state index 计算 <code>cos(h_THINK_ON(close), h_THINK_OFF(close))</code>，再对 5,000 个配对求均值和标准差。</p><p><b>结果。</b>平均 cosine 从 embedding 层的 {fmt(sim_embedding)} 上升到最终 <code>ln_f</code> 后的 {fmt(sim_final)}；两种模式在最终 count readout 前不是完全分离的表示，反而经过四个 layers 后更接近。</p><p><b>解释边界。</b>THINK_OFF close 固定在绝对位置 259；THINK_ON close 在 259+2n，因为 trace 含 n 对 index/marker。因此 cosine 同时混合了 switch 模式、trace context 和 learned absolute position 差异，不能单独解释成“推理机制距离”。</p></div>
+    {figure(source_figures/'mode_hidden_similarity.png','Figure 7. THINK_ON/OFF 在 close anchor 的 hidden cosine','横轴是 hidden-state index：0=embedding+position，1–3=Layer 1–3 后的 residual，4=Layer 4 后再经过最终 ln_f 的 hidden state；纵轴是同一 prompt 两种模式在各自 close token hidden state 的平均 cosine similarity。点越低表示表示方向越不同，但差异包含 trace 与绝对位置两种混淆。',wide=True)}
     {table(sim_rows,[('state','表示位置'),('mean','平均 cosine'),('std','标准差')])}
 
     <h3>5.2 实验 E：count 信息何时出现、被写到哪个 token？</h3>
-    <div class="callout good"><b>实验目的。</b>这不是再次评估模型答题是否正确，也不是继续训练模型；它是一个冻结模型后的“信息定位”实验。我们想回答：①模型尚未读 prompt 时，hidden state 中应当没有 count；②读完整个 prompt 后、生成 trace 前，是否已经能从某个固定位置读出 count；③到最终答案前，哪个 block 把 count 写成可直接分类的表示；④ THINK_ON 与 THINK_OFF 是否在相同阶段形成 count 信息。</div>
+    <div class="callout good"><b>实验目的。</b>这不是再次评估模型答题是否正确，也不是继续训练模型；它是一个冻结模型后的“信息定位”实验。我们想回答：①模型尚未读 prompt 时，hidden state 中应当没有 count；②读完整个 prompt 后、生成 trace 前，是否已经能从某个固定位置读出 count；③到最终答案前，哪个 Layer 把 count 写成可直接分类的表示；④ THINK_ON 与 THINK_OFF 是否在相同阶段形成 count 信息。</div>
     <div class="protocol"><p><b>为什么比较 token anchors。</b>Transformer 在每个 token 位置都有一个 256 维 residual。由于 causal mask，一个位置只能包含它之前的上下文信息。比较 sequence 中不同位置，就像沿计算流程放置几个测量点：在 prompt 前测一次、读完整个 prompt 后测一次、即将输出答案前再测一次。</p><p><b>Sequence 与样本。</b>对每个 count 1–10 生成 500 个 prompts，共 5,000 个 base examples；同一 prompt 分别渲染 THINK_ON 与 THINK_OFF 的完整 gold sequence，并做一次 teacher-forced forward。虽然完整 sequence 被送入模型，但 causal mask 保证每个 anchor 看不到位于它之后的 gold tokens。模型参数全程冻结。</p></div>
     {table([
       {'anchor':'mode_pos','token / absolute position':'&lt;THINK_ON&gt; 或 &lt;THINK_OFF&gt;；position=1','此时看到了什么':'只有 BOS 和 mode token，prompt 尚未出现','为什么测':'负对照；理论上不应知道 needle 总数'},
@@ -697,40 +1058,42 @@ def build_report(run_dir: Path) -> str:
       {'anchor':'think_close_pos / pre_count_pos','token / absolute position':'&lt;/Think&gt;；THINK_OFF=259，THINK_ON=259+2n','此时看到了什么':'完整 prompt；THINK_ON 还看到了完整 indexed trace','为什么测':'它的 logits 直接预测 &lt;C_n&gt;，是 answer-ready state；但 THINK_ON 的位置本身泄漏 n'},
       {'anchor':'count token','token / absolute position':'gold &lt;C_n&gt; 本身','此时看到了什么':'token identity 已直接给出答案','为什么测':'严重 label leakage，标记为 leakage-prone 并从主图排除'}
     ], [('anchor','anchor 名称'),('token / absolute position','实际 token 与位置'),('此时看到了什么','可见上下文'),('为什么测','实验角色')])}
-    <div class="protocol"><p><b>提取什么。</b>在每个 anchor 的同一个 token position 沿模型深度提取五次：index 0 是尚未经过 Transformer 的 embedding+position 向量；index 1、2、3 是分别经过 block 0、1、2 后的 residual；index 4 是经过 block 3 与最终 <code>ln_f</code> 后的向量。每次都是 256 维。以固定位置 <code>&lt;Think/&gt;</code> 为例：index 0 只含该 token identity 与 position 258；到 index 1 时，该位置的 attention 已经可以从前面的 256-token prompt 读入信息；后续 blocks 再继续更新同一条 residual stream。</p><p><b>Probe 做什么。</b>按缓存顺序用前 70% 样本训练、后 30% 测试。先用训练集 mean/std 标准化每一维；对十个 count 类分别计算训练向量 centroid。测试时，将一个 hidden vector 分给欧氏距离最近的 centroid。若分到真实 count，记为正确。图中的 accuracy 是 held-out nearest-centroid exact-count accuracy；平衡十分类的直观 chance 约为 10%。</p><p><b>为什么再做 ridge。</b>Nearest-centroid 要求精确分成十类；ridge regression（α=1）则把 count 当连续数值，测 hidden state 是否沿某个近似连续方向排列。报告 R² 与 MAE：R² 越接近 1 表示 count 的连续变化越可线性解释，MAE 是预测 count 与真实 count 的平均绝对差。</p><p><b>为什么需要 baseline。</b>Position baseline 只用 absolute token position 查训练集中的 majority count。如果 probe 很高、position baseline 也同样高，hidden vector 可能只编码了位置。Trace-length baseline 直接使用缓存中的 gold <code>trace_len=count</code>，即使 THINK_OFF 也如此，因此它只是 oracle sanity check，不是模型真正可见的输入。</p></div>
+    <div class="protocol"><p><b>提取什么。</b>在每个 anchor 的同一个 token position 沿模型深度提取五次：index 0 是尚未经过 Transformer 的 embedding+position 向量；index 1、2、3 是分别经过 Layer 1、2、3 后的 residual；index 4 是经过 Layer 4 与最终 <code>ln_f</code> 后的向量。每次都是 256 维。以固定位置 <code>&lt;Think/&gt;</code> 为例：index 0 只含该 token identity 与 position 258；到 index 1 时，该位置的 attention 已经可以从前面的 256-token prompt 读入信息；后续 layers 再继续更新同一条 residual stream。</p><p><b>Probe 做什么。</b>按缓存顺序用前 70% 样本训练、后 30% 测试。先用训练集 mean/std 标准化每一维；对十个 count 类分别计算训练向量 centroid。测试时，将一个 hidden vector 分给欧氏距离最近的 centroid。若分到真实 count，记为正确。图中的 accuracy 是 held-out nearest-centroid exact-count accuracy；平衡十分类的直观 chance 约为 10%。</p><p><b>为什么再做 ridge。</b>Nearest-centroid 要求精确分成十类；ridge regression（α=1）则把 count 当连续数值，测 hidden state 是否沿某个近似连续方向排列。报告 R² 与 MAE：R² 越接近 1 表示 count 的连续变化越可线性解释，MAE 是预测 count 与真实 count 的平均绝对差。</p><p><b>为什么需要 baseline。</b>Position baseline 只用 absolute token position 查训练集中的 majority count。如果 probe 很高、position baseline 也同样高，hidden vector 可能只编码了位置。Trace-length baseline 直接使用缓存中的 gold <code>trace_len=count</code>，即使 THINK_OFF 也如此，因此它只是 oracle sanity check，不是模型真正可见的输入。</p></div>
     <div class="formula">centroid_c = mean(z-scored hidden vectors with count=c)；prediction = argmin_c ||z(h_test) − centroid_c||₂</div>
     <div class="formula">ridge: count_hat = wᵀ z(h) + b；R²=1−SSE/SST；MAE=mean(|count_hat−count|)</div>
     <div class="callout result-line"><b>结果 1：负对照正常。</b><code>mode_pos</code> 位于 prompt 之前；non-thinking 的最佳 centroid accuracy 只有 {pct(float(probe_best_map[('nonthinking','mode_pos')].accuracy))}，接近十分类 chance，R² 约为 {fmt(float(probe_best_map[('nonthinking','mode_pos')].r2))}。这说明 probe 没有凭空从样本编号或 mode token 解码出 count。</div>
     <div class="callout result-line"><b>结果 2：模型在生成 trace 前已经具有 count 信息。</b>固定位置 <code>&lt;Think/&gt;</code> 已经看完整个 prompt、但还没有看到 trace。其最佳 exact centroid accuracy 为 THINK_OFF {pct(float(probe_best_map[('nonthinking','think_open_pos')].accuracy))}、THINK_ON {pct(float(probe_best_map[('thinking','think_open_pos')].accuracy))}；更重要的是 ridge R² 分别为 {fmt(float(probe_best_map[('nonthinking','think_open_pos')].r2))}/{fmt(float(probe_best_map[('thinking','think_open_pos')].r2))}，MAE 约 {fmt(float(probe_best_map[('nonthinking','think_open_pos')].mae))}/{fmt(float(probe_best_map[('thinking','think_open_pos')].mae))} 个 count。也就是说，count 在 trace 开始前已形成很强的连续可读表示；显式 CoT 不是模型第一次获得 count 的唯一途径。</div>
-    <div class="callout result-line"><b>结果 3：THINK_OFF 的第一个 block 形成 answer-ready state。</b>固定位置的 non-thinking <code>&lt;/Think&gt;</code> 在 embedding 层只有 {pct(float(probe_subset[(probe_subset['mode']=='nonthinking') & (probe_subset.anchor_name=='think_close_pos') & (probe_subset.layer==0)].iloc[0].accuracy))}；经过第一个 block（hidden-state index 1）后立即达到 100% exact accuracy、ridge R²={fmt(float(probe_subset[(probe_subset['mode']=='nonthinking') & (probe_subset.anchor_name=='think_close_pos') & (probe_subset.layer==1)].iloc[0].r2))}，而 position baseline 只有 {pct(float(probe_best_map[('nonthinking','think_close_pos')].position_baseline_acc))}。因此 count 不是 close token embedding 自带的，也不是由绝对位置给出的；第一个 block 将 prompt 中的计数结果写入了用于预测 <code>&lt;C_n&gt;</code> 的 residual。这与后文 L0 broad-head ablation/patching 的因果结果一致。</div>
-    <div class="callout warn"><b>结果 4：THINK_ON close 的 100% probe 不能证明“CoT 算出了 count”。</b>THINK_ON trace 每个 needle 恰好增加两个 token <code>&lt;I_k&gt;,M_k</code>，所以 close 的 absolute position 是 <code>259+2n</code>。在任何 Transformer block 之前，embedding+position state 就已经达到 100%，position baseline 也是 100%。这主要是实验格式直接把 n 编进了位置；因此该 anchor 不能用于判断 count arithmetic，应优先看固定位置的 Think-open，或做 position-matched counterfactual。</div>
-    {figure(report_figures/'probe_accuracy.png','Figure 8. Count 信息在不同 token/层的可读性','左右分别为 THINK_OFF 与 THINK_ON。横轴 hidden-state index：0=token+position embedding，1–3=block 0–2 后的 residual，4=block 3 后再经过最终 ln_f 的 hidden state；纵轴为上表定义的 token anchor；每格是 30% held-out test 的 nearest-centroid exact-count accuracy。读图时重点看三类对照：mode_pos 应接近 chance；固定位置 think_open 显示 pre-trace count 信息；close 显示 answer-ready state。prompt_marker_k 行受“只有 count≥k 才存在该 anchor”及随机 absolute position影响，不应与固定 anchors 等价解释。',wide=True)}
+    <div class="callout result-line"><b>结果 3：THINK_OFF 的 Layer 1 形成 answer-ready state。</b>固定位置的 non-thinking <code>&lt;/Think&gt;</code> 在 embedding 层只有 {pct(float(probe_subset[(probe_subset['mode']=='nonthinking') & (probe_subset.anchor_name=='think_close_pos') & (probe_subset.layer==0)].iloc[0].accuracy))}；经过 Layer 1（hidden-state index 1）后立即达到 100% exact accuracy、ridge R²={fmt(float(probe_subset[(probe_subset['mode']=='nonthinking') & (probe_subset.anchor_name=='think_close_pos') & (probe_subset.layer==1)].iloc[0].r2))}，而 position baseline 只有 {pct(float(probe_best_map[('nonthinking','think_close_pos')].position_baseline_acc))}。因此 count 不是 close token embedding 自带的，也不是由绝对位置给出的；Layer 1 将 prompt 中的计数结果写入了用于预测 <code>&lt;C_n&gt;</code> 的 residual。这与后文 L0 broad-head ablation/patching 的因果结果一致。</div>
+    <div class="callout warn"><b>结果 4：THINK_ON close 的 100% probe 不能证明“CoT 算出了 count”。</b>THINK_ON trace 每个 needle 恰好增加两个 token <code>&lt;I_k&gt;,M_k</code>，所以 close 的 absolute position 是 <code>259+2n</code>。在任何 Transformer layer 之前，embedding+position state 就已经达到 100%，position baseline 也是 100%。这主要是实验格式直接把 n 编进了位置；因此该 anchor 不能用于判断 count arithmetic，应优先看固定位置的 Think-open，或做 position-matched counterfactual。</div>
+    {figure(report_figures/'probe_accuracy.png','Figure 8. Count 信息在不同 token/层的可读性','左右分别为 THINK_OFF 与 THINK_ON。横轴 hidden-state index：0=token+position embedding，1–3=Layer 1–3 后的 residual，4=Layer 4 后再经过最终 ln_f 的 hidden state；纵轴为上表定义的 token anchor；每格是 30% held-out test 的 nearest-centroid exact-count accuracy。读图时重点看三类对照：mode_pos 应接近 chance；固定位置 think_open 显示 pre-trace count 信息；close 显示 answer-ready state。prompt_marker_k 行受“只有 count≥k 才存在该 anchor”及随机 absolute position影响，不应与固定 anchors 等价解释。',wide=True)}
     {table(probe_summary_rows,[('mode','模式'),('anchor','anchor'),('layer','最佳 hidden-state index'),('accuracy','centroid accuracy'),('r2','ridge R²'),('mae','ridge MAE'),('position','position baseline'),('trace_len','trace-length baseline')])}
-    <div class="callout good"><b>这项实验最终说明什么。</b>在 THINK_OFF 中，模型读完整个 prompt 后已经形成近似连续的 count representation，并在第一个 block 后把它写成可直接选择 <code>&lt;C_n&gt;</code> 的 answer-ready residual。THINK_ON 在 trace 开始前也已有类似 count 信息，因此显式 trace 更像额外执行的检索过程，而不是获得 count 的唯一计算链。Probe 只说明“信息在哪里可读”；count-readout head mask 和 clean-to-corrupt patching 才说明后续报告中的 early broad heads 对该表示具有因果作用。</div>
+    <div class="callout good"><b>这项实验最终说明什么。</b>在 THINK_OFF 中，模型读完整个 prompt 后已经形成近似连续的 count representation，并在 Layer 1 后把它写成可直接选择 <code>&lt;C_n&gt;</code> 的 answer-ready residual。THINK_ON 在 trace 开始前也已有类似 count 信息，因此显式 trace 更像额外执行的检索过程，而不是获得 count 的唯一计算链。Probe 只说明“信息在哪里可读”；count-readout head mask 和 clean-to-corrupt patching 才说明后续报告中的 early broad heads 对该表示具有因果作用。</div>
     <div class="callout warn"><b>这项实验没有说明什么。</b>它没有证明存在单一 count neuron，没有证明 residual 使用严格线性加法，也没有证明 THINK_ON close 的表示来自逐步累加。尤其是 THINK_ON close 的绝对位置泄漏，使其高 probe accuracy 本身几乎没有机制解释力。</div>
 
     {v53_section}
     {core_questions_section}
+    {v54_section}
 
-    <h2>7. 综合机制解释</h2>
+    <h2>8. 综合机制解释</h2>
     <div class="format-grid">
-      <div class="format"><b>THINK_OFF：direct broad aggregation</b><p>最终 query 的候选 signature 是对多个 prompt needles 的宽分布 attention。L0H1 单头 mask 使 teacher-forced count accuracy 平均下降 70 个百分点；L0H1+L0H3 clean-to-corrupt patch 恢复约 79% count margin。证据共同支持第一个 block 形成直接 count aggregation，再由后层稳定读出。</p></div>
-      <div class="format"><b>THINK_ON：targeted retrieval + redundant final route</b><p>block 2 的 L1H0/H1/H2 在 <code>&lt;I_k&gt;</code> 处执行 k-to-k retrieval。正确位置的 targeted top-2 patch 恢复约 82% marker identity；mask 整个 L1 会摧毁 trace，但 final count 仍可正确，说明 final answer 主要由与 non-thinking 共用的 direct prompt path 保底，trace 是可执行但非唯一的中间计算。</p></div>
+      <div class="format"><b>THINK_OFF：direct broad aggregation</b><p>最终 query 的候选 signature 是对多个 prompt needles 的宽分布 attention。L0H1 单头 mask 使 teacher-forced count accuracy 平均下降 70 个百分点；L0H1+L0H3 clean-to-corrupt patch 恢复约 79% count margin。证据共同支持 Layer 1 形成直接 count aggregation，再由后层稳定读出。</p></div>
+      <div class="format"><b>THINK_ON：targeted retrieval + redundant final route</b><p>Layer 2 的 L1H0/H1/H2 在 <code>&lt;I_k&gt;</code> 处执行 k-to-k retrieval。正确位置的 targeted top-2 patch 恢复约 82% marker identity；mask 整个 L1 会摧毁 trace，但 final count 仍可正确，说明 final answer 主要由与 non-thinking 共用的 direct prompt path 保底，trace 是可执行但非唯一的中间计算。</p></div>
     </div>
+    {v54_mechanism_callout}
     <div class="callout warn"><b>不要过度解读。</b>“trace 被破坏而 final 仍正确”不等于 trace 永远无用：forced-trace conflict 会让约 44% 的非对角样本偏离 prompt count。更准确的描述是：prompt-direct 路径占主导，trace/position-progress 状态会调制最终读出，两条信息源在正常数据上始终一致，因此训练没有迫使模型只选其中一条。</div>
 
-    <h2>8. 结论：支持什么，不支持什么</h2>
-    <div class="callout good"><b>当前结果支持：</b><ul><li>一个单模型可被显式 THINK_ON/OFF token 稳定路由到“生成 indexed trace”或“跳过 trace”两条路径。</li><li>block-2 多头 circuit 对 indexed marker retrieval 具有必要性和位置特异的充分性；top-2 patch 恢复约 82%，top-4 接近 100%。</li><li>non-thinking count 主要依赖 block-1 broad aggregation heads；对应 top-2 patch 恢复约 79%。</li><li>trace progress residual 足以因果改变下一 index token，说明 trace 中存在显式进度状态。</li><li>最终 count 保留 prompt-direct 旁路；CoT trace 是实际执行的检索，不是唯一 answer channel。</li></ul></div>
-    <div class="callout warn"><b>当前结果不支持：</b><ul><li>不支持 thinking 提升当前 ID accuracy，因为两种模式都饱和。</li><li>不支持“每个 targeted head 单独必要”；top-1/top-2 mask 不改变 argmax，存在明显冗余，top-4 又与整层 ablation 混淆。</li><li>不支持最终 count 完全由 trace 决定；冲突样本只有 {pct(follows_trace)} 严格跟随 forced trace。</li><li>不支持 progress state 已与 learned absolute position 解耦；当前 transplant 同时改变语义进度和 donor 绝对位置。</li><li>不支持 count/length OOD，也不支持直接外推到真实语言模型。</li></ul></div>
+    <h2>9. 结论：支持什么，不支持什么</h2>
+    <div class="callout good"><b>当前结果支持：</b><ul><li>一个单模型可被显式 THINK_ON/OFF token 稳定路由到“生成 indexed trace”或“跳过 trace”两条路径。</li><li>Layer 2 多头 circuit 对 indexed marker retrieval 具有必要性和位置特异的充分性；top-2 patch 恢复约 82%，top-4 接近 100%。</li>{v54_integrated_support}<li>trace progress residual 足以因果改变下一 index token，说明 trace 中存在显式进度状态。</li><li>最终 count 保留 prompt-direct 旁路；CoT trace 是实际执行的检索，不是唯一 answer channel。</li></ul></div>
+    <div class="callout warn"><b>当前结果不支持：</b><ul><li>不支持 thinking 提升当前 ID accuracy，因为两种模式都饱和。</li><li>不支持“每个 targeted head 单独必要”；top-1/top-2 mask 不改变 argmax，存在明显冗余，top-4 又与整层 ablation 混淆。</li>{v54_integrated_nonsupport}<li>不支持最终 count 完全由 trace 决定；冲突样本只有 {pct(follows_trace)} 严格跟随 forced trace。</li><li>不支持 progress state 已与 learned absolute position 解耦；当前 transplant 同时改变语义进度和 donor 绝对位置。</li><li>不支持 count/length OOD，也不支持直接外推到真实语言模型。</li></ul></div>
 
-    <h2>9. 下一步最有价值的实验</h2>
+    <h2>10. 下一步最有价值的实验</h2>
     <ol><li><b>Combinatorial retrieval ablation：</b>对 L1H0/H1/H2/H3 的全部非空子集做 15 组 mask，定位冗余结构，避免把 targeted top-4 与 whole-layer effect 混为一谈。</li><li><b>Position-controlled progress patch：</b>构造相同绝对位置、不同 progress token 的 donor，或显式交换 index token embedding，区分抽象计数状态和 learned position cue。</li><li><b>Path-specific final readout：</b>在 prompt count 与 trace count 冲突时分别 patch L0 broad heads、trace-attending heads 与 residual，测哪条路径把 final logit 拉向 prompt 或 trace。</li><li><b>Hard regime：</b>增加长度、needle 数量或减小模型，使 direct path 不再饱和，再比较显式 retrieval trace 是否提高样本效率、鲁棒性或 OOD。</li></ol>
 
-    <h2>10. 文件与复现</h2>
+    <h2>11. 文件与复现</h2>
     {table([
-      {'item':'训练配置','path':code(run_dir/'config.json')}, {'item':'v5 原始表','path':code(tables)}, {'item':'checkpoint','path':code(run_dir/'checkpoints'/'final.pt')}, {'item':'v5.3 配置','path':code(v53_dir/'run_config.json')}, {'item':'v5.3 原始表','path':code(v53_tables)}, {'item':'报告生成器','path':code('scripts/build_v5_explicit_switch_report.py')}
+      {'item':'训练配置','path':code(run_dir/'config.json')}, {'item':'v5 原始表','path':code(tables)}, {'item':'checkpoint','path':code(run_dir/'checkpoints'/'final.pt')}, {'item':'v5.3 配置','path':code(v53_dir/'run_config.json')}, {'item':'v5.3 原始表','path':code(v53_tables)}, {'item':'v5.4 配置','path':code(v54_dir/'run_config.json')}, {'item':'v5.4 原始表','path':code(v54_tables)}, {'item':'报告生成器','path':code('scripts/build_v5_explicit_switch_report.py')}
     ], [('item','内容'),('path','路径')])}
-    <p class="small">本 HTML 中所有 PNG 均以 base64 内嵌，可作为单文件离线发送。所有核心数字从 CSV 重新聚合；层和 head 的表格编号严格采用结果文件中的 0-based 编号。</p>
+    <p class="small">本 HTML 中所有 PNG 均以 base64 内嵌，six-PC 交互图也使用内嵌数据与原生 Canvas，不依赖外部文件或 CDN，可作为单文件离线发送。所有核心数字从 CSV 重新聚合；层和 head 的表格编号严格采用结果文件中的 0-based 编号。</p>
     </main></body></html>"""
 
 
