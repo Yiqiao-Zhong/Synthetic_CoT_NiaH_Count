@@ -85,7 +85,9 @@ cells = [
     code(
         r"""
         from pathlib import Path
+        import json
         import os
+        import signal
         import subprocess
         import sys
 
@@ -105,7 +107,67 @@ cells = [
         os.chdir(repo)
         print("Repo:", repo)
 
-        # Install one mutually compatible scientific stack before importing it.
+        # Do not replace NumPy underneath a live Colab kernel. First validate the
+        # complete compiled stack in a clean child process. If it is inconsistent,
+        # repair all binary packages together and restart exactly once.
+        probe_code = r'''import json
+        import matplotlib
+        import numpy
+        import pandas
+        import scipy
+        print(json.dumps({
+            "numpy": numpy.__version__,
+            "pandas": pandas.__version__,
+            "scipy": scipy.__version__,
+            "matplotlib": matplotlib.__version__,
+        }))'''
+        probe = subprocess.run(
+            [sys.executable, "-c", probe_code],
+            capture_output=True,
+            text=True,
+        )
+
+        def restart_runtime(reason: str) -> None:
+            print(reason)
+            print("The runtime will restart now. Reconnect, then run all cells again once.")
+            sys.stdout.flush()
+            if Path("/content").exists():
+                os.kill(os.getpid(), signal.SIGKILL)
+            raise RuntimeError("Restart this kernel, then rerun the notebook.")
+
+        if probe.returncode != 0:
+            print("Scientific-stack ABI probe failed; repairing compatible wheels.")
+            print(probe.stderr[-2000:])
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "-q",
+                    "--no-cache-dir",
+                    "--force-reinstall",
+                    "numpy==1.26.4",
+                    "pandas==2.2.3",
+                    "scipy==1.13.1",
+                    "matplotlib==3.8.4",
+                    "seaborn==0.13.2",
+                ],
+                check=True,
+            )
+            restart_runtime("Scientific-stack ABI repair finished.")
+
+        disk_versions = json.loads(probe.stdout.strip().splitlines()[-1])
+        loaded_numpy = sys.modules.get("numpy")
+        loaded_numpy_version = getattr(loaded_numpy, "__version__", None)
+        if loaded_numpy_version and loaded_numpy_version != disk_versions["numpy"]:
+            restart_runtime(
+                "NumPy on disk is compatible, but this kernel still holds "
+                f"NumPy {loaded_numpy_version} instead of {disk_versions['numpy']}."
+            )
+
+        # Pure-Python/project dependencies are safe to install without replacing
+        # the already validated NumPy/Pandas/SciPy stack.
         subprocess.run(
             [
                 sys.executable,
@@ -113,11 +175,6 @@ cells = [
                 "pip",
                 "install",
                 "-q",
-                "numpy<2",
-                "pandas>=2.1,<3",
-                "scipy>=1.11,<2",
-                "matplotlib>=3.8",
-                "seaborn>=0.13",
                 "transformers>=4.41,<5",
                 "tqdm>=4.66",
             ],
