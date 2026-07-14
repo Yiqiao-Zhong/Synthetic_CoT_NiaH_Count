@@ -724,7 +724,6 @@ def save_cumulative_ablation_panel(
     mode: str,
     metric: str,
     family: str,
-    show_bottom: bool,
     title: str,
     path: Path,
 ) -> None:
@@ -734,13 +733,30 @@ def save_cumulative_ablation_panel(
         frame = cumulative[(cumulative["mode"] == mode) & (cumulative["count_bin"] == count_bin)]
         top = frame[frame.family == family].sort_values("top_n")
         ax.plot(top.top_n, top[metric], color=BLUE, marker="o", ms=3, label="ranked top")
-        if show_bottom:
-            bottom = frame[frame.family == "primary_bottom"].sort_values("top_n")
-            ax.plot(bottom.top_n, bottom[metric], color=RED, marker="o", ms=3, label="matched ranking bottom")
         random = frame[frame.family == "random"]
+        for index, (_, path_frame) in enumerate(random.groupby("replicate")):
+            path_frame = path_frame.sort_values("top_n")
+            ax.plot(
+                path_frame.top_n,
+                path_frame[metric],
+                color="#94a3b8",
+                linewidth=0.85,
+                alpha=0.28,
+                label="random paths" if index == 0 else None,
+            )
         mean, low, high = random_band(random, metric)
-        ax.plot(mean.top_n, mean[metric], color=GRAY, linewidth=2, label="8 random orders: mean")
+        ax.plot(mean.top_n, mean[metric], color=GRAY, linewidth=2.2, label="random mean")
         ax.fill_between(mean.top_n, low[metric], high[metric], color=GRAY, alpha=0.18, label="random min-max")
+        random_four = mean.loc[mean.top_n == 4, metric]
+        if not random_four.empty:
+            ax.axhline(
+                float(random_four.iloc[0]),
+                color="#7c3aed",
+                linestyle="--",
+                linewidth=1.5,
+                alpha=0.9,
+                label="random-4 mean",
+            )
         baseline = frame[frame.family == "baseline"]
         if not baseline.empty:
             ax.axhline(float(baseline.iloc[0][metric]), color="#111827", linestyle="--", linewidth=1, alpha=0.7)
@@ -755,7 +771,7 @@ def save_cumulative_ablation_panel(
         ax.set_ylabel("remaining accuracy")
     handles, labels = axes[0].get_legend_handles_labels()
     fig.subplots_adjust(left=0.06, right=0.99, bottom=0.14, top=0.75, wspace=0.28)
-    fig.legend(handles, labels, loc="upper center", ncol=4, bbox_to_anchor=(0.5, 0.88), frameon=False)
+    fig.legend(handles, labels, loc="upper center", ncol=6, bbox_to_anchor=(0.5, 0.88), frameon=False)
     fig.suptitle(title, fontsize=15, fontweight="bold", y=0.98)
     fig.savefig(path, dpi=190, bbox_inches="tight")
     plt.close(fig)
@@ -776,21 +792,7 @@ def save_position_local_ablation_panel(
             (local["mechanism"] == mechanism)
             & (local["count_bin"] == count_bin)
         ]
-        styles = (
-            ("ranked_top", BLUE, "-", "ranked top"),
-            (
-                "global_reverse",
-                RED,
-                "--",
-                "reverse ranking (layer-confounded)",
-            ),
-            (
-                "layer_matched_low",
-                "#f59e0b",
-                "-.",
-                "same-layer low-score control",
-            ),
-        )
+        styles = (("ranked_top", BLUE, "-", "ranked top"),)
         for family, color, linestyle, label in styles:
             group = frame[frame.family == family].sort_values("top_n")
             ax.plot(
@@ -805,6 +807,16 @@ def save_position_local_ablation_panel(
             )
         random = frame[frame.family == "layer_matched_random"]
         if not random.empty:
+            for index, (_, path_frame) in enumerate(random.groupby("replicate")):
+                path_frame = path_frame.sort_values("top_n")
+                ax.plot(
+                    path_frame.top_n,
+                    path_frame[metric],
+                    color="#94a3b8",
+                    linewidth=0.85,
+                    alpha=0.28,
+                    label="same-layer random paths" if index == 0 else None,
+                )
             mean, low, high = random_band(random, metric)
             ax.plot(
                 mean.top_n,
@@ -821,6 +833,16 @@ def save_position_local_ablation_panel(
                 alpha=0.18,
                 label="same-layer random: min-max",
             )
+            random_four = mean.loc[mean.top_n == 4, metric]
+            if not random_four.empty:
+                ax.axhline(
+                    float(random_four.iloc[0]),
+                    color="#7c3aed",
+                    linestyle="--",
+                    linewidth=1.5,
+                    alpha=0.9,
+                    label="same-layer random-4 mean",
+                )
         baseline = frame[frame.family == "baseline"]
         if not baseline.empty:
             ax.axhline(
@@ -854,63 +876,453 @@ def save_position_local_ablation_panel(
     plt.close(fig)
 
 
-def save_retrieval_patch(retrieval: pd.DataFrame, path: Path) -> None:
-    fig, axes = plt.subplots(2, 3, figsize=(13.7, 7.8), sharex=True, sharey=True, constrained_layout=True)
-    for row, role in enumerate(("interior", "final")):
-        for col, count_bin in enumerate(COUNT_BINS):
-            ax = axes[row, col]
-            frame = retrieval[(retrieval.query_role == role) & (retrieval.count_bin == count_bin)]
-            for family, color, label in (
-                ("targeted_top", BLUE, "targeted top"),
-                ("targeted_bottom", RED, "targeted bottom"),
-            ):
-                group = frame[frame.family == family].groupby("top_n", as_index=False).normalized_recovery.mean()
-                ax.plot(group.top_n, group.normalized_recovery, color=color, marker="o", label=label)
-            random = frame[frame.family == "random"]
-            mean, low, high = random_band(random, "normalized_recovery")
-            ax.plot(mean.top_n, mean.normalized_recovery, color=GRAY, marker="o", label="random mean")
-            ax.fill_between(mean.top_n, low.normalized_recovery, high.normalized_recovery, color=GRAY, alpha=0.18)
-            ax.axhline(0, color="#111827", linewidth=1)
-            ax.axhline(1, color="#111827", linestyle="--", linewidth=1)
-            ax.set_title(f"{role} trace index | count {count_bin}")
-            ax.set_xticks([1, 2, 4, 8, 16])
-            ax.set_xlabel("number of patched heads")
-    axes[0, 0].set_ylabel("normalized clean-margin recovery")
-    axes[1, 0].set_ylabel("normalized clean-margin recovery")
-    handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=3, bbox_to_anchor=(0.5, -0.03))
-    fig.suptitle("Marker-identity clean-to-corrupt patching, stratified by gold count", fontsize=15, fontweight="bold")
+def save_retrieval_patch_panel(
+    retrieval: pd.DataFrame,
+    *,
+    query_role: str,
+    title: str,
+    path: Path,
+) -> None:
+    """Plot clean-to-corrupt marker recovery without a low-score-head baseline."""
+    fig, axes = plt.subplots(1, 3, figsize=(13.8, 4.8), sharex=True, sharey=True)
+    for ax, count_bin in zip(axes, COUNT_BINS):
+        frame = retrieval[(retrieval.query_role == query_role) & (retrieval.count_bin == count_bin)]
+        ranked = (
+            frame[frame.family == "targeted_top"]
+            .groupby("top_n", as_index=False)
+            .normalized_recovery.mean()
+            .sort_values("top_n")
+        )
+        random = frame[frame.family == "random"].copy()
+        for replicate, path_rows in random.groupby("replicate"):
+            path_rows = path_rows.sort_values("top_n")
+            ax.plot(
+                path_rows.top_n,
+                path_rows.normalized_recovery,
+                color="#94a3b8",
+                alpha=0.48,
+                linewidth=1.1,
+                label="individual random order" if int(replicate) == int(random.replicate.min()) else None,
+            )
+        mean, low, high = random_band(random, "normalized_recovery")
+        ax.fill_between(mean.top_n, low.normalized_recovery, high.normalized_recovery, color=GRAY, alpha=0.14, label="random min-max")
+        ax.plot(mean.top_n, mean.normalized_recovery, color=GRAY, marker="o", linewidth=2, label="random mean")
+        random4 = random[random.top_n == 4].normalized_recovery.mean()
+        ax.axhline(random4, color=PURPLE, linestyle=":", linewidth=1.7, label="random top-4 mean")
+        ax.plot(ranked.top_n, ranked.normalized_recovery, color=BLUE, marker="o", linewidth=2.3, label="targeted ranked top")
+        ax.axhline(0, color="#111827", linewidth=1)
+        ax.axhline(1, color="#111827", linestyle="--", linewidth=1)
+        ax.set_title(f"gold count {count_bin}")
+        ax.set_xticks([1, 2, 4, 8, 16])
+        ax.set_xlim(0.5, 16.5)
+        ax.set_ylim(-0.08, 1.08)
+        ax.set_xlabel("number of clean head-output slices patched")
+        ax.set_ylabel("normalized clean-marker margin recovery")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.subplots_adjust(left=0.06, right=0.99, bottom=0.16, top=0.72, wspace=0.14)
+    fig.legend(handles, labels, loc="upper center", ncol=5, bbox_to_anchor=(0.5, 0.86), frameon=False)
+    fig.suptitle(title, fontsize=15, fontweight="bold", y=0.98)
     fig.savefig(path, dpi=190, bbox_inches="tight")
     plt.close(fig)
 
 
-def save_nested_patch(regression: pd.DataFrame, path: Path) -> None:
-    fig, axes = plt.subplots(2, 3, figsize=(13.7, 7.8), sharex=True, constrained_layout=True)
-    for row, mode in enumerate(("nonthinking", "thinking")):
-        for col, count_bin in enumerate(COUNT_BINS):
-            ax = axes[row, col]
-            frame = regression[(regression["mode"] == mode) & (regression["count_bin"] == count_bin)]
-            for family, color, label in (
-                ("primary_top", BLUE, "ranked top"),
-                ("primary_bottom", RED, "ranked bottom"),
-            ):
-                group = frame[frame.family == family].sort_values("top_n")
-                ax.plot(group.top_n, group.slope, color=color, marker="o", label=label)
-            random = frame[frame.family == "random"]
-            grouped = random.groupby("top_n").slope
-            mean, low, high = grouped.mean(), grouped.min(), grouped.max()
-            ax.plot(mean.index, mean.values, color=GRAY, marker="o", label="random mean")
-            ax.fill_between(mean.index, low.values, high.values, color=GRAY, alpha=0.18)
+def save_successor_patch_panel(
+    summary: pd.DataFrame,
+    *,
+    direction: str,
+    metric: str,
+    title: str,
+    path: Path,
+) -> None:
+    """Plot local M_k successor/close patching with row and stage controls."""
+    family_styles = {
+        "successor_top": (BLUE, "o", "successor-score ranked"),
+        "targeted_top": (ORANGE, "s", "k-to-k targeted ranked"),
+        "successor_wrong_row": (GREEN, "^", "successor heads, wrong donor row"),
+    }
+    fig, axes = plt.subplots(1, 3, figsize=(13.8, 4.9), sharex=True, sharey=True)
+    for ax, count_bin in zip(axes, COUNT_BINS):
+        frame = summary[
+            (summary["direction"] == direction)
+            & (summary["count_bin"] == count_bin)
+        ].copy()
+        for family, (color, marker, label) in family_styles.items():
+            rows = frame[frame["family"] == family].sort_values("top_n")
+            if rows.empty:
+                continue
+            ax.plot(
+                rows["top_n"],
+                rows[metric],
+                color=color,
+                marker=marker,
+                linewidth=2.2,
+                markersize=5,
+                label=label,
+            )
+
+        random = frame[frame["family"] == "random"].copy()
+        if not random.empty:
+            for replicate, rows in random.groupby("replicate"):
+                rows = rows.sort_values("top_n")
+                ax.plot(
+                    rows["top_n"],
+                    rows[metric],
+                    color="#a8b2c1",
+                    alpha=0.42,
+                    linewidth=1.0,
+                    label=(
+                        "individual random order"
+                        if int(replicate) == int(random["replicate"].min())
+                        else None
+                    ),
+                )
+            mean, low, high = random_band(random, metric)
+            ax.fill_between(
+                mean["top_n"],
+                low[metric],
+                high[metric],
+                color=GRAY,
+                alpha=0.15,
+                label="random min-max",
+            )
+            ax.plot(
+                mean["top_n"],
+                mean[metric],
+                color=GRAY,
+                linewidth=2.0,
+                label="random mean",
+            )
+
+        ax.axhline(0, color="#111827", linewidth=1.0)
+        if metric == "normalized_recovery":
+            ax.axhline(1, color="#111827", linestyle="--", linewidth=1.0)
+            ax.set_ylim(-0.08, 1.08)
+            ax.set_ylabel("normalized continue/close margin recovery")
+        else:
+            ax.axhline(1, color="#111827", linestyle="--", linewidth=1.0)
+            ax.set_ylim(-0.04, 1.04)
+            ax.set_ylabel("patched target-decision accuracy")
+        ax.set_title(f"count {count_bin}")
+        ax.set_xlim(0.5, 16.5)
+        ax.set_xticks([1, 2, 4, 8, 12, 16])
+        ax.set_xlabel("number of head-output slices patched at M_k")
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    fig.subplots_adjust(left=0.065, right=0.995, bottom=0.16, top=0.70, wspace=0.20)
+    fig.legend(
+        by_label.values(),
+        by_label.keys(),
+        loc="upper center",
+        ncol=3,
+        bbox_to_anchor=(0.5, 0.88),
+        frameon=False,
+    )
+    fig.suptitle(title, fontsize=15, fontweight="bold", y=0.99)
+    fig.savefig(path, dpi=190, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_successor_residual_logit_lens(
+    summary: pd.DataFrame,
+    path: Path,
+) -> None:
+    """Show where continue evidence appears along the residual stream."""
+    stage_order = [
+        (layer, stage)
+        for layer in range(4)
+        for stage in ("resid_pre", "post_attn", "post_mlp")
+    ]
+    stage_labels = [
+        f"L{layer + 1} pre" if stage == "resid_pre" else
+        f"L{layer + 1} +Attn" if stage == "post_attn" else
+        f"L{layer + 1} +MLP"
+        for layer, stage in stage_order
+    ]
+    frame = summary[
+        (summary["direction"] == "continue_into_close")
+        & (summary["stage_type"] == "residual_logit_lens")
+    ].copy()
+    fig, axes = plt.subplots(1, 3, figsize=(14.6, 4.9), sharex=True, sharey=True)
+    for ax, count_bin in zip(axes, COUNT_BINS):
+        rows = frame[frame["count_bin"] == count_bin].set_index(["layer", "stage"])
+        clean = [float(rows.loc[key, "clean_margin"]) for key in stage_order]
+        corrupt = [float(rows.loc[key, "corrupt_margin"]) for key in stage_order]
+        x = np.arange(len(stage_order))
+        ax.plot(x, clean, color=BLUE, marker="o", linewidth=2.2, label="long prompt: continue target")
+        ax.plot(x, corrupt, color=ORANGE, marker="o", linewidth=2.2, label="short prompt: same target")
+        ax.axhline(0, color="#111827", linewidth=1)
+        for boundary in (2.5, 5.5, 8.5):
+            ax.axvline(boundary, color="#cbd5e1", linewidth=1)
+        ax.set_title(f"count {count_bin}")
+        ax.set_xticks(x)
+        ax.set_xticklabels(stage_labels, rotation=55, ha="right", fontsize=8)
+        ax.set_xlabel("residual stage at marker query M_k")
+        ax.set_ylabel("target-aligned next-token logit margin")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.subplots_adjust(left=0.065, right=0.995, bottom=0.31, top=0.72, wspace=0.18)
+    fig.legend(handles, labels, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 0.86), frameon=False)
+    fig.suptitle("Residual logit lens: where does continue evidence become linearly readable?", fontsize=15, fontweight="bold", y=0.98)
+    fig.savefig(path, dpi=190, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_successor_component_evidence(
+    summary: pd.DataFrame,
+    path: Path,
+) -> None:
+    """Compare target-aligned evidence directly written by attention and MLP outputs."""
+    frame = summary[
+        (summary["direction"] == "continue_into_close")
+        & (summary["stage_type"] == "direct_component_unembedding")
+    ].copy()
+    fig, axes = plt.subplots(1, 3, figsize=(13.8, 4.7), sharex=True, sharey=True)
+    for ax, count_bin in zip(axes, COUNT_BINS):
+        rows = frame[frame["count_bin"] == count_bin]
+        for stage, color, marker, label in (
+            ("attn_out", BLUE, "o", "attention output"),
+            ("mlp_out", ORANGE, "s", "MLP output"),
+        ):
+            selected = rows[rows["stage"] == stage].sort_values("layer")
+            ax.plot(
+                selected["layer"] + 1,
+                selected["evidence_gap"],
+                color=color,
+                marker=marker,
+                linewidth=2.3,
+                label=label,
+            )
+        ax.axhline(0, color="#111827", linewidth=1)
+        ax.set_title(f"count {count_bin}")
+        ax.set_xticks([1, 2, 3, 4])
+        ax.set_xlabel("layer producing the additive component")
+        ax.set_ylabel("clean-minus-corrupt target-aligned component margin")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.subplots_adjust(left=0.07, right=0.995, bottom=0.16, top=0.72, wspace=0.18)
+    fig.legend(handles, labels, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 0.86), frameon=False)
+    fig.suptitle("Direct unembedding diagnostic: attention routes evidence; MLP amplifies token evidence", fontsize=15, fontweight="bold", y=0.98)
+    fig.savefig(path, dpi=190, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_successor_sublayer_conversion(
+    summary: pd.DataFrame,
+    *,
+    direction: str,
+    title: str,
+    path: Path,
+) -> None:
+    """Contrast attention-only patching with native MLP mediation and full-state patching."""
+    styles = {
+        "attn_direct_residual": (BLUE, "o", "donor Attn; receiver MLP frozen"),
+        "attn_native_mlp": (GREEN, "s", "donor Attn; native MLP recomputed"),
+        "mlp_out_only": (ORANGE, "^", "donor MLP output only"),
+        "post_mlp_state": (GRAY, "D", "full donor post-MLP state"),
+    }
+    frame = summary[summary["direction"] == direction].copy()
+    fig, axes = plt.subplots(1, 3, figsize=(14.6, 4.8), sharex=True, sharey=True)
+    for ax, count_bin in zip(axes, COUNT_BINS):
+        rows = frame[frame["count_bin"] == count_bin]
+        for intervention, (color, marker, label) in styles.items():
+            selected = rows[rows["intervention"] == intervention].sort_values("layer")
+            ax.plot(
+                selected["layer"] + 1,
+                selected["normalized_recovery"],
+                color=color,
+                marker=marker,
+                linewidth=2.2,
+                label=label,
+            )
+        ax.axhline(0, color="#111827", linewidth=1)
+        ax.axhline(1, color="#111827", linestyle="--", linewidth=1)
+        ax.set_title(f"count {count_bin}")
+        ax.set_xticks([1, 2, 3, 4])
+        ax.set_ylim(-0.08, 1.08)
+        ax.set_xlabel("patched layer at marker query M_k")
+        ax.set_ylabel("normalized target-margin recovery")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.subplots_adjust(left=0.065, right=0.995, bottom=0.16, top=0.69, wspace=0.18)
+    fig.legend(handles, labels, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 0.87), frameon=False)
+    fig.suptitle(title, fontsize=15, fontweight="bold", y=0.99)
+    fig.savefig(path, dpi=190, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_mlp_feature_concentration(
+    concentration: pd.DataFrame,
+    path: Path,
+) -> None:
+    """Plot how quickly ranked MLP features accumulate projected token evidence."""
+    direction_rows = (
+        ("continue_into_close", "Continue evidence -> close receiver"),
+        ("close_into_continue", "Close evidence -> continue receiver"),
+    )
+    fig, axes = plt.subplots(2, 2, figsize=(12.8, 8.4), sharex=True, sharey=True)
+    colors = {"1-10": BLUE, "11-20": ORANGE, "21-30": GREEN}
+    for row_index, (direction, direction_label) in enumerate(direction_rows):
+        for col_index, layer in enumerate((2, 3)):
+            ax = axes[row_index, col_index]
+            frame = concentration[
+                (concentration["direction"] == direction)
+                & (concentration["layer"] == layer)
+            ]
+            for count_bin in COUNT_BINS:
+                rows = frame[frame["count_bin"] == count_bin].sort_values("support_size")
+                ax.plot(
+                    rows["support_size"],
+                    rows["positive_evidence_fraction"],
+                    color=colors[count_bin],
+                    marker="o",
+                    linewidth=2.2,
+                    label=f"count {count_bin}: positive evidence",
+                )
+                ax.plot(
+                    rows["support_size"],
+                    rows["absolute_evidence_fraction"],
+                    color=colors[count_bin],
+                    linestyle="--",
+                    linewidth=1.7,
+                    alpha=0.8,
+                    label=f"count {count_bin}: absolute evidence",
+                )
+            ax.set_xscale("log", base=2)
+            ax.set_xticks([1, 4, 16, 64, 256, 1024])
+            ax.set_xticklabels(["1", "4", "16", "64", "256", "1024"])
+            ax.set_ylim(-0.02, 1.03)
+            ax.set_title(f"{direction_label}\nLayer {layer + 1} post-GELU features")
+            ax.set_xlabel("number of top-ranked MLP features")
+            ax.set_ylabel("fraction of total projected evidence")
+            ax.axhline(1, color="#111827", linestyle=":", linewidth=1)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.subplots_adjust(left=0.075, right=0.995, bottom=0.10, top=0.76, hspace=0.37, wspace=0.16)
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        ncol=3,
+        bbox_to_anchor=(0.5, 0.89),
+        frameon=False,
+    )
+    fig.suptitle(
+        "MLP feature evidence concentration at the marker query M_k",
+        fontsize=15,
+        fontweight="bold",
+        y=0.98,
+    )
+    fig.savefig(path, dpi=190, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_mlp_feature_patch_panel(
+    summary: pd.DataFrame,
+    *,
+    direction: str,
+    title: str,
+    path: Path,
+) -> None:
+    """Plot held-out post-GELU feature replacement and sparse-direction recovery."""
+    frame = summary[summary["direction"] == direction].copy()
+    fig, axes = plt.subplots(2, 3, figsize=(14.8, 8.2), sharex=True, sharey=True)
+    styles = {
+        "ranked_feature_replacement": (BLUE, "o", "ranked feature replacement"),
+        "sparse_mean_direction": (GREEN, "s", "sparse mean-direction transport"),
+        "random_feature_replacement": (GRAY, "^", "matched random features"),
+    }
+    for row_index, layer in enumerate((2, 3)):
+        for col_index, count_bin in enumerate(COUNT_BINS):
+            ax = axes[row_index, col_index]
+            rows = frame[
+                (frame["layer"] == layer) & (frame["count_bin"] == count_bin)
+            ]
+            for family, (color, marker, label) in styles.items():
+                selected = rows[rows["family"] == family].sort_values("support_size")
+                ax.plot(
+                    selected["support_size"],
+                    selected["normalized_recovery"],
+                    color=color,
+                    marker=marker,
+                    linewidth=2.1,
+                    label=label,
+                )
+                if family == "random_feature_replacement" and not selected.empty:
+                    mean = selected["normalized_recovery"].to_numpy(float)
+                    std = selected["normalized_recovery_std"].fillna(0).to_numpy(float)
+                    ax.fill_between(
+                        selected["support_size"].to_numpy(float),
+                        mean - std,
+                        mean + std,
+                        color=color,
+                        alpha=0.14,
+                    )
+            ax.set_xscale("log", base=2)
+            ax.set_xticks([1, 4, 16, 64, 256, 1024])
+            ax.set_xticklabels(["1", "4", "16", "64", "256", "1024"])
             ax.axhline(0, color="#111827", linewidth=1)
             ax.axhline(1, color="#111827", linestyle="--", linewidth=1)
-            ax.set_title(f"{mode} final query | count {count_bin}")
-            ax.set_xticks([1, 2, 4, 8, 16])
-            ax.set_xlabel("number of donor head slices patched")
-    axes[0, 0].set_ylabel("slope: expected shift / donor offset")
-    axes[1, 0].set_ylabel("slope: expected shift / donor offset")
+            ax.set_ylim(-0.08, 1.08)
+            ax.set_title(f"Layer {layer + 1} | count {count_bin}")
+            ax.set_xlabel("patched feature support size")
+            ax.set_ylabel("normalized target-margin recovery")
     handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=3, bbox_to_anchor=(0.5, -0.03))
-    fig.suptitle("Nested-prompt head-output patching: transport of count across all offset sizes", fontsize=15, fontweight="bold")
+    fig.subplots_adjust(left=0.065, right=0.995, bottom=0.10, top=0.80, hspace=0.30, wspace=0.18)
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        ncol=3,
+        bbox_to_anchor=(0.5, 0.90),
+        frameon=False,
+    )
+    fig.suptitle(title, fontsize=15, fontweight="bold", y=0.99)
+    fig.savefig(path, dpi=190, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_nested_patch_panel(
+    regression: pd.DataFrame,
+    *,
+    mode: str,
+    title: str,
+    path: Path,
+) -> None:
+    """Plot donor-to-receiver count transport for one final-query mechanism."""
+    fig, axes = plt.subplots(1, 3, figsize=(13.8, 4.8), sharex=True, sharey=True)
+    selected = regression[(regression["mode"] == mode) & regression.count_bin.isin(COUNT_BINS)]
+    y_min = min(-0.08, float(selected[selected.family.isin(["primary_top", "random"])].slope.min()) - 0.04)
+    y_max = max(1.08, float(selected[selected.family.isin(["primary_top", "random"])].slope.max()) + 0.04)
+    for ax, count_bin in zip(axes, COUNT_BINS):
+        frame = selected[selected.count_bin == count_bin]
+        ranked = frame[frame.family == "primary_top"].sort_values("top_n")
+        random = frame[frame.family == "random"].copy()
+        for replicate, path_rows in random.groupby("replicate"):
+            path_rows = path_rows.sort_values("top_n")
+            ax.plot(
+                path_rows.top_n,
+                path_rows.slope,
+                color="#94a3b8",
+                alpha=0.48,
+                linewidth=1.1,
+                label="individual random order" if int(replicate) == int(random.replicate.min()) else None,
+            )
+        grouped = random.groupby("top_n").slope
+        mean, low, high = grouped.mean(), grouped.min(), grouped.max()
+        ax.fill_between(mean.index, low.values, high.values, color=GRAY, alpha=0.14, label="random min-max")
+        ax.plot(mean.index, mean.values, color=GRAY, marker="o", linewidth=2, label="random mean")
+        random4 = random[random.top_n == 4].slope.mean()
+        ax.axhline(random4, color=PURPLE, linestyle=":", linewidth=1.7, label="random top-4 mean")
+        ax.plot(ranked.top_n, ranked.slope, color=BLUE, marker="o", linewidth=2.3, label="mechanism-ranked top")
+        ax.axhline(0, color="#111827", linewidth=1)
+        ax.axhline(1, color="#111827", linestyle="--", linewidth=1)
+        ax.set_title(f"receiver count {count_bin}")
+        ax.set_xticks([1, 2, 4, 8, 16])
+        ax.set_xlim(0.5, 16.5)
+        ax.set_ylim(y_min, y_max)
+        ax.set_xlabel("number of donor head-output slices patched")
+        ax.set_ylabel("transport slope: expected-count shift / donor offset")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.subplots_adjust(left=0.06, right=0.99, bottom=0.16, top=0.72, wspace=0.14)
+    fig.legend(handles, labels, loc="upper center", ncol=5, bbox_to_anchor=(0.5, 0.86), frameon=False)
+    fig.suptitle(title, fontsize=15, fontweight="bold", y=0.98)
     fig.savefig(path, dpi=190, bbox_inches="tight")
     plt.close(fig)
 
@@ -947,6 +1359,188 @@ def save_steering(steering: pd.DataFrame, path: Path) -> None:
     fig.legend(handles, labels, loc="lower center", ncol=5, bbox_to_anchor=(0.5, -0.025))
     fig.suptitle("Adjacent-count direction steering dose response by count range", fontsize=15, fontweight="bold")
     fig.savefig(path, dpi=190, bbox_inches="tight")
+    plt.close(fig)
+
+
+def aggregate_geometry_path_regression(detail: pd.DataFrame) -> pd.DataFrame:
+    """Fit causal output transport across all donor offsets in each panel."""
+    rows = []
+    groups = ["site", "mode", "count_bin", "layer", "method", "alpha"]
+    for keys, frame in detail.groupby(groups, dropna=False):
+        clean = frame[["intended_count_shift", "causal_expected_shift"]].dropna()
+        slope = intercept = r2 = math.nan
+        if len(clean) >= 2 and clean.intended_count_shift.nunique() >= 2:
+            x = clean.intended_count_shift.to_numpy(dtype=float)
+            y = clean.causal_expected_shift.to_numpy(dtype=float)
+            design = np.column_stack([np.ones(len(x)), x])
+            beta, *_ = np.linalg.lstsq(design, y, rcond=None)
+            prediction = design @ beta
+            denominator = float(((y - y.mean()) ** 2).sum())
+            slope = float(beta[1])
+            intercept = float(beta[0])
+            r2 = (
+                1.0 - float(((y - prediction) ** 2).sum()) / denominator
+                if denominator > 1e-12
+                else math.nan
+            )
+        rows.append(
+            {
+                **dict(zip(groups, keys)),
+                "n": len(frame),
+                "transport_slope": slope,
+                "transport_intercept": intercept,
+                "transport_r2": r2,
+                "path_tracking_mae": float(frame.path_tracking_error.mean()),
+                "intended_hit": float(frame.follows_intended_integer.mean()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def save_adjacent_geometry_transport(regression: pd.DataFrame, path: Path) -> None:
+    sites = (
+        ("nonthinking_final_answer", "Non-thinking final-answer state"),
+        ("thinking_final_answer", "CoT natural final-answer state"),
+        ("thinking_fixed_trace_answer", "CoT fixed-15 control"),
+    )
+    methods = (
+        ("adjacent_centroid_transplant", "full centroid transplant", BLUE, "-"),
+        ("adjacent_delta_transport", "receiver residual + centroid delta", ORANGE, "--"),
+    )
+    fig, axes = plt.subplots(3, 3, figsize=(14.4, 10.8), sharex=True, sharey=True)
+    for row, (site, site_label) in enumerate(sites):
+        for col, count_bin in enumerate(COUNT_BINS):
+            ax = axes[row, col]
+            frame = regression[(regression.site == site) & (regression.count_bin == count_bin)]
+            for method, label, color, linestyle in methods:
+                group = frame[frame.method == method].sort_values("layer")
+                ax.plot(
+                    group.layer + 1,
+                    group.transport_slope,
+                    color=color,
+                    linestyle=linestyle,
+                    marker="o",
+                    linewidth=2.2,
+                    label=label,
+                )
+            ax.axhline(0, color="#111827", linewidth=1)
+            ax.axhline(1, color=GRAY, linestyle="--", linewidth=1.2, label="ideal one-count transport")
+            ax.set_title(f"{site_label} | count {count_bin}")
+            ax.set_xticks([1, 2, 3, 4])
+            if row == len(sites) - 1:
+                ax.set_xlabel("residual intervention after Layer", labelpad=5)
+    for row in range(3):
+        axes[row, 0].set_ylabel("transport slope")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=3, bbox_to_anchor=(0.5, 0.012), frameon=False)
+    fig.suptitle(
+        "Adjacent count transport: full centroid versus residual-preserving delta",
+        fontsize=15,
+        fontweight="bold",
+        y=0.985,
+    )
+    fig.subplots_adjust(left=0.065, right=0.99, top=0.925, bottom=0.105, hspace=0.34, wspace=0.10)
+    fig.savefig(path, dpi=190, bbox_inches="tight", pad_inches=0.18)
+    plt.close(fig)
+
+
+def save_nonadjacent_path_transport(
+    regression: pd.DataFrame,
+    *,
+    method: str,
+    title: str,
+    path: Path,
+) -> None:
+    sites = (
+        ("nonthinking_final_answer", "Non-thinking final-answer state"),
+        ("thinking_final_answer", "CoT natural final-answer state"),
+    )
+    colors = {0.25: "#93c5fd", 0.5: BLUE, 0.75: PURPLE, 1.0: RED}
+    fig, axes = plt.subplots(2, 3, figsize=(14.4, 7.6), sharex=True, sharey=True)
+    for row, (site, site_label) in enumerate(sites):
+        for col, count_bin in enumerate(COUNT_BINS):
+            ax = axes[row, col]
+            frame = regression[
+                (regression.site == site)
+                & (regression.count_bin == count_bin)
+                & (regression.method == method)
+            ]
+            for alpha in sorted(frame.alpha.dropna().unique()):
+                group = frame[frame.alpha == alpha].sort_values("layer")
+                ax.plot(
+                    group.layer + 1,
+                    group.transport_slope,
+                    color=colors.get(float(alpha), GRAY),
+                    marker="o",
+                    linewidth=2.0,
+                    label=f"alpha={float(alpha):g}",
+                )
+            ax.axhline(0, color="#111827", linewidth=1)
+            ax.axhline(1, color=GRAY, linestyle="--", linewidth=1.2, label="ideal path transport")
+            ax.set_title(f"{site_label} | count {count_bin}")
+            ax.set_xticks([1, 2, 3, 4])
+            if row == len(sites) - 1:
+                ax.set_xlabel("residual intervention after Layer", labelpad=5)
+    for row in range(2):
+        axes[row, 0].set_ylabel("transport slope")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=5, bbox_to_anchor=(0.5, 0.014), frameon=False)
+    fig.suptitle(title, fontsize=15, fontweight="bold", y=0.982)
+    fig.subplots_adjust(left=0.065, right=0.99, top=0.91, bottom=0.15, hspace=0.34, wspace=0.10)
+    fig.savefig(path, dpi=190, bbox_inches="tight", pad_inches=0.18)
+    plt.close(fig)
+
+
+def save_curve_chord_tracking(detail: pd.DataFrame, path: Path) -> None:
+    frame = detail[
+        detail.method.isin(("nonadjacent_chord_transport", "nonadjacent_curve_transport"))
+        & (detail.alpha < 1.0)
+        & detail.site.isin(("nonthinking_final_answer", "thinking_final_answer"))
+    ]
+    summary = (
+        frame.groupby(["site", "count_bin", "layer", "method"], as_index=False)
+        .path_tracking_error.mean()
+    )
+    sites = (
+        ("nonthinking_final_answer", "Non-thinking final-answer state"),
+        ("thinking_final_answer", "CoT natural final-answer state"),
+    )
+    methods = (
+        ("nonadjacent_chord_transport", "straight endpoint chord", ORANGE, "--"),
+        ("nonadjacent_curve_transport", "piecewise centroid curve", GREEN, "-"),
+    )
+    fig, axes = plt.subplots(2, 3, figsize=(14.4, 7.6), sharex=True)
+    for row, (site, site_label) in enumerate(sites):
+        for col, count_bin in enumerate(COUNT_BINS):
+            ax = axes[row, col]
+            panel = summary[(summary.site == site) & (summary.count_bin == count_bin)]
+            for method, label, color, linestyle in methods:
+                group = panel[panel.method == method].sort_values("layer")
+                ax.plot(
+                    group.layer + 1,
+                    group.path_tracking_error,
+                    color=color,
+                    linestyle=linestyle,
+                    marker="o",
+                    linewidth=2.2,
+                    label=label,
+                )
+            ax.set_title(f"{site_label} | count {count_bin}")
+            ax.set_xticks([1, 2, 3, 4])
+            if row == len(sites) - 1:
+                ax.set_xlabel("residual intervention after Layer", labelpad=5)
+    for row in range(2):
+        axes[row, 0].set_ylabel("mean absolute path-tracking error")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=2, bbox_to_anchor=(0.5, 0.014), frameon=False)
+    fig.suptitle(
+        "Does the curved centroid path track intermediate counts better than a chord?",
+        fontsize=15,
+        fontweight="bold",
+        y=0.982,
+    )
+    fig.subplots_adjust(left=0.065, right=0.99, top=0.91, bottom=0.15, hspace=0.34, wspace=0.12)
+    fig.savefig(path, dpi=190, bbox_inches="tight", pad_inches=0.18)
     plt.close(fig)
 
 
@@ -1404,7 +1998,7 @@ def mechanism_explorer() -> str:
       const copy = {
         direct: [
           {title:'Step 1 · 形成待计数集合', read:'读取：完整 prompt 中 marker/needle token 的身份与位置。', write:'写入：各位置的局部表示；此时还没有外显计数轨迹。', test:'可证伪预测：若模型完全不区分 needle 与 noise，后续 broad score 和 count probe 不应出现。'},
-          {title:'Step 2 · 并行 broad retrieval', read:'读取：final <Ans> query 通过若干 attention heads 同时访问多个 prompt needles。', write:'写入：needle value vectors 的加权组合，而不是按 k=1,2,… 逐个输出。', test:'可证伪预测：高 broad-score heads 的全局 mask 应比 bottom/random heads 更早破坏 final accuracy。'},
+          {title:'Step 2 · 并行 broad retrieval', read:'读取：final <Ans> query 通过若干 attention heads 同时访问多个 prompt needles。', write:'写入：needle value vectors 的加权组合，而不是按 k=1,2,… 逐个输出。', test:'可证伪预测：高 broad-score heads 的全局 mask 应比固定随机删除路径更早破坏 final accuracy。'},
           {title:'Step 3 · 聚合为 cardinality state', read:'读取：多个 head outputs 与既有 residual。', write:'写入：answer-query residual 中可区分 count 1…30 的分布式状态。', test:'可证伪预测：把 donor count 的 head slices 或 residual 搬给 receiver，输出应朝 donor count 移动。'},
           {title:'Step 4 · 后层变换与离散化', read:'读取：连续的 count-related residual geometry。', write:'写入：30 个 number-token logits 之间更大的正确 margin。', test:'可证伪预测：早层可能负责集合聚合，后层 residual transplant 应更接近一比一决定最终 count。'},
           {title:'Step 5 · 直接答案读出', read:'读取：<Ans> 位置最后一层 residual。', write:'输出：共享数字 token <Cₙ>，没有中间 trace token。', test:'机制边界：成功输出只证明最终状态足够，不证明内部一定沿一条线性 +1 轴计算。'}
@@ -1481,8 +2075,69 @@ def build_report(run_dir: Path) -> Path:
     position_local = pd.read_csv(tables / "position_local_ablation_by_bin.csv")
     retrieval = pd.read_csv(tables / "retrieval_control_patching_by_bin.csv")
     nested = pd.read_csv(tables / "nested_head_patching_regression_by_bin.csv")
+    successor_tables = run_dir / "analysis" / "successor_patching" / "tables"
+    successor_summary_path = successor_tables / "successor_head_patching_summary.csv"
+    if not successor_summary_path.exists():
+        raise FileNotFoundError(
+            "Missing successor patching summary. Run scripts/run_v10_successor_patching.py "
+            f"for {run_dir} before rebuilding the report."
+        )
+    successor_summary = pd.read_csv(successor_summary_path)
+    successor_conversion_tables = run_dir / "analysis" / "successor_conversion" / "tables"
+    successor_stage_path = successor_conversion_tables / "successor_stage_logit_lens_summary.csv"
+    successor_conversion_path = successor_conversion_tables / "successor_sublayer_patching_summary.csv"
+    successor_conversion_manifest_path = run_dir / "analysis" / "successor_conversion" / "manifest.json"
+    if not successor_stage_path.exists() or not successor_conversion_path.exists():
+        raise FileNotFoundError(
+            "Missing successor sublayer conversion outputs. Run "
+            "scripts/run_v10_successor_conversion.py for "
+            f"{run_dir} before rebuilding the report."
+        )
+    successor_stage = pd.read_csv(successor_stage_path)
+    successor_conversion = pd.read_csv(successor_conversion_path)
+    successor_conversion_manifest = json.loads(
+        successor_conversion_manifest_path.read_text(encoding="utf-8")
+    )
+    successor_mlp_root = run_dir / "analysis" / "successor_mlp_features"
+    successor_mlp_tables = successor_mlp_root / "tables"
+    mlp_feature_summary_path = successor_mlp_tables / "mlp_feature_patching_summary.csv"
+    mlp_feature_concentration_path = successor_mlp_tables / "mlp_feature_concentration.csv"
+    mlp_feature_manifest_path = successor_mlp_root / "manifest.json"
+    if not all(
+        path.exists()
+        for path in (
+            mlp_feature_summary_path,
+            mlp_feature_concentration_path,
+            mlp_feature_manifest_path,
+        )
+    ):
+        raise FileNotFoundError(
+            "Missing successor MLP-feature outputs. Run "
+            "scripts/run_v10_successor_mlp_features.py for "
+            f"{run_dir} before rebuilding the report."
+        )
+    mlp_feature_summary = pd.read_csv(mlp_feature_summary_path)
+    mlp_feature_concentration = pd.read_csv(mlp_feature_concentration_path)
+    mlp_feature_manifest = json.loads(mlp_feature_manifest_path.read_text(encoding="utf-8"))
     steering = pd.read_csv(tables / "geometry_steering_by_bin.csv")
     steering_gain = pd.read_csv(tables / "geometry_steering_gain_by_bin.csv")
+    geometry_path_root = run_dir / "analysis" / "geometry_path_steering"
+    geometry_path_tables = geometry_path_root / "tables"
+    geometry_path_detail_path = geometry_path_tables / "geometry_path_steering.csv"
+    geometry_path_manifest_path = geometry_path_root / "manifest.json"
+    if not geometry_path_detail_path.exists() or not geometry_path_manifest_path.exists():
+        raise FileNotFoundError(
+            "Missing centroid-path steering outputs. Run "
+            "scripts/run_v10_geometry_path_steering.py for "
+            f"{run_dir} before rebuilding the report."
+        )
+    geometry_path_detail = pd.read_csv(geometry_path_detail_path)
+    geometry_path_manifest = json.loads(geometry_path_manifest_path.read_text(encoding="utf-8"))
+    geometry_path_regression = aggregate_geometry_path_regression(geometry_path_detail)
+    geometry_path_regression.to_csv(
+        geometry_path_tables / "geometry_path_steering_regression_report.csv",
+        index=False,
+    )
     centroid_reg = pd.read_csv(tables / "centroid_transplant_regression_by_bin.csv")
     raw_reg = pd.read_csv(tables / "final_state_transplant_regression_by_bin.csv")
     coordinates = pd.read_csv(tables / "centroid_mean_pca_coordinates.csv")
@@ -1513,13 +2168,34 @@ def build_report(run_dir: Path) -> Path:
         "local_nonthinking": figures / "position_local_nonthinking_broad_to_final.png",
         "local_targeted": figures / "position_local_cot_targeted_to_trace.png",
         "local_readout": figures / "position_local_cot_readout_to_final.png",
-        "retrieval": figures / "retrieval_patching_by_count_bin.png",
-        "nested": figures / "nested_head_patching_by_count_bin.png",
+        "retrieval_interior": figures / "retrieval_patching_interior_by_count_bin.png",
+        "retrieval_final": figures / "retrieval_patching_final_by_count_bin.png",
+        "successor_continue_recovery": figures / "successor_continue_recovery_by_count_bin.png",
+        "successor_continue_accuracy": figures / "successor_continue_accuracy_by_count_bin.png",
+        "successor_close_recovery": figures / "successor_close_recovery_by_count_bin.png",
+        "successor_close_accuracy": figures / "successor_close_accuracy_by_count_bin.png",
+        "successor_logit_lens": figures / "successor_residual_logit_lens.png",
+        "successor_component_evidence": figures / "successor_component_evidence.png",
+        "successor_conversion_continue": figures / "successor_conversion_continue.png",
+        "successor_conversion_close": figures / "successor_conversion_close.png",
+        "mlp_feature_concentration": figures / "mlp_feature_concentration.png",
+        "mlp_feature_continue": figures / "mlp_feature_continue_recovery.png",
+        "mlp_feature_close": figures / "mlp_feature_close_recovery.png",
+        "nested_nonthinking": figures / "nested_head_patching_nonthinking_by_count_bin.png",
+        "nested_thinking": figures / "nested_head_patching_thinking_by_count_bin.png",
         "steering": figures / "geometry_steering_by_count_bin.png",
+        "geometry_path_adjacent": figures / "geometry_path_adjacent_transport.png",
+        "geometry_path_chord": figures / "geometry_path_chord_transport.png",
+        "geometry_path_curve": figures / "geometry_path_curve_transport.png",
+        "geometry_path_tracking": figures / "geometry_path_curve_vs_chord_tracking.png",
         "transplant": figures / "residual_transplant_by_count_bin.png",
         "pca_variance": figures / "pca_variance_by_site_layer.png",
         "pca_static": figures / "pca_count_mean_static.png",
     }
+    # The legacy inline report body is replaced below after f-string evaluation.
+    # Keep these aliases until that body is removed entirely.
+    generated["retrieval"] = generated["retrieval_interior"]
+    generated["nested"] = generated["nested_nonthinking"]
     save_training_overall(eval_counts, eval_losses, generated["training_overall"])
     save_training_by_bin(eval_bins, generated["training_bins"])
     save_broad_attention(attention_rows, generated["broad_attention"])
@@ -1560,7 +2236,6 @@ def build_report(run_dir: Path) -> Path:
         mode="nonthinking",
         metric="final_count_accuracy",
         family="direct_broad_top",
-        show_bottom=True,
         title="Non-thinking broad-head ablation: final-count accuracy",
         path=generated["cumulative_nonthinking"],
     )
@@ -1569,7 +2244,6 @@ def build_report(run_dir: Path) -> Path:
         mode="thinking",
         metric="trace_marker_accuracy",
         family="targeted_retrieval_top",
-        show_bottom=True,
         title="CoT targeted-head ablation: trace-marker accuracy",
         path=generated["cumulative_targeted_trace"],
     )
@@ -1578,7 +2252,6 @@ def build_report(run_dir: Path) -> Path:
         mode="thinking",
         metric="final_count_accuracy",
         family="targeted_retrieval_top",
-        show_bottom=True,
         title="CoT targeted-head ablation: final-count accuracy",
         path=generated["cumulative_targeted_final"],
     )
@@ -1587,7 +2260,6 @@ def build_report(run_dir: Path) -> Path:
         mode="thinking",
         metric="final_count_accuracy",
         family="trace_readout_top",
-        show_bottom=False,
         title="CoT trace-readout-head ablation: final-count accuracy",
         path=generated["cumulative_readout_final"],
     )
@@ -1612,9 +2284,115 @@ def build_report(run_dir: Path) -> Path:
         title="Position-local ablation: CoT trace-readout heads at <Ans> only",
         path=generated["local_readout"],
     )
-    save_retrieval_patch(retrieval, generated["retrieval"])
-    save_nested_patch(nested, generated["nested"])
+    save_retrieval_patch_panel(
+        retrieval,
+        query_role="interior",
+        title="CoT local head patching at an interior <k>: marker-identity recovery",
+        path=generated["retrieval_interior"],
+    )
+    save_retrieval_patch_panel(
+        retrieval,
+        query_role="final",
+        title="CoT local head patching at final <n>: marker-identity recovery",
+        path=generated["retrieval_final"],
+    )
+    save_successor_patch_panel(
+        successor_summary,
+        direction="continue_into_close",
+        metric="normalized_recovery",
+        title="CoT successor patch at M_k: continue evidence into a close receiver",
+        path=generated["successor_continue_recovery"],
+    )
+    save_successor_patch_panel(
+        successor_summary,
+        direction="continue_into_close",
+        metric="patched_target_correct",
+        title="CoT successor patch at M_k: does the close receiver emit <k+1>?",
+        path=generated["successor_continue_accuracy"],
+    )
+    save_successor_patch_panel(
+        successor_summary,
+        direction="close_into_continue",
+        metric="normalized_recovery",
+        title="CoT stop patch at M_k: close evidence into a continue receiver",
+        path=generated["successor_close_recovery"],
+    )
+    save_successor_patch_panel(
+        successor_summary,
+        direction="close_into_continue",
+        metric="patched_target_correct",
+        title="CoT stop patch at M_k: does the continue receiver emit </Think>?",
+        path=generated["successor_close_accuracy"],
+    )
+    save_successor_residual_logit_lens(
+        successor_stage,
+        generated["successor_logit_lens"],
+    )
+    save_successor_component_evidence(
+        successor_stage,
+        generated["successor_component_evidence"],
+    )
+    save_successor_sublayer_conversion(
+        successor_conversion,
+        direction="continue_into_close",
+        title="Sublayer conversion: continue evidence into a close receiver",
+        path=generated["successor_conversion_continue"],
+    )
+    save_successor_sublayer_conversion(
+        successor_conversion,
+        direction="close_into_continue",
+        title="Sublayer conversion: close evidence into a continue receiver",
+        path=generated["successor_conversion_close"],
+    )
+    save_mlp_feature_concentration(
+        mlp_feature_concentration,
+        generated["mlp_feature_concentration"],
+    )
+    save_mlp_feature_patch_panel(
+        mlp_feature_summary,
+        direction="continue_into_close",
+        title="MLP feature patching: continue evidence into a close receiver",
+        path=generated["mlp_feature_continue"],
+    )
+    save_mlp_feature_patch_panel(
+        mlp_feature_summary,
+        direction="close_into_continue",
+        title="MLP feature patching: close evidence into a continue receiver",
+        path=generated["mlp_feature_close"],
+    )
+    save_nested_patch_panel(
+        nested,
+        mode="nonthinking",
+        title="Non-thinking local patching at <Ans>: donor-count transport",
+        path=generated["nested_nonthinking"],
+    )
+    save_nested_patch_panel(
+        nested,
+        mode="thinking",
+        title="CoT local patching at <Ans>: trace-readout head slices",
+        path=generated["nested_thinking"],
+    )
     save_steering(steering, generated["steering"])
+    save_adjacent_geometry_transport(
+        geometry_path_regression,
+        generated["geometry_path_adjacent"],
+    )
+    save_nonadjacent_path_transport(
+        geometry_path_regression,
+        method="nonadjacent_chord_transport",
+        title="Non-adjacent straight-chord transport across count centroids",
+        path=generated["geometry_path_chord"],
+    )
+    save_nonadjacent_path_transport(
+        geometry_path_regression,
+        method="nonadjacent_curve_transport",
+        title="Non-adjacent transport along the piecewise centroid curve",
+        path=generated["geometry_path_curve"],
+    )
+    save_curve_chord_tracking(
+        geometry_path_detail,
+        generated["geometry_path_tracking"],
+    )
     save_transplants(centroid_reg, raw_reg, generated["transplant"])
     save_pca_variance(geometry, generated["pca_variance"])
     save_pca_static(coordinates, generated["pca_static"])
@@ -1750,11 +2528,10 @@ def build_report(run_dir: Path) -> Path:
         frame = cumulative[
             (cumulative["mode"] == mode)
             & (cumulative["family"] == family)
-            & (cumulative["replicate"] == 0)
             & (cumulative["count_bin"] == count_bin)
             & (cumulative["top_n"] == top_n)
         ]
-        return "n/a" if frame.empty else pct(frame.iloc[0][metric])
+        return "n/a" if frame.empty else pct(frame[metric].mean())
 
     def local_remaining_accuracy(
         *,
@@ -1802,6 +2579,10 @@ def build_report(run_dir: Path) -> Path:
                     mode="nonthinking", family="direct_broad_top", count_bin=count_bin, top_n=2,
                     metric="final_count_accuracy",
                 ),
+                "direct_random4": remaining_accuracy(
+                    mode="nonthinking", family="random", count_bin=count_bin, top_n=4,
+                    metric="final_count_accuracy",
+                ),
                 "target_trace_top1": remaining_accuracy(
                     mode="thinking", family="targeted_retrieval_top", count_bin=count_bin, top_n=1,
                     metric="trace_marker_accuracy",
@@ -1818,12 +2599,24 @@ def build_report(run_dir: Path) -> Path:
                     mode="thinking", family="targeted_retrieval_top", count_bin=count_bin, top_n=8,
                     metric="final_count_accuracy",
                 ),
+                "target_trace_random4": remaining_accuracy(
+                    mode="thinking", family="random", count_bin=count_bin, top_n=4,
+                    metric="trace_marker_accuracy",
+                ),
+                "target_final_random4": remaining_accuracy(
+                    mode="thinking", family="random", count_bin=count_bin, top_n=4,
+                    metric="final_count_accuracy",
+                ),
                 "readout_final_top4": remaining_accuracy(
                     mode="thinking", family="trace_readout_top", count_bin=count_bin, top_n=4,
                     metric="final_count_accuracy",
                 ),
                 "readout_final_top8": remaining_accuracy(
                     mode="thinking", family="trace_readout_top", count_bin=count_bin, top_n=8,
+                    metric="final_count_accuracy",
+                ),
+                "readout_final_random4": remaining_accuracy(
+                    mode="thinking", family="random", count_bin=count_bin, top_n=4,
                     metric="final_count_accuracy",
                 ),
             }
@@ -1850,25 +2643,18 @@ def build_report(run_dir: Path) -> Path:
                             top_n=top_n,
                             metric=metric,
                         ),
-                        "reverse": local_remaining_accuracy(
-                            mechanism=mechanism,
-                            family="global_reverse",
-                            count_bin=count_bin,
-                            top_n=top_n,
-                            metric=metric,
-                        ),
-                        "same_layer_low": local_remaining_accuracy(
-                            mechanism=mechanism,
-                            family="layer_matched_low",
-                            count_bin=count_bin,
-                            top_n=top_n,
-                            metric=metric,
-                        ),
                         "same_layer_random": local_remaining_accuracy(
                             mechanism=mechanism,
                             family="layer_matched_random",
                             count_bin=count_bin,
                             top_n=top_n,
+                            metric=metric,
+                        ),
+                        "random4_reference": local_remaining_accuracy(
+                            mechanism=mechanism,
+                            family="layer_matched_random",
+                            count_bin=count_bin,
+                            top_n=4,
                             metric=metric,
                         ),
                     }
@@ -1902,38 +2688,260 @@ def build_report(run_dir: Path) -> Path:
         for row in alignment.itertuples(index=False)
     }
 
-    patch_rows = []
+    retrieval_patch_rows = []
+    for query_role in ("interior", "final"):
+        for count_bin in COUNT_BINS:
+            frame = retrieval[(retrieval.query_role == query_role) & (retrieval.count_bin == count_bin)]
+            for top_n in (1, 2, 4, 8):
+                ranked = frame[(frame.family == "targeted_top") & (frame.top_n == top_n)].normalized_recovery.mean()
+                random_values = frame[(frame.family == "random") & (frame.top_n == top_n)].normalized_recovery
+                retrieval_patch_rows.append(
+                    {
+                        "role": "interior k" if query_role == "interior" else "final k=n",
+                        "bin": count_bin,
+                        "heads": top_n,
+                        "ranked": fmt(ranked),
+                        "random": fmt(random_values.mean()),
+                        "range": f"{fmt(random_values.min())} to {fmt(random_values.max())}",
+                    }
+                )
+
+    count_transport_rows = []
+    for mode, label in (("nonthinking", "non-thinking broad"), ("thinking", "CoT trace readout")):
+        for count_bin in COUNT_BINS:
+            frame = nested[(nested["mode"] == mode) & (nested.count_bin == count_bin)]
+            for top_n in (1, 2, 4, 8):
+                ranked = frame[(frame.family == "primary_top") & (frame.top_n == top_n)].slope.mean()
+                random_values = frame[(frame.family == "random") & (frame.top_n == top_n)].slope
+                count_transport_rows.append(
+                    {
+                        "mechanism": label,
+                        "bin": count_bin,
+                        "heads": top_n,
+                        "slope": fmt(ranked),
+                        "random": fmt(random_values.mean()),
+                        "range": f"{fmt(random_values.min())} to {fmt(random_values.max())}",
+                    }
+                )
+    retrieval_patch_lookup = {
+        (row["role"], row["bin"], row["heads"]): row for row in retrieval_patch_rows
+    }
+
+    successor_patch_rows: list[dict[str, object]] = []
+    successor_patch_lookup: dict[tuple[str, str, int, str], dict[str, object]] = {}
+    successor_direction_labels = {
+        "continue_into_close": "continue → close receiver",
+        "close_into_continue": "close → continue receiver",
+    }
+    successor_family_labels = {
+        "successor_top": "successor-score ranked",
+        "targeted_top": "k-to-k targeted ranked",
+        "successor_wrong_row": "successor heads / wrong donor row",
+    }
+    for direction, direction_label in successor_direction_labels.items():
+        for count_bin in COUNT_BINS:
+            frame = successor_summary[
+                (successor_summary["direction"] == direction)
+                & (successor_summary["count_bin"] == count_bin)
+            ]
+            for top_n in (1, 2, 4, 8):
+                random = frame[
+                    (frame["family"] == "random") & (frame["top_n"] == top_n)
+                ]
+                random_recovery = random["normalized_recovery"]
+                random_accuracy = random["patched_target_correct"]
+                for family, family_label in successor_family_labels.items():
+                    selected = frame[
+                        (frame["family"] == family) & (frame["top_n"] == top_n)
+                    ]
+                    if selected.empty:
+                        continue
+                    row = {
+                        "direction": direction_label,
+                        "bin": count_bin,
+                        "heads": top_n,
+                        "family": family_label,
+                        "recovery": fmt(selected["normalized_recovery"].mean()),
+                        "accuracy": pct(selected["patched_target_correct"].mean()),
+                        "random_recovery": fmt(random_recovery.mean()),
+                        "random_recovery_range": (
+                            f"{fmt(random_recovery.min())} to {fmt(random_recovery.max())}"
+                        ),
+                        "random_accuracy": pct(random_accuracy.mean()),
+                    }
+                    successor_patch_rows.append(row)
+                    successor_patch_lookup[(direction, count_bin, top_n, family)] = row
+
+    def successor_value(
+        direction: str,
+        count_bin: str,
+        top_n: int,
+        family: str,
+        field: str,
+    ) -> str:
+        return str(successor_patch_lookup[(direction, count_bin, top_n, family)][field])
+
+    conversion_labels = {
+        "continue_into_close": "continue evidence → close receiver",
+        "close_into_continue": "close evidence → continue receiver",
+    }
+    successor_conversion_rows = []
+    for direction, direction_label in conversion_labels.items():
+        for count_bin in COUNT_BINS:
+            for layer in (2, 3):
+                frame = successor_conversion[
+                    (successor_conversion["direction"] == direction)
+                    & (successor_conversion["count_bin"] == count_bin)
+                    & (successor_conversion["layer"] == layer)
+                ].set_index("intervention")
+                direct = float(frame.loc["attn_direct_residual", "normalized_recovery"])
+                native = float(frame.loc["attn_native_mlp", "normalized_recovery"])
+                mlp_only = float(frame.loc["mlp_out_only", "normalized_recovery"])
+                full = float(frame.loc["post_mlp_state", "normalized_recovery"])
+                successor_conversion_rows.append(
+                    {
+                        "direction": direction_label,
+                        "bin": count_bin,
+                        "layer": f"Layer {layer + 1}",
+                        "attn_direct": fmt(direct),
+                        "native_mlp": fmt(native),
+                        "mlp_mediation": fmt(native - direct),
+                        "mlp_only": fmt(mlp_only),
+                        "full_state": fmt(full),
+                        "direct_accuracy": pct(frame.loc["attn_direct_residual", "patched_target_correct"]),
+                        "native_accuracy": pct(frame.loc["attn_native_mlp", "patched_target_correct"]),
+                        "mlp_accuracy": pct(frame.loc["mlp_out_only", "patched_target_correct"]),
+                    }
+                )
+
+    successor_stage_rows = []
+    stage_continue = successor_stage[successor_stage["direction"] == "continue_into_close"]
     for count_bin in COUNT_BINS:
-        retrieval_top4 = retrieval[
-            (retrieval.family == "targeted_top")
-            & (retrieval.query_role == "final")
-            & (retrieval.count_bin == count_bin)
-            & (retrieval.top_n == 4)
-        ].normalized_recovery.mean()
-        direct_top4 = select_row(
-            nested,
-            mode="nonthinking",
-            family="primary_top",
-            replicate=0,
+        for layer in (2, 3):
+            frame = stage_continue[
+                (stage_continue["count_bin"] == count_bin)
+                & (stage_continue["layer"] == layer)
+            ].set_index("stage")
+            successor_stage_rows.append(
+                {
+                    "bin": count_bin,
+                    "layer": f"Layer {layer + 1}",
+                    "attn_component": fmt(frame.loc["attn_out", "evidence_gap"]),
+                    "mlp_component": fmt(frame.loc["mlp_out", "evidence_gap"]),
+                    "post_attn_gap": fmt(frame.loc["post_attn", "evidence_gap"]),
+                    "post_mlp_gap": fmt(frame.loc["post_mlp", "evidence_gap"]),
+                }
+            )
+
+    successor_pairs_per_direction = int(
+        successor_conversion[
+            (successor_conversion["direction"] == "continue_into_close")
+            & (successor_conversion["intervention"] == "post_mlp_state")
+            & (successor_conversion["layer"] == 3)
+        ]["n_pairs"].sum()
+    )
+
+    def conversion_value(
+        direction: str,
+        count_bin: str,
+        layer: int,
+        intervention: str,
+        field: str = "normalized_recovery",
+    ) -> str:
+        row = select_row(
+            successor_conversion,
+            direction=direction,
             count_bin=count_bin,
-            top_n=4,
+            layer=layer,
+            intervention=intervention,
         )
-        cot_top4 = select_row(
-            nested,
-            mode="thinking",
-            family="primary_top",
-            replicate=0,
+        return pct(row[field]) if field == "patched_target_correct" else fmt(row[field])
+
+    mlp_direction_labels = {
+        "continue_into_close": "continue evidence → close receiver",
+        "close_into_continue": "close evidence → continue receiver",
+    }
+
+    def mlp_feature_value(
+        direction: str,
+        count_bin: str,
+        layer: int,
+        family: str,
+        support_size: int,
+        field: str = "normalized_recovery",
+    ) -> str:
+        row = select_row(
+            mlp_feature_summary,
+            direction=direction,
             count_bin=count_bin,
-            top_n=4,
+            layer=layer,
+            family=family,
+            support_size=support_size,
         )
-        patch_rows.append(
-            {
-                "bin": count_bin,
-                "retrieval": fmt(retrieval_top4),
-                "direct": fmt(direct_top4.slope),
-                "cot": fmt(cot_top4.slope),
-            }
+        return pct(row[field]) if field == "patched_target_correct" else fmt(row[field])
+
+    mlp_feature_rows = []
+    for direction, direction_label in mlp_direction_labels.items():
+        for count_bin in COUNT_BINS:
+            for layer in (2, 3):
+                for support_size in (64, 256):
+                    mlp_feature_rows.append(
+                        {
+                            "direction": direction_label,
+                            "bin": count_bin,
+                            "layer": f"Layer {layer + 1}",
+                            "features": support_size,
+                            "ranked_recovery": mlp_feature_value(
+                                direction,
+                                count_bin,
+                                layer,
+                                "ranked_feature_replacement",
+                                support_size,
+                            ),
+                            "sparse_recovery": mlp_feature_value(
+                                direction,
+                                count_bin,
+                                layer,
+                                "sparse_mean_direction",
+                                support_size,
+                            ),
+                            "random_recovery": mlp_feature_value(
+                                direction,
+                                count_bin,
+                                layer,
+                                "random_feature_replacement",
+                                support_size,
+                            ),
+                            "ranked_accuracy": mlp_feature_value(
+                                direction,
+                                count_bin,
+                                layer,
+                                "ranked_feature_replacement",
+                                support_size,
+                                "patched_target_correct",
+                            ),
+                        }
+                    )
+
+    mlp_fit_pairs_per_direction = 29 * int(mlp_feature_manifest["fit_examples_per_k"])
+    mlp_eval_pairs_per_direction = 29 * int(mlp_feature_manifest["eval_examples_per_k"])
+
+    def stage_gap(count_bin: str, layer: int, stage: str) -> str:
+        row = select_row(
+            stage_continue,
+            count_bin=count_bin,
+            layer=layer,
+            stage=stage,
         )
+        return fmt(row.evidence_gap, 2)
+
+    count_transport_lookup = {
+        (row["mechanism"], row["bin"], row["heads"]): row for row in count_transport_rows
+    }
+    direct_transport_rows = [row for row in count_transport_rows if row["mechanism"] == "non-thinking broad"]
+    cot_transport_rows = [row for row in count_transport_rows if row["mechanism"] == "CoT trace readout"]
+    successor_table_rows = [row for row in successor_patch_rows if row["heads"] == 4]
+    patch_rows = retrieval_patch_rows
 
     steering_rows = []
     for count_bin in COUNT_BINS:
@@ -1952,6 +2960,142 @@ def build_report(run_dir: Path) -> Path:
                     "r2": fmt(row.r2),
                 }
             )
+
+    path_site_labels = {
+        "nonthinking_final_answer": "non-thinking natural final",
+        "thinking_final_answer": "CoT natural final",
+        "thinking_fixed_trace_answer": "CoT counterfactual fixed-15 final",
+    }
+
+    def path_metric(
+        site: str,
+        count_bin: str,
+        method: str,
+        field: str,
+        *,
+        layer: int = 3,
+        alpha: float | None = None,
+    ) -> float:
+        frame = geometry_path_regression[
+            (geometry_path_regression.site == site)
+            & (geometry_path_regression.count_bin == count_bin)
+            & (geometry_path_regression.layer == layer)
+            & (geometry_path_regression.method == method)
+        ]
+        if alpha is not None:
+            frame = frame[np.isclose(frame.alpha.astype(float), float(alpha))]
+        if frame.empty:
+            return math.nan
+        return float(frame.iloc[0][field])
+
+    adjacent_transport_rows = []
+    for site, label in path_site_labels.items():
+        for count_bin in COUNT_BINS:
+            adjacent_transport_rows.append(
+                {
+                    "site": label,
+                    "bin": count_bin,
+                    "full_slope": fmt(
+                        path_metric(
+                            site,
+                            count_bin,
+                            "adjacent_centroid_transplant",
+                            "transport_slope",
+                        )
+                    ),
+                    "delta_slope": fmt(
+                        path_metric(
+                            site,
+                            count_bin,
+                            "adjacent_delta_transport",
+                            "transport_slope",
+                        )
+                    ),
+                    "delta_r2": fmt(
+                        path_metric(
+                            site,
+                            count_bin,
+                            "adjacent_delta_transport",
+                            "transport_r2",
+                        )
+                    ),
+                    "delta_mae": fmt(
+                        path_metric(
+                            site,
+                            count_bin,
+                            "adjacent_delta_transport",
+                            "path_tracking_mae",
+                        )
+                    ),
+                }
+            )
+
+    nonadjacent_path_rows = []
+    for site in ("nonthinking_final_answer", "thinking_final_answer"):
+        for count_bin in COUNT_BINS:
+            nonadjacent_path_rows.append(
+                {
+                    "site": path_site_labels[site],
+                    "bin": count_bin,
+                    "chord_slope": fmt(
+                        path_metric(
+                            site,
+                            count_bin,
+                            "nonadjacent_chord_transport",
+                            "transport_slope",
+                            alpha=0.5,
+                        )
+                    ),
+                    "chord_r2": fmt(
+                        path_metric(
+                            site,
+                            count_bin,
+                            "nonadjacent_chord_transport",
+                            "transport_r2",
+                            alpha=0.5,
+                        )
+                    ),
+                    "chord_mae": fmt(
+                        path_metric(
+                            site,
+                            count_bin,
+                            "nonadjacent_chord_transport",
+                            "path_tracking_mae",
+                            alpha=0.5,
+                        )
+                    ),
+                    "curve_slope": fmt(
+                        path_metric(
+                            site,
+                            count_bin,
+                            "nonadjacent_curve_transport",
+                            "transport_slope",
+                            alpha=0.5,
+                        )
+                    ),
+                    "curve_r2": fmt(
+                        path_metric(
+                            site,
+                            count_bin,
+                            "nonadjacent_curve_transport",
+                            "transport_r2",
+                            alpha=0.5,
+                        )
+                    ),
+                    "curve_mae": fmt(
+                        path_metric(
+                            site,
+                            count_bin,
+                            "nonadjacent_curve_transport",
+                            "path_tracking_mae",
+                            alpha=0.5,
+                        )
+                    ),
+                }
+            )
+
+    endpoint_sanity = geometry_path_manifest["endpoint_sanity"]
+    geometry_path_examples_per_count = int(geometry_path_manifest["examples_per_count"])
 
     pca_rows = []
     for site, label in (
@@ -2072,7 +3216,7 @@ def build_report(run_dir: Path) -> Path:
         {"item": "non-thinking sequence", "value": "<BOS> prompt[256] <Ans> <n> <EOS>；只监督最终 count 与 EOS。"},
         {"item": "CoT sequence", "value": "<BOS> prompt[256] <Think> <1> M1 ... <n> Mn </Think> <Ans> <n> <EOS>；trace index 与答案共享同一套 number tokens。"},
         {"item": "训练", "value": f"每个模型 {config['train_steps']} steps；batch={config['batch_size']}；AdamW lr={config['lr']}；warmup={config['warmup_steps']}；weight decay={config['weight_decay']}；seed={config['seed']}。"},
-        {"item": "正式 ablation", "value": f"每个 exact count {manifest['ablation_examples_per_exact_count']} 个新 prompts，共 {30*manifest['ablation_examples_per_exact_count']} 个；16 个单头；top-1 至 top-16；bottom 与 {manifest['ablation_random_orders']} 个随机顺序。"},
+        {"item": "正式 ablation", "value": f"每个 exact count {manifest['ablation_examples_per_exact_count']} 个新 prompts，共 {30*manifest['ablation_examples_per_exact_count']} 个；16 个单头；top-1 至 top-16；与固定随机删除路径、逐步随机均值、min–max 和 random-4 mean 比较。"},
         {"item": "分层原则", "value": "所有 bin 统计直接从 gold/receiver count 属于该区间的逐样本行重新计算；all-count 不是三个区间均值的均值。"},
     ]
     single_ablation_caption = (
@@ -2509,7 +3653,8 @@ def build_report(run_dir: Path) -> Path:
         <li><b>评估样本。</b>重新生成每个 exact count {manifest['ablation_examples_per_exact_count']} 个 held-out prompts，共 {30 * manifest['ablation_examples_per_exact_count']} 个。每个区间 1–10、11–20、21–30 各含 {10 * manifest['ablation_examples_per_exact_count']} 个样本，因此三栏的样本量与类别数完全相同。</li>
         <li><b>全局 head mask。</b>对 Layer <code>l</code> 的 head <code>h</code>，把 GPT-2 forward 中对应 <code>head_mask[l,h]</code> 设为 0。该 head 在整条 sequence 的<b>所有 query positions</b>都被关闭，而不是只在 <code>&lt;Ans&gt;</code> 或某一个 <code>&lt;k&gt;</code> 关闭；其他 heads、MLP、embedding 和模型参数不变。因而实验能判断“这个 head 是否整体必要”，但不能单独定位它在哪个 query 上发挥作用。</li>
         <li><b>单头消融。</b>16 个 Layer×head 分别单独 mask。报告 <code>accuracy drop = baseline accuracy − masked accuracy</code>；drop=1 表示从 100% 降到 0%，drop=0 表示离散 accuracy 没变。</li>
-        <li><b>累计消融。</b>先按第 5 节定义的分数给 heads 排名，再依次 mask top-1、top-2、…、top-16。Non-thinking 使用 <code>broad_attention_score</code>；CoT 分别使用 <code>k-to-k raw mass</code>、<code>trace_markers_mass</code> 与 successor score。曲线同时与倒序/bottom heads和 {manifest['ablation_random_orders']} 个固定随机顺序比较；只有“高分 top 曲线比 bottom/random 更早下降”才说明该排名捕捉了特异机制。</li>
+        <li><b>累计消融。</b>先按第 5 节定义的分数给 heads 排名，再依次 mask top-1、top-2、…、top-16。Non-thinking 使用 <code>broad_attention_score</code>；CoT 分别使用 <code>k-to-k raw mass</code>、<code>trace_markers_mass</code> 与 successor score。对照只使用预先固定的随机 head 删除路径，不再使用低分或倒序排名。</li>
+        <li><b>随机对照与 random-4 mean。</b>淡灰细线逐条显示每个固定随机删除顺序；深灰线是在同一个 mask 数 <code>n</code> 上对所有随机路径取均值，灰色阴影是随机路径的 min–max。紫色水平虚线 <code>random-4 mean</code> 是随机路径在“恰好删 4 个 heads”时剩余 accuracy 的均值，并横向延伸作为易读参照；它不是一条随 <code>n</code> 变化的额外实验曲线。只有 ranked-top 曲线稳定早于随机路径分布下降，才能说明描述性排名含有超出随机删除的机制信息。</li>
         <li><b>Teacher-forced final-count accuracy。</b>完整 gold prefix 已在输入中；在 <code>&lt;Ans&gt;</code> 位置读取 logits，若 argmax 数字 token 等于 gold count 则正确。CoT 中 gold trace 仍存在于左侧，所以该指标检验“给定正确 trace 后的最终 readout”，不是自由生成整条 trace 的端到端准确率。</li>
         <li><b>Teacher-forced trace-marker accuracy。</b>对 CoT 的每个数字 <code>&lt;k&gt;</code> query，检查其 next-token argmax 是否为 gold marker <code>M_k</code>，再对所有有效 k queries 求平均。后一步仍看到数据中的 gold 早期 trace token；某一步预测错不会被写回上下文并污染后续步骤。</li>
         <li><b>Teacher-forced trace-index accuracy。</b>在 <code>&lt;Think&gt;</code> 或前一个 marker <code>M_(k-1)</code> 的 query 上，检查 next-token argmax 是否为数字 <code>&lt;k&gt;</code>。它测 successor/index 生成，与 marker identity retrieval 是不同子任务。</li>
@@ -2523,7 +3668,7 @@ def build_report(run_dir: Path) -> Path:
 
       <h3>7.3 Non-thinking：early broad heads 对直接 final count 具有强必要性</h3>
       <h4>实验</h4>
-      <p>Non-thinking 没有逐 k trace。我们按第 5 节定义的 <code>broad_attention_score</code> 排序 heads，先逐头 mask，再从 top-1 开始累计 mask；在每个 count 区间都以 non-thinking final-count accuracy 为结果变量，并与 bottom/random 删除顺序比较。</p>
+      <p>Non-thinking 没有逐 k trace。我们按第 5 节定义的 <code>broad_attention_score</code> 排序 heads，先逐头 mask，再从 top-1 开始累计 mask；在每个 count 区间都以 non-thinking final-count accuracy 为结果变量，并与固定随机删除路径、随机均值和 random-4 mean 比较。</p>
       <h4>结果</h4>
       {figure(
           generated['single_nonthinking'],
@@ -2533,10 +3678,10 @@ def build_report(run_dir: Path) -> Path:
       {figure(
           generated['cumulative_nonthinking'],
           'Figure 4B. Non-thinking broad heads 的累计消融剂量曲线',
-          '<b>横轴</b>是累计 global mask 的 head 数，刻度为 1、2、4、8、12、16；<b>纵轴</b>是干预后剩余的绝对 final-count accuracy，范围 0–1。三栏对应三个 count 区间。蓝线按 broad score 从高到低删除，红线按反向排名删除，灰线和阴影是 8 个随机顺序的均值及 min–max；水平虚线是无干预 baseline。'
+          '<b>横轴</b>是累计 global mask 的 head 数，刻度为 1、2、4、8、12、16；<b>纵轴</b>是干预后剩余的绝对 final-count accuracy，范围 0–1。三栏对应三个 count 区间。蓝线按 broad score 从高到低删除；淡灰细线是各条固定随机路径，深灰线是逐步随机均值，灰色阴影是随机 min–max；紫色虚线是恰好随机删 4 个 heads 时的平均 accuracy（random-4 mean）；黑色虚线是无干预 baseline。'
       )}
       {table(ablation_rows,[('bin','count 区间'),('direct_head','最强单头'),('direct_drop','final-count drop')])}
-      {table(cumulative_ablation_rows,[('bin','count 区间'),('direct_top1','broad top-1 后 final accuracy'),('direct_top2','broad top-2 后 final accuracy')])}
+      {table(cumulative_ablation_rows,[('bin','count 区间'),('direct_top1','broad top-1 后 final accuracy'),('direct_top2','broad top-2 后 final accuracy'),('direct_random4','随机删 4 heads 的平均 final accuracy')])}
       <div class="callout good">描述性排名稳定的 <code>L1H3</code> 同时是中高 count 最强的单头因果组件：11–20 的最大 final-accuracy drop 为 <b>{ablation_lookup['11-20']['direct_drop']}</b>，21–30 为 <b>{ablation_lookup['21-30']['direct_drop']}</b>。1–10 的最强单头为 <code>{ablation_lookup['1-10']['direct_head']}</code>，drop 为 <b>{ablation_lookup['1-10']['direct_drop']}</b>。按 broad score 累计 mask top-1 后，三个区间剩余 accuracy 为 <b>{cumulative_ablation_lookup['1-10']['direct_top1']}</b> / <b>{cumulative_ablation_lookup['11-20']['direct_top1']}</b> / <b>{cumulative_ablation_lookup['21-30']['direct_top1']}</b>；累计到 top-2 后为 <b>{cumulative_ablation_lookup['1-10']['direct_top2']}</b> / <b>{cumulative_ablation_lookup['11-20']['direct_top2']}</b> / <b>{cumulative_ablation_lookup['21-30']['direct_top2']}</b>。</div>
       <h4>分析</h4>
       <p>结果支持 Layer 1 broad routing 是 direct counting 的必要入口：同一批早期 heads 既在描述性 attention 中广泛覆盖 prompt needles，又在删除后造成大幅 final-count 损伤。低 count 的最强单头与中高 count 略有差异，说明容易样本有更多可替代路径；但 top-2 累计删除后三段都接近崩溃，说明 broad circuit 整体不是可有可无的伴随现象。</p>
@@ -2553,15 +3698,15 @@ def build_report(run_dir: Path) -> Path:
       {figure(
           generated['cumulative_targeted_trace'],
           'Figure 4D. CoT targeted heads 的累计消融：局部 trace-marker accuracy',
-          '<b>横轴</b>是累计 mask 的 targeted heads 数；<b>纵轴</b>是剩余 teacher-forced trace-marker accuracy。三栏为三个 count 区间；蓝/红/灰分别是 targeted top、bottom 与随机删除顺序。'
+          '<b>横轴</b>是累计 global mask 的 targeted heads 数；<b>纵轴</b>是剩余 teacher-forced trace-marker accuracy。三栏为三个 count 区间。蓝线是 targeted-score ranked top；淡灰细线是各条固定随机删除路径，深灰线是逐步随机均值，灰色阴影是随机 min–max；紫色虚线是 random-4 mean，黑色虚线是无干预 baseline。'
       )}
       {figure(
           generated['cumulative_targeted_final'],
           'Figure 4E. 同一 targeted-head 消融对最终 count readout 的影响',
-          '<b>横轴</b>仍是累计 mask 的 targeted heads 数；<b>纵轴</b>改为给定 gold trace 后的 teacher-forced final-count accuracy。与 Figure 4D 对照可区分“trace marker 已生成失败”与“最终 readout 也失败”。'
+          '<b>横轴</b>仍是累计 global mask 的 targeted heads 数；<b>纵轴</b>改为给定 gold trace 后的 teacher-forced final-count accuracy。蓝线与随机对照的定义同 Figure 4D；紫色虚线是随机删 4 个 heads 时的平均 final accuracy。与 Figure 4D 对照可区分“trace marker 已生成失败”与“最终 readout 也失败”。'
       )}
       {table(ablation_rows,[('bin','count 区间'),('trace_head','最强 trace 单头'),('trace_drop','trace-marker drop')])}
-      {table(cumulative_ablation_rows,[('bin','count 区间'),('target_trace_top1','target top-1 后 trace'),('target_trace_top4','top-4 后 trace'),('target_trace_top8','top-8 后 trace'),('target_final_top8','同一 top-8 后 final')])}
+      {table(cumulative_ablation_rows,[('bin','count 区间'),('target_trace_top1','target top-1 后 trace'),('target_trace_top4','top-4 后 trace'),('target_trace_top8','top-8 后 trace'),('target_trace_random4','随机删 4 heads 的平均 trace'),('target_final_top8','同一 top-8 后 final'),('target_final_random4','随机删 4 heads 的平均 final')])}
       <div class="callout good">第 5 节 raw k-to-k mass 最高的是 <code>L4H2</code>，其次包括 <code>L3H1</code> 和 <code>L3H0</code>；但三个区间中，单头 mask 后 trace-marker drop 最大的都是 <code>{ablation_lookup['1-10']['trace_head']}</code> 一类早期 heads，最大 drop 分别为 <b>{ablation_lookup['1-10']['trace_drop']}</b> / <b>{ablation_lookup['11-20']['trace_drop']}</b> / <b>{ablation_lookup['21-30']['trace_drop']}</b>。只删 targeted top-1 时，三个区间的 trace-marker accuracy 仍为 <b>{cumulative_ablation_lookup['1-10']['target_trace_top1']}</b> / <b>{cumulative_ablation_lookup['11-20']['target_trace_top1']}</b> / <b>{cumulative_ablation_lookup['21-30']['target_trace_top1']}</b>；删 top-4 后降到 <b>{cumulative_ablation_lookup['1-10']['target_trace_top4']}</b> / <b>{cumulative_ablation_lookup['11-20']['target_trace_top4']}</b> / <b>{cumulative_ablation_lookup['21-30']['target_trace_top4']}</b>，删 top-8 后进一步降到 <b>{cumulative_ablation_lookup['1-10']['target_trace_top8']}</b> / <b>{cumulative_ablation_lookup['11-20']['target_trace_top8']}</b> / <b>{cumulative_ablation_lookup['21-30']['target_trace_top8']}</b>。同一 top-8 干预下，final-count accuracy 仍为 <b>{cumulative_ablation_lookup['1-10']['target_final_top8']}</b> / <b>{cumulative_ablation_lookup['11-20']['target_final_top8']}</b> / <b>{cumulative_ablation_lookup['21-30']['target_final_top8']}</b>。</div>
       <h4>分析</h4>
       <p>“最尖锐地指向 matching needle”与“单独删除时最不可替代”不是同一性质。top-1 几乎无损、top-4 开始下降、top-8 接近崩溃，说明 targeted retrieval 由多枚可互补的 routing heads 共同实现，而不是一枚唯一的“第 k 个 needle head”。final count 仍稳定也不能解释为 trace 无用：teacher-forced 输入已经给出 gold marker tokens，最终 <code>&lt;Ans&gt;</code> 可以绕过被损坏的生成步骤直接读取正确 trace。检验自由生成中的级联失败仍需要 autoregressive ablation。</p>
@@ -2578,55 +3723,55 @@ def build_report(run_dir: Path) -> Path:
       {figure(
           generated['cumulative_readout_final'],
           'Figure 4G. CoT trace-readout heads 的累计消融剂量曲线',
-          '<b>横轴</b>是按 <code>trace_markers_mass</code> 排名后累计 mask 的 head 数；<b>纵轴</b>是剩余 teacher-forced final-count accuracy。三栏为三个 count 区间；蓝线是 readout top 排名，灰线和阴影是随机顺序均值及 min–max。'
+          '<b>横轴</b>是按 <code>trace_markers_mass</code> 排名后累计 global mask 的 head 数；<b>纵轴</b>是剩余 teacher-forced final-count accuracy。三栏为三个 count 区间。蓝线是 readout ranked top；淡灰细线、深灰均值线与灰色 min–max 阴影给出随机删除分布；紫色虚线是 random-4 mean，黑色虚线是无干预 baseline。'
       )}
       {table(ablation_rows,[('bin','count 区间'),('cot_final_head','最强 final 单头'),('cot_final_drop','final-count drop')])}
-      {table(cumulative_ablation_rows,[('bin','count 区间'),('readout_final_top4','readout top-4 后 final'),('readout_final_top8','readout top-8 后 final')])}
+      {table(cumulative_ablation_rows,[('bin','count 区间'),('readout_final_top4','readout top-4 后 final'),('readout_final_top8','readout top-8 后 final'),('readout_final_random4','随机删 4 heads 的平均 final')])}
       <div class="callout">描述性 readout ranking 以前列 <code>L2H3</code>、<code>L2H2</code>、<code>L4H1</code>、<code>L4H0</code> 为主，与 k-to-k targeted ranking 不同。删 readout top-4 后，三个区间的 final-count accuracy 为 <b>{cumulative_ablation_lookup['1-10']['readout_final_top4']}</b> / <b>{cumulative_ablation_lookup['11-20']['readout_final_top4']}</b> / <b>{cumulative_ablation_lookup['21-30']['readout_final_top4']}</b>；删 top-8 后为 <b>{cumulative_ablation_lookup['1-10']['readout_final_top8']}</b> / <b>{cumulative_ablation_lookup['11-20']['readout_final_top8']}</b> / <b>{cumulative_ablation_lookup['21-30']['readout_final_top8']}</b>。累计曲线并不严格单调。</div>
       <h4>分析</h4>
       <p>Targeted retrieval 与 final trace readout 是两个不同阶段的候选 circuit。低 count 在 readout 删除下更早受损，中高 count 仍保留明显冗余；非单调曲线则说明 global mask 同时改变了多个相互补偿或竞争的通路，所以不能把“再增加一枚被 mask head”带来的边际差当作该 head 的独立贡献。第 8 节需要把 patch 限定在 <code>&lt;Ans&gt;</code> query，才能进一步确认 readout activation 是否足以搬运 count 信息。</p>
 
       <h3>7.6 Position-local ablation：把“哪个 head”与“在哪个 query 起作用”分开</h3>
       <h4>实验</h4>
-      <p>前面的 global mask 会关闭一枚 head 在整条 sequence 的所有输出，因此 reverse/bottom 顺序如果更早选到 Layer 1 heads，就可能比 targeted top 顺序更快破坏网络，即使这些 Layer 1 heads 在数字 <code>&lt;k&gt;</code> query 上没有较高 k-to-k mass。为去除这个混淆，本实验直接 hook 每层 attention 的 <code>c_proj</code> 输入；这个张量仍按四个 head slices 拼接。对选中的 head，只把指定语义 query 行对应的 64 维 slice 置零，其余 token positions、其余 heads、MLP 与参数全部保持原值。</p>
+      <p>前面的 global mask 会关闭一枚 head 在整条 sequence 的所有输出，因此任何累计顺序都可能混入 Layer 构成与非目标 token positions 上的上游作用。为把“哪个 head”与“在哪个 query 起作用”分开，本实验直接 hook 每层 attention 的 <code>c_proj</code> 输入；这个张量仍按四个 head slices 拼接。对选中的 head，只把指定语义 query 行对应的 64 维 slice 置零，其余 token positions、其余 heads、MLP 与参数全部保持原值。</p>
       <div class="protocol"><ol>
         <li><b>Non-thinking broad。</b>只在最终 <code>&lt;Ans&gt;</code> query 屏蔽 selected head outputs，测 final-count accuracy；同一 heads 在 prompt token 上的作用不受影响。</li>
         <li><b>CoT targeted retrieval。</b>只在所有 gold trace 数字 <code>&lt;k&gt;</code> queries 屏蔽 selected head outputs，测下一 token 是否为正确 <code>M_k</code> 的 trace-marker accuracy；marker、successor 和最终 <code>&lt;Ans&gt;</code> rows 不直接被 mask。</li>
         <li><b>CoT trace readout。</b>只在最终 <code>&lt;Ans&gt;</code> query 屏蔽 selected head outputs，测给定 gold trace 后的 final-count accuracy；trace 生成 rows 不受影响。</li>
-        <li><b>严格同层对照。</b><code>same-layer low</code> 与 <code>same-layer random</code> 在累计第 t 步都使用与 ranked-top 第 t 步相同的 Layer，只在该 Layer 内换成低分或随机 head。因此每个 prefix 的 Layer 组成完全相同，差异不能再归因于“一个顺序先删 Layer 1、另一个先删 Layer 3/4”。红色 reverse curve 仍保留为旧式、Layer 分布混淆的对照，不作为 top-vs-bottom 的严格检验。</li>
+        <li><b>严格同层随机对照。</b><code>same-layer random</code> 在累计第 t 步使用与 ranked-top 第 t 步相同的 Layer，只在该 Layer 内随机选择尚未删除的 head。因此每个 prefix 的 Layer 组成与 ranked-top 完全相同，差异不能再归因于“一个顺序先删 Layer 1、另一个先删 Layer 3/4”。图中逐条显示固定随机路径、逐步均值和 min–max；紫色 random-4 mean 表示同层随机路径在恰好删 4 个 heads 时的平均剩余 accuracy。</li>
       </ol></div>
 
       <h4>结果 A：Non-thinking broad heads，仅在 &lt;Ans&gt; 局部屏蔽</h4>
       {figure(
           generated['local_nonthinking'],
           'Figure 4H. Position-local non-thinking broad-head ablation',
-          '<b>横轴</b>是累计只在 <code>&lt;Ans&gt;</code> query 屏蔽的 head 数；<b>纵轴</b>是剩余 teacher-forced final-count accuracy。三栏为 count 1–10、11–20、21–30。蓝=按 broad score 排名；红虚线=旧 reverse 排名（Layer-confounded）；橙点划线=保持蓝线 Layer 序列、但在同层选低分 heads；灰线/阴影=保持同一 Layer 序列的 8 个同层随机顺序的均值与 min–max；黑色点线=无干预 baseline。'
+          '<b>横轴</b>是累计只在 <code>&lt;Ans&gt;</code> query 屏蔽的 head 数；<b>纵轴</b>是剩余 teacher-forced final-count accuracy。三栏为 count 1–10、11–20、21–30。蓝线按 broad score 排名；淡灰细线是保持相同 Layer 序列的各条随机路径，深灰线是逐步随机均值，灰色阴影是随机 min–max；紫色虚线是同层 random-4 mean，黑色点线是无干预 baseline。'
       )}
-      {table(position_local_direct_rows,[('bin','count 区间'),('top_n','局部 mask 数'),('ranked_top','broad top'),('reverse','reverse（层混淆）'),('same_layer_low','同层 low'),('same_layer_random','同层 random 均值')])}
+      {table(position_local_direct_rows,[('bin','count 区间'),('top_n','局部 mask 数'),('ranked_top','broad ranked top'),('same_layer_random','同层 random 均值'),('random4_reference','同层 random-4 mean')])}
       <h4>分析 A</h4>
-      <p>局部结果确认了 broad score 在最终答案 query 上具有同层内的特异性，但效应随 count 难度变化。只屏蔽 broad top-1 后，1–10 / 11–20 / 21–30 的 final-count accuracy 分别只剩 <b>12.5% / 11.3% / 68.8%</b>；严格同层 low control 分别为 <b>1.3% / 73.8% / 100.0%</b>，同层 random 均值为 <b>2.7% / 65.5% / 99.5%</b>。因此中高 count 下，broad top 比同层 low/random 更早造成损伤；低 count 的 Layer-1 heads 普遍重要，top 与同层 control 都接近崩溃。累计到同一 Layer 序列中的 top-2 后，三段 accuracy 为 <b>3.8% / 17.5% / 10.0%</b>，而旧 reverse 顺序仍为 <b>90.0% / 100.0% / 88.8%</b>。这说明旧 global bottom 曲线的异常不能解释成“低 broad-score heads 在答案位置更重要”；它主要混入了这些 heads 在整条序列其他位置的上游作用。</p>
+      <p>局部结果显示 broad score 在最终答案 query 上的特异性随 count 难度变化。只屏蔽 broad top-1 后，1–10 / 11–20 / 21–30 的 final-count accuracy 分别只剩 <b>12.5% / 11.3% / 68.8%</b>；同层 random 均值为 <b>2.7% / 65.5% / 99.5%</b>。因此中高 count 下，ranked top 比同层随机删除更早造成损伤；低 count 下随机删除同层 Layer-1 head 也常导致崩溃，说明该区间存在广泛的早层脆弱性，不能把 top-1 差异解释成排名特异性。累计 top-2 后三段 accuracy 为 <b>3.8% / 17.5% / 10.0%</b>。应结合灰色随机分布和 random-4 mean 判断 ranked curve 是否异常，而不是与人为构造的低分顺序比较。</p>
 
       <h4>结果 B：CoT targeted heads，仅在 trace 数字 &lt;k&gt; 局部屏蔽</h4>
       {figure(
           generated['local_targeted'],
           'Figure 4I. Position-local CoT targeted-retrieval ablation',
-          '<b>横轴</b>是累计在所有 trace 数字 <code>&lt;k&gt;</code> queries 局部屏蔽的 head 数；<b>纵轴</b>是剩余 teacher-forced trace-marker accuracy。颜色和对照定义与 Figure 4H 相同。它直接回答 matching-needle 高分 heads 在产生 <code>M_k</code> 的 query 上是否比同层低分/随机 heads 更必要。'
+          '<b>横轴</b>是累计在所有 trace 数字 <code>&lt;k&gt;</code> queries 局部屏蔽的 head 数；<b>纵轴</b>是剩余 teacher-forced trace-marker accuracy。颜色和随机对照定义与 Figure 4H 相同。它直接回答 matching-needle 高分 heads 在产生 <code>M_k</code> 的 query 上是否比相同 Layer 构成的随机 heads 更必要。'
       )}
-      {table(position_local_targeted_rows,[('bin','count 区间'),('top_n','局部 mask 数'),('ranked_top','targeted top'),('reverse','reverse（层混淆）'),('same_layer_low','同层 low'),('same_layer_random','同层 random 均值')])}
+      {table(position_local_targeted_rows,[('bin','count 区间'),('top_n','局部 mask 数'),('ranked_top','targeted ranked top'),('same_layer_random','同层 random 均值'),('random4_reference','同层 random-4 mean')])}
       <h4>分析 B</h4>
-      <p>这是对“bottom 为什么比 top 更显著”的直接校正。Position-local + same-layer control 让每个累计步拥有完全相同的 Layer 序列后，targeted top 的损伤明显早于同层 low/random：局部屏蔽 top-4 后，三个区间的 trace-marker accuracy 为 <b>76.8% / 65.9% / 61.7%</b>；同层 low 为 <b>99.3% / 99.7% / 99.5%</b>，同层 random 均值为 <b>96.4% / 96.7% / 94.0%</b>。Top-1 单头仍是冗余的，三个区间均保持 100%；top-2 后开始降至 <b>96.1% / 92.1% / 90.6%</b>。这支持 k-to-k mass 定位的是一组在数字 <code>&lt;k&gt;</code> query 上具有特异局部因果作用、但成员可相互补偿的 retrieval circuit，而不是唯一一枚“第 k 个 needle head”。屏蔽到 top-8 时各同层排序最终覆盖同一批 heads，三条对照共同崩溃，因此该端点不能用于比较排名优劣。</p>
+      <p>Position-local + same-layer random control 让每个累计步拥有完全相同的 Layer 序列。局部屏蔽 ranked top-4 后，三个区间的 trace-marker accuracy 为 <b>76.8% / 65.9% / 61.7%</b>，而同层 random 均值为 <b>96.4% / 96.7% / 94.0%</b>。Top-1 后三个区间均保持 100%，top-2 后开始降至 <b>96.1% / 92.1% / 90.6%</b>。这支持 k-to-k mass 定位的是一组在数字 <code>&lt;k&gt;</code> query 上具有特异局部因果作用、但成员可相互补偿的 retrieval circuit，而不是唯一一枚“第 k 个 needle head”。屏蔽到 top-8 时不同路径覆盖的 head 集合高度重叠，端点不再适合比较排序优劣，重点应放在早期剂量相对随机分布的下降速度。</p>
 
       <h4>结果 C：CoT trace-readout heads，仅在 &lt;Ans&gt; 局部屏蔽</h4>
       {figure(
           generated['local_readout'],
           'Figure 4J. Position-local CoT trace-readout ablation',
-          '<b>横轴</b>是累计只在最终 <code>&lt;Ans&gt;</code> query 屏蔽的 head 数；<b>纵轴</b>是给定 gold trace 后的 teacher-forced final-count accuracy。蓝线按 <code>trace_markers_mass</code> 排名；橙/灰是严格同层 low/random 对照。'
+          '<b>横轴</b>是累计只在最终 <code>&lt;Ans&gt;</code> query 屏蔽的 head 数；<b>纵轴</b>是给定 gold trace 后的 teacher-forced final-count accuracy。蓝线按 <code>trace_markers_mass</code> 排名；淡灰随机路径、深灰均值、灰色 min–max 和紫色 random-4 mean 构成严格同层随机对照。'
       )}
-      {table(position_local_readout_rows,[('bin','count 区间'),('top_n','局部 mask 数'),('ranked_top','readout top'),('reverse','reverse（层混淆）'),('same_layer_low','同层 low'),('same_layer_random','同层 random 均值')])}
+      {table(position_local_readout_rows,[('bin','count 区间'),('top_n','局部 mask 数'),('ranked_top','readout ranked top'),('same_layer_random','同层 random 均值'),('random4_reference','同层 random-4 mean')])}
       <h4>分析 C</h4>
-      <p>该实验把 readout 干预限制到最终答案 row，因此不会直接破坏前面的 trace construction。结果显示 readout 的局部表示比 retrieval 更冗余：累计屏蔽 top-4 时三个区间仍全部为 <b>100%</b>；到 top-8 时才变为 <b>56.2% / 90.0% / 100.0%</b>。同层 random 在 top-8 的均值为 <b>70.8% / 91.3% / 100.0%</b>，同层 low 仍为 100%。这给出低 count 上有限的 readout-score 特异性，但中高 count 下尚不能证明前八枚 readout heads 的局部必要性。零消融仍只检验必要性，不检验某个 clean head output 是否足以恢复 corrupt count；充分性需要第 8 节的 query-local clean-to-corrupt patch。</p>
+      <p>该实验把 readout 干预限制到最终答案 row，因此不会直接破坏前面的 trace construction。结果显示 readout 的局部表示比 retrieval 更冗余：累计屏蔽 top-4 时三个区间仍全部为 <b>100%</b>；到 top-8 时才变为 <b>56.2% / 90.0% / 100.0%</b>，同层 random 在 top-8 的均值为 <b>70.8% / 91.3% / 100.0%</b>。这给出低 count 上有限的 readout-score 特异性，但中高 count 下尚不能证明前八枚 readout heads 的局部必要性。零消融仍只检验必要性，不检验某个 clean head output 是否足以恢复 corrupt count；充分性需要第 8 节的 query-local clean-to-corrupt patch。</p>
 
-      <div class="callout warn"><b>修正后的结论边界。</b>原先“bottom 比 top 更伤”的 global 曲线不能直接反驳 targeted retrieval，因为它同时改变了 Layer 前缀与所有 token positions。严格的 position-local 结果显示：targeted top-4 在三个 count 区间都比同层低分/随机 heads 更早损伤 marker retrieval；broad top 的同层特异性主要出现在 11–20 与 21–30，低 count 则表现为同层 Layer-1 heads 普遍必要。Global 曲线仍可说明某些 heads 对整条网络必要，但不能用来判断它们究竟在 retrieval、早期支持计算，还是最终 readout 位置发挥作用。</div>
+      <div class="callout warn"><b>修正后的结论边界。</b>严格的 position-local 结果显示：targeted ranked top-4 在三个 count 区间都比相同 Layer 构成的随机 heads 更早损伤 marker retrieval；broad ranked top 的同层特异性主要出现在 11–20 与 21–30，低 count 则表现为同层 Layer-1 heads 普遍必要。Global 曲线仍可说明某些 heads 对整条网络必要，但不能用来判断它们究竟在 retrieval、早期支持计算，还是最终 readout 位置发挥作用。因此第 7 节仅以固定随机路径、随机均值、随机范围和 random-4 mean 作为比较基线。</div>
 
       <h3>7.7 描述性 attention score 与因果 drop 是否一致</h3>
       <h4>实验</h4>
@@ -2658,6 +3803,282 @@ def build_report(run_dir: Path) -> Path:
         <div class="mechanism"><h3>Non-thinking</h3><p><b>当前支持：</b>Layer 1 broad heads 既有描述性 prompt-wide attention，也有强单头/累计必要性；它们很可能是直接 set aggregation 的关键入口。</p><p><b>仍缺：</b>global mask 不能证明这些 heads 把“count 数值”写到了哪里。第 8 节需要在 <code>&lt;Ans&gt;</code> 局部 patch broad-head output，并测 hidden-state/count logits 是否随 donor count 搬运。</p></div>
         <div class="mechanism"><h3>CoT</h3><p><b>当前支持：</b>k-to-k heads 作为一个组对 marker trace 必要，但单头可替代；targeted retrieval 与 final trace readout 是不同阶段、不同排名的多头 circuit。</p><p><b>仍缺：</b>teacher forcing 隔断了局部 trace 错误向最终答案的级联。第 8 节应分别在 <code>&lt;k&gt;</code> 和 <code>&lt;Ans&gt;</code> 做局部 activation patch，并使用 marker-identity margin、next-index margin 与 final-count margin 区分检索、successor 和 readout。</p></div>
       </div>
+    </section>
+    """
+
+    patching_section = f"""
+    <section id="patching">
+      <h2>8. Attention-head patching：候选 head output 是否具有局部因果充分性</h2>
+      <p>第 7 节的 ablation 问的是“移除某个组件会不会坏”，属于<b>必要性</b>证据；本节反过来问“只把 clean/donor 的这个组件放进 corrupt/receiver run，能不能把缺失的信息带回来”，属于<b>局部充分性与信息运输</b>证据。所有 patch 都发生在 attention 的 <code>c_proj</code> 之前：四枚 head 的 value-weighted outputs 仍是四段独立的 64 维 slices；只替换指定 Layer×head、指定 semantic query 的 slice，其他 token rows、其他 heads、MLP、residual stream 和参数保持 receiver/corrupt 值。</p>
+
+      <h3>8.1 共用实验定义：clean/corrupt、donor/receiver 与两种结果量</h3>
+      <div class="protocol"><ol>
+        <li><b>Marker-identity clean-to-corrupt patch。</b>clean 与 corrupt 的 256-token prompt、needle 位置、count、trace 数字和全部上下文长度相同；唯一变化是目标第 k 个 prompt needle 的 marker identity。clean run 需要预测原 marker，corrupt run 在同一位置改成另一 marker。我们在同一个 CoT 数字 <code>&lt;k&gt;</code> query，把 clean 的 selected head-output slices 放进 corrupt run。</li>
+        <li><b>Clean-marker logit margin。</b>在 <code>&lt;k&gt;</code> query 的 next-token logits 中，以 clean marker 的 logit 减去其余 marker token 中最大 logit。margin 为正表示 clean marker 胜过所有 marker competitors；为负表示模型更偏向某个错误 marker。</li>
+        <li><b>Normalized recovery。</b><code>(patched margin − corrupt margin) / (clean margin − corrupt margin)</code>。0 表示 patch 没有把 corrupt 状态拉向 clean；1 表示恢复到 clean margin；大于 1 是过度恢复；小于 0 表示比 corrupt 更差。先对每个 clean/corrupt pair 计算，再在 count 区间内平均。</li>
+        <li><b>Nested donor-to-receiver patch。</b>receiver count 为 n，donor count 为 m；两者共享同一 noise sequence，且较小 count 的 needle 集合严格是较大 count 的子集。合法 offset 为 <code>m−n ∈ ±&#123;1,2,3,5,10&#125;</code>。在各自最终 <code>&lt;Ans&gt;</code> query，把 donor selected head slices 放进 receiver；CoT 因 trace 长度不同，绝对 position 可以不同，但 semantic query 都是最终 answer readout。</li>
+        <li><b>Expected count 与 transport slope。</b>只在 count-token logits 上做 softmax，计算 <code>E[count]=Σ_c c·p(c)</code>。每个 pair 的 causal shift 是 <code>E[count]_patched − E[count]_receiver</code>；在每个 count 区间拟合 <code>shift = a + b(m−n)</code>。纵轴 slope <code>b=1</code> 表示 donor offset 被一比一搬到输出，<code>b=0</code> 表示没有系统 count transport。</li>
+        <li><b>候选与随机对照。</b>蓝线按目标机制的描述性 score 从高到低 patch：CoT retrieval 使用 k-to-k mass，non-thinking 使用 broad score，CoT final readout 使用 trace-marker mass。淡灰细线是三条固定随机 head 顺序；深灰是逐 top-n 随机均值，阴影是 min–max；紫色水平线只是 random top-4 mean 的易读参照。低分/bottom 排名不再作为对照。</li>
+        <li><b>Successor/stop 的 nested pair。</b>对每个 <code>k=1,…,29</code>，构造 short prompt（count=k）和 long prompt（count=k+1）。两者共享同一 noise sequence、前 k 个 needle 的位置与 marker identity；long 只在更晚位置多一个 needle。因此从 <code>&lt;Think&gt;</code> 到第 k 个 marker <code>M_k</code> 的 teacher-forced trace 完全相同，差异只在 prompt 是否还存在第 k+1 个 needle。</li>
+        <li><b>Successor query 与双向 margin。</b>patch row 是 marker <code>M_k</code> 本身：其 next-token decision 在 long prompt 应为 <code>&lt;k+1&gt;</code>，在 short prompt 应为 <code>&lt;/Think&gt;</code>。Continue margin 定义为 <code>z(&lt;k+1&gt;)−z(&lt;/Think&gt;)</code>；close margin 反向定义为 <code>z(&lt;/Think&gt;)−z(&lt;k+1&gt;)</code>。两者均以 margin&gt;0 记为目标决定正确。</li>
+        <li><b>Successor controls。</b><code>successor_top</code> 按 marker query 指向下一 prompt needle 的 raw mass 排序；<code>targeted_top</code> 沿用数字 <code>&lt;k&gt;</code> 的 k-to-k retrieval 排名，检验两个阶段是否共用 heads；<code>wrong donor row</code> 使用相同 successor heads，却把 donor 前一行数字 <code>&lt;k&gt;</code> 的 slice 贴到 receiver 的 <code>M_k</code> row，检验结果是否真的依赖 marker-query activation；另有四条固定随机 head 顺序。</li>
+      </ol></div>
+
+      <h3>8.2 CoT targeted retrieval：在数字 &lt;k&gt; query 恢复正确 marker identity</h3>
+      <h4>实验</h4>
+      <p>每个 exact count 使用 2 个独立 prompts。对每个样本分别选择一个<b>内部步骤</b>（约位于 trace 中部的 k）与<b>最后步骤</b>（k=n）。在 clean/corrupt prompt 中只改对应第 k 个 needle 的 marker identity；随后按第 5 节 k-to-k mass 排名，依次 patch top-1、top-2、top-4、top-8、top-16 clean head slices 到 corrupt 的数字 <code>&lt;k&gt;</code> row。结果变量是 clean-marker normalized recovery，不是离散 accuracy。</p>
+      <h4>结果 A：interior k</h4>
+      {figure(
+          generated['retrieval_interior'],
+          'Figure 5A. Interior &lt;k&gt; 的 marker-identity clean-to-corrupt recovery',
+          '<b>横轴</b>是被局部 patch 的 clean head-output slices 数；<b>纵轴</b>是 clean-marker logit margin 的 normalized recovery，黑实线 0 表示无恢复，黑虚线 1 表示完全恢复。三栏按 gold count 分区。蓝线按 k-to-k score patch top-n；灰线与灰带为随机路径；紫色虚线是随机 top-4 mean。'
+      )}
+      <h4>结果 B：final k=n</h4>
+      {figure(
+          generated['retrieval_final'],
+          'Figure 5B. Final &lt;n&gt; 的 marker-identity clean-to-corrupt recovery',
+          '<b>横纵轴与 Figure 5A 相同，但 query 是 trace 最后一个数字 <code>&lt;n&gt;</code>。它检验 retrieval circuit 是否在 close 之前的最后一次 marker retrieval 上仍工作，而不是 successor/close token 本身。'
+      )}
+      {table(retrieval_patch_rows,[('role','query role'),('bin','gold count 区间'),('heads','patched top-n'),('ranked','targeted recovery'),('random','random mean'),('range','random min–max')])}
+      <h4>分析</h4>
+      <p>单枚最高分 head 并不充分：interior top-1 在三个区间只恢复 <b>{retrieval_patch_lookup[('interior k','1-10',1)]['ranked']}</b> / <b>{retrieval_patch_lookup[('interior k','11-20',1)]['ranked']}</b> / <b>{retrieval_patch_lookup[('interior k','21-30',1)]['ranked']}</b>。但 top-2 立即升到 <b>{retrieval_patch_lookup[('interior k','1-10',2)]['ranked']}</b> / <b>{retrieval_patch_lookup[('interior k','11-20',2)]['ranked']}</b> / <b>{retrieval_patch_lookup[('interior k','21-30',2)]['ranked']}</b>，top-4 达 <b>{retrieval_patch_lookup[('interior k','1-10',4)]['ranked']}</b> / <b>{retrieval_patch_lookup[('interior k','11-20',4)]['ranked']}</b> / <b>{retrieval_patch_lookup[('interior k','21-30',4)]['ranked']}</b>。final k=n 呈现几乎相同的剂量响应，top-4 recovery 为 <b>{retrieval_patch_lookup[('final k=n','1-10',4)]['ranked']}</b> / <b>{retrieval_patch_lookup[('final k=n','11-20',4)]['ranked']}</b> / <b>{retrieval_patch_lookup[('final k=n','21-30',4)]['ranked']}</b>。</p>
+      <div class="callout good"><b>因果结论：</b>k-to-k retrieval 不是由一枚最高分 head 独立完成，而是由一个很小的多头 activation bundle 搬运 marker identity。Top-2 已恢复大部分 clean margin，top-4 在全部 count 区间接近完全恢复；这与第 7 节“单头可替代、成组消融才明显受损”相互吻合。随机 top-4 均值只有约 0.22–0.27，但 min–max 很宽且仅有三条随机路径，因此证据应表述为 ranked top-4 明显高于随机均值，而不是声称胜过每一个随机组合。</div>
+      <p><b>没有检验什么。</b>本实验只在数字 <code>&lt;k&gt;</code> query 检验“下一个 marker identity 是什么”。它没有在 marker <code>M_k</code> query 上 patch，也没有测 <code>&lt;k+1&gt;</code> versus <code>&lt;/Think&gt;</code> 的 next-index/close margin，因此不能回答模型如何从第 k 步推进到第 k+1 步。</p>
+
+      <h3>8.3 CoT successor/stop：在 marker M<sub>k</sub> query 运输“继续还是关闭”证据</h3>
+      <h4>实验</h4>
+      <p>本实验专门补上 Figure 5 没有覆盖的下一步：模型已经在数字 <code>&lt;k&gt;</code> 后检索并生成了 marker <code>M_k</code>，此时它如何决定再输出 <code>&lt;k+1&gt;</code>，还是用 <code>&lt;/Think&gt;</code> 关闭 trace。对每个 <code>k=1,…,29</code>，我们构造一对严格 nested prompts：short receiver 含 k 个 needles，long donor 含 k+1 个 needles；二者共享全部 256 个 noise tokens、前 k 个 needle 的位置与 marker identity，long 只在更晚的一个空位置新增第 k+1 个 needle。因此两条 teacher-forced sequence 从 <code>&lt;Think&gt;</code> 到 <code>M_k</code> 完全相同，只有 prompt 中“是否还有下一个 needle”不同。</p>
+      <div class="protocol"><ol>
+        <li><b>Continue → close receiver。</b>clean/donor 是 long prompt，正确 next token 为 <code>&lt;k+1&gt;</code>；corrupt/receiver 是 short prompt，正确 next token 为 <code>&lt;/Think&gt;</code>。在 receiver 的 <code>M_k</code> query 局部贴入 donor head-output slices，读取 <code>z(&lt;k+1&gt;)−z(&lt;/Think&gt;)</code>。若 patch 把短序列拉向“继续”，该 margin 与 target-decision accuracy 应上升。</li>
+        <li><b>Close → continue receiver。</b>clean/donor 改为 short prompt，corrupt/receiver 改为 long prompt；读取反向 margin <code>z(&lt;/Think&gt;)−z(&lt;k+1&gt;)</code>。这是独立的反向检验，排除某组 heads 只会无条件增加 index logit 的解释。</li>
+        <li><b>Patch 位置。</b>只在 marker <code>M_k</code> 这一行、attention <code>c_proj</code> 之前替换选中 Layer×head 的 64 维 output slice；前面的数字 <code>&lt;k&gt;</code> row、其他 token rows、未选 heads、MLP 与 residual stream 均保持 receiver 值。</li>
+        <li><b>四组排序/对照。</b><code>successor-score ranked</code> 按 <code>M_k</code> query 指向第 k+1 个 prompt needle 的 attention mass 排序；<code>k-to-k targeted ranked</code> 使用上一阶段数字 <code>&lt;k&gt;</code> 到第 k 个 needle 的排名；<code>wrong donor row</code> 使用同一 successor heads，却把 donor 的数字 <code>&lt;k&gt;</code> row 贴到 receiver 的 <code>M_k</code> row；灰线为四条固定随机 head 顺序。</li>
+        <li><b>结果量。</b>每个 pair 先计算 normalized recovery，再在 1–10、11–20、21–30 三个 receiver count 区间内平均。离散 target-decision accuracy 是 patch 后目标 margin 大于 0 的样本比例；它回答 patch 是否真的翻转了 continue/close 选择，而不只是让 margin 小幅移动。</li>
+      </ol></div>
+
+      <h4>结果 A：把 continue activation 贴进本应关闭的 short receiver</h4>
+      {figure(
+          generated['successor_continue_recovery'],
+          'Figure 5C. Continue → close receiver：next-index margin 的 normalized recovery',
+          '<b>横轴</b>是只在 <code>M_k</code> query 局部 patch 的 top-n head slices 数（1、2、4、8、12、16）；<b>纵轴</b>是 continue margin <code>z(&lt;k+1&gt;)−z(&lt;/Think&gt;)</code> 的 normalized recovery。三栏按 short receiver count 分区。蓝线按 successor score，橙线沿用 k-to-k targeted 排名，绿线用 successor heads 但贴错 donor row；灰线、深灰均值与灰带为四条随机顺序。黑实线 0 表示无恢复，黑虚线 1 表示达到 clean long-prompt margin。'
+      )}
+      {figure(
+          generated['successor_continue_accuracy'],
+          'Figure 5D. Continue → close receiver：patch 后继续决定的 accuracy',
+          '<b>横轴与分组</b>同 Figure 5C；<b>纵轴</b>是 patch 后 <code>z(&lt;k+1&gt;)−z(&lt;/Think&gt;)&gt;0</code> 的 pair 比例。它是严格的决定翻转率，不是 next-token 全词表 accuracy。虚线 1 表示所有 short receivers 都被 donor activation 推向继续。'
+      )}
+      <p>单头和 top-2 总体不足以稳定翻转决定，但 top-4 开始呈现清楚的高-count 效应。Successor-ranked top-4 在 1–10 / 11–20 / 21–30 的 recovery 为 <b>{successor_value('continue_into_close','1-10',4,'successor_top','recovery')}</b> / <b>{successor_value('continue_into_close','11-20',4,'successor_top','recovery')}</b> / <b>{successor_value('continue_into_close','21-30',4,'successor_top','recovery')}</b>，对应 target-decision accuracy 为 <b>{successor_value('continue_into_close','1-10',4,'successor_top','accuracy')}</b> / <b>{successor_value('continue_into_close','11-20',4,'successor_top','accuracy')}</b> / <b>{successor_value('continue_into_close','21-30',4,'successor_top','accuracy')}</b>。扩到 top-8 后 recovery 达 <b>{successor_value('continue_into_close','1-10',8,'successor_top','recovery')}</b> / <b>{successor_value('continue_into_close','11-20',8,'successor_top','recovery')}</b> / <b>{successor_value('continue_into_close','21-30',8,'successor_top','recovery')}</b>，中高 count 已接近完全恢复。</p>
+
+      <h4>结果 B：把 close activation 贴进本应继续的 long receiver</h4>
+      {figure(
+          generated['successor_close_recovery'],
+          'Figure 5E. Close → continue receiver：close margin 的 normalized recovery',
+          '<b>横轴</b>是 patched top-n；<b>纵轴</b>改为 close margin <code>z(&lt;/Think&gt;)−z(&lt;k+1&gt;)</code> 的 normalized recovery。receiver 是仍有第 k+1 个 needle 的 long prompt，donor 是在 k 处结束的 short prompt。正向恢复表示局部 activation 能把本应继续的状态拉向关闭。其余颜色、三段 count 区间和随机对照与 Figure 5C 相同。'
+      )}
+      {figure(
+          generated['successor_close_accuracy'],
+          'Figure 5F. Close → continue receiver：patch 后关闭决定的 accuracy',
+          '<b>纵轴</b>是 patch 后 <code>z(&lt;/Think&gt;)−z(&lt;k+1&gt;)&gt;0</code> 的 pair 比例；因此它测的是 donor close evidence 是否足以翻转 long receiver，而不是模型原本的自然 trace accuracy。'
+      )}
+      <p>反向结果排除了“patch 只会把数字 logits 普遍抬高”的单向解释。Successor-ranked top-4 在三个区间的 close recovery 为 <b>{successor_value('close_into_continue','1-10',4,'successor_top','recovery')}</b> / <b>{successor_value('close_into_continue','11-20',4,'successor_top','recovery')}</b> / <b>{successor_value('close_into_continue','21-30',4,'successor_top','recovery')}</b>，target-decision accuracy 为 <b>{successor_value('close_into_continue','1-10',4,'successor_top','accuracy')}</b> / <b>{successor_value('close_into_continue','11-20',4,'successor_top','accuracy')}</b> / <b>{successor_value('close_into_continue','21-30',4,'successor_top','accuracy')}</b>。Top-8 recovery 进一步达到 <b>{successor_value('close_into_continue','1-10',8,'successor_top','recovery')}</b> / <b>{successor_value('close_into_continue','11-20',8,'successor_top','recovery')}</b> / <b>{successor_value('close_into_continue','21-30',8,'successor_top','recovery')}</b>。</p>
+
+      <h4>结果 C：top-4 候选、阶段对照与错误-row 对照</h4>
+      {table(successor_table_rows,[('direction','patch 方向'),('bin','receiver count 区间'),('family','head/row 条件'),('recovery','normalized recovery'),('accuracy','target-decision accuracy'),('random_recovery','random recovery 均值'),('random_recovery_range','random recovery min–max')])}
+      <h4>分析</h4>
+      <p><b>第一，successor 是分布式局部 circuit，而不是单枚开关 head。</b>单头几乎从不翻转 continue/close；top-4 在中高 count 已明显有效，top-8 才在两种方向上接近完整恢复。这与第 7 节的多头冗余一致，但这里的证据更强：它不是删除后性能下降，而是 selected clean activations 在同一 <code>M_k</code> row 足以把 receiver 的决定向 donor 搬运。</p>
+      <p><b>第二，retrieval 与 successor 有重叠，但 top heads 并不相同。</b>在中高 count 的 top-4，数字 <code>&lt;k&gt;</code> 上得到的 k-to-k ranking 明显弱于 successor ranking；到 top-8 后二者才共同接近完全恢复。这说明较大的 routing circuit 可能跨阶段复用，但“找到第 k 个 needle”与“在 M<sub>k</sub> 后决定继续/关闭”不能由同一个 top-4 排名概括。</p>
+      <p><b>第三，query row 有信息，但不是绝对隔离。</b>同一 successor heads 若改贴 donor 的上一行数字 <code>&lt;k&gt;</code> activation，top-4 通常显著弱于正确 <code>M_k</code> row，尤其在反向 close patch 与高 count 条件下；然而某些 wrong-row top-8 仍能恢复，说明 continue/close 信息也可能已经分布在相邻 residual/attention rows，不能声称只存在于 marker row。</p>
+      <div class="callout good"><b>本实验回答了什么：</b>在受控 nested prompts 中，marker <code>M_k</code> query 的一个多头 activation bundle 同时携带可双向运输的 continue/close 证据；该 bundle 在中高 count 上用 top-4 已可显著改变决定，top-8 接近充分。<b>没有证明什么：</b>它尚不能把计算解释成符号式 <code>k+1</code> 加法，也没有证明同一 circuit 会在完全 autoregressive generation 中阻止所有级联错误；它定位的是局部 next-index/stop decision 的因果载体。</div>
+
+      <h3>8.4 从 attention evidence 到具体 index logit：MLP 与 residual 的层内转换</h3>
+      <h4>实验</h4>
+      <p>本实验继续使用 8.3 节完全相同的 nested short/long pairs 与 marker <code>M_k</code> query，但不再只把整个 head bundle 当成黑箱。每个方向包含 <b>{successor_pairs_per_direction}</b> 对样本（<code>k=1,…,29</code>，每个 k 使用 {successor_conversion_manifest['examples_per_k']} 个独立 base sequences），并保留 continue→close 与 close→continue 两个方向。实验仍是单步、teacher-forced 的局部因果分析；按照本节问题范围，<b>没有运行 autoregressive rollout</b>。</p>
+      <div class="protocol"><ol>
+        <li><b>Layer 内计算分解。</b>对每一层，记进入该层的 residual 为 <code>h_pre</code>，attention 输出为 <code>a</code>，则 <code>h_attn = h_pre + a</code>；MLP 输出为 <code>m = MLP(LN₂(h_attn))</code>，层末 residual 为 <code>h_post = h_attn + m</code>。报告把它们依次称为 <code>resid_pre</code>、<code>attn_out</code>、<code>post_attn</code>、<code>mlp_out</code>、<code>post_mlp</code>。</li>
+        <li><b>Residual logit lens。</b>在每个 residual stage 上临时应用模型最终的 <code>ln_f</code> 与 tied unembedding，计算 target token 相对 competitor 的 margin：continue 方向为 <code>z(&lt;k+1&gt;)−z(&lt;/Think&gt;)</code>。这回答“到这一 stage 时，目标决定是否已经可被最终读出头线性读取”，而不是声称模型在中间层真的提前退出。</li>
+        <li><b>Component direct-unembedding diagnostic。</b>对 additive component <code>a</code> 或 <code>m</code> 直接乘 unembedding，并计算 clean-minus-corrupt target-aligned margin。由于 component 本身没有经过最终 LayerNorm，这只是定位哪个 component 把证据写向目标 token 的描述性诊断；真正的因果结论来自下一项 patch。</li>
+        <li><b>关键 MLP mediation 对照。</b><code>donor Attn; receiver MLP frozen</code> 把 donor attention output 加进 receiver residual，但强制保留 receiver baseline MLP output；<code>donor Attn; native MLP recomputed</code> 使用同一 donor attention output，却让 MLP 对改变后的 <code>h_attn</code> 自然重算。二者 normalized recovery 之差，就是 donor attention evidence 经当前层 MLP 转换带来的局部 mediation gain。</li>
+        <li><b>其他干预。</b><code>donor MLP output only</code> 只把 donor MLP additive output 加到 receiver <code>h_attn</code>；<code>donor Attn + donor MLP</code> 同时替换两个 additive components；<code>full donor post-attn state</code> 替换 <code>h_attn</code> 后重算 MLP；<code>full donor post-MLP state</code> 替换整层输出，是该层完整状态充分性的上界/sanity check。</li>
+      </ol></div>
+
+      <h4>结果 A：continue/close margin 在 residual stream 的哪里出现</h4>
+      {figure(
+          generated['successor_logit_lens'],
+          'Figure 5G. Marker M_k 处的 residual logit-lens 轨迹',
+          '<b>横轴</b>按计算顺序列出每层输入（Lx pre）、加完 attention 后（Lx +Attn）与再加完 MLP 后（Lx +MLP）的 residual；<b>纵轴</b>是经最终 <code>ln_f + unembedding</code> 读出的 continue target margin。蓝线是存在第 k+1 个 needle 的 long/clean prompt；橙线是 count=k 的 short/corrupt prompt，但也用同一个 continue target 读取。两线分离表示该 stage 已包含可线性读取的 continue-versus-close 证据。三栏为 receiver count 区间。'
+      )}
+      <p>低 count 的 clean−corrupt residual gap 在 Layer 3 post-attention 为 <b>{stage_gap('1-10',2,'post_attn')}</b>，经 Layer 3 MLP 后扩大到 <b>{stage_gap('1-10',2,'post_mlp')}</b>；Layer 4 post-attention 与 post-MLP 分别进一步达到 <b>{stage_gap('1-10',3,'post_attn')}</b> 和 <b>{stage_gap('1-10',3,'post_mlp')}</b>。11–20 的对应四个数是 <b>{stage_gap('11-20',2,'post_attn')}</b>、<b>{stage_gap('11-20',2,'post_mlp')}</b>、<b>{stage_gap('11-20',3,'post_attn')}</b>、<b>{stage_gap('11-20',3,'post_mlp')}</b>；21–30 则为 <b>{stage_gap('21-30',2,'post_attn')}</b>、<b>{stage_gap('21-30',2,'post_mlp')}</b>、<b>{stage_gap('21-30',3,'post_attn')}</b>、<b>{stage_gap('21-30',3,'post_mlp')}</b>。</p>
+
+      <h4>结果 B：attention 与 MLP 各自把多少证据直接写向目标 token</h4>
+      {figure(
+          generated['successor_component_evidence'],
+          'Figure 5H. Attention-output 与 MLP-output 的 target-aligned direct-unembedding evidence',
+          '<b>横轴</b>是产生 additive component 的 Layer 1–4；<b>纵轴</b>是该 component 对目标 margin 的 clean-minus-corrupt 差。蓝线为 attention output，橙线为 MLP output；正值表示该 component 在 long prompt 中比 short prompt 更偏向 <code>&lt;k+1&gt;</code>。这是没有最终 LayerNorm 的分量诊断，不单独作为因果证据。'
+      )}
+      {table(successor_stage_rows,[('bin','count 区间'),('layer','Layer'),('attn_component','attention component gap'),('mlp_component','MLP component gap'),('post_attn_gap','post-attn residual gap'),('post_mlp_gap','post-MLP residual gap')])}
+      <p>Layer 3 是证据第一次稳定变大的路由层；Layer 4 则表现出最强的 logit 写入。三个 count 区间中，Layer 4 attention component gap 分别为 <b>{stage_gap('1-10',3,'attn_out')}</b> / <b>{stage_gap('11-20',3,'attn_out')}</b> / <b>{stage_gap('21-30',3,'attn_out')}</b>，而 Layer 4 MLP component gap 达 <b>{stage_gap('1-10',3,'mlp_out')}</b> / <b>{stage_gap('11-20',3,'mlp_out')}</b> / <b>{stage_gap('21-30',3,'mlp_out')}</b>。因此最终 index/close logit 的巨大分离并不是 attention output 独自线性写出的；MLP 是更强的目标-token amplifier。</p>
+
+      <h4>结果 C：固定 receiver MLP 与允许 native MLP 重算的因果对照</h4>
+      {figure(
+          generated['successor_conversion_continue'],
+          'Figure 5I. Continue evidence → close receiver 的 sublayer conversion',
+          '<b>横轴</b>是被干预的 Layer 1–4；<b>纵轴</b>是 continue margin normalized recovery。蓝线只替换 donor attention output并冻结 receiver MLP output；绿线使用相同 donor attention，却让当前层 MLP 对新 residual 自然重算；橙线只替换 donor MLP output；灰线替换完整 donor post-MLP residual，作为 full-state 上界。三栏按 short receiver count 分区。'
+      )}
+      {figure(
+          generated['successor_conversion_close'],
+          'Figure 5J. Close evidence → continue receiver 的 sublayer conversion',
+          '<b>横纵轴及四种干预</b>与 Figure 5I 相同，但 target margin 改为 <code>z(&lt;/Think&gt;)−z(&lt;k+1&gt;)</code>，receiver 是本应继续的 long prompt。该反向实验检验 MLP mediation 是否同时支持关闭，而不是只普遍抬高数字 logits。'
+      )}
+      {table(successor_conversion_rows,[('direction','patch 方向'),('bin','count 区间'),('layer','Layer'),('attn_direct','Attn + frozen MLP recovery'),('native_mlp','Attn + native MLP recovery'),('mlp_mediation','MLP mediation gain'),('mlp_only','MLP-only recovery'),('full_state','full post-MLP recovery'),('direct_accuracy','Attn-only target accuracy'),('native_accuracy','native-MLP target accuracy'),('mlp_accuracy','MLP-only target accuracy')])}
+      <h4>分析</h4>
+      <p><b>Layer 3 把 routed evidence 转成可执行决定。</b>Continue 方向在 11–20 / 21–30 中，Layer 3 attention-direct recovery 为 <b>{conversion_value('continue_into_close','11-20',2,'attn_direct_residual')}</b> / <b>{conversion_value('continue_into_close','21-30',2,'attn_direct_residual')}</b>；允许同层 MLP 自然重算后升到 <b>{conversion_value('continue_into_close','11-20',2,'attn_native_mlp')}</b> / <b>{conversion_value('continue_into_close','21-30',2,'attn_native_mlp')}</b>，mediation gain 分别约 0.40 与 0.32。反向 close 方向同样从 <b>{conversion_value('close_into_continue','11-20',2,'attn_direct_residual')}</b> / <b>{conversion_value('close_into_continue','21-30',2,'attn_direct_residual')}</b> 升至 <b>{conversion_value('close_into_continue','11-20',2,'attn_native_mlp')}</b> / <b>{conversion_value('close_into_continue','21-30',2,'attn_native_mlp')}</b>。这说明 MLP 不是被动经过 donor evidence，而是在当前 residual 上做了实质的非线性转换。</p>
+      <p><b>Layer 4 MLP 更像最终 token-logit writer。</b>仅替换 Layer 4 MLP output 的 recovery 在 continue 方向为 <b>{conversion_value('continue_into_close','1-10',3,'mlp_out_only')}</b> / <b>{conversion_value('continue_into_close','11-20',3,'mlp_out_only')}</b> / <b>{conversion_value('continue_into_close','21-30',3,'mlp_out_only')}</b>，在 close 方向为 <b>{conversion_value('close_into_continue','1-10',3,'mlp_out_only')}</b> / <b>{conversion_value('close_into_continue','11-20',3,'mlp_out_only')}</b> / <b>{conversion_value('close_into_continue','21-30',3,'mlp_out_only')}</b>。完整 Layer 4 post-MLP state 在六个方向×区间条件中 recovery 均为 1；但 MLP-only 并非总能独立达到 1，说明最终写入仍依赖 receiver residual、attention evidence 与 MLP output 的组合，而不是一个脱离上下文的标量加法神经元。</p>
+      <div class="callout good"><b>本实验补上的因果链：</b><code>M_k attention routing</code> 提供 continue/close 证据；该证据在 Layer 3 residual 中变得可读，并由同层 MLP 显著转化；Layer 4 MLP 再把状态强烈对齐到具体 <code>&lt;k+1&gt;</code> 或 <code>&lt;/Think&gt;</code> logit。换言之，attention 更像“把下一步是否存在的证据送入当前位置”，MLP/residual 组合更像“把证据变成当前词表上的决定”。这比“某个 attention head 直接写出 index token”更符合干预结果。</div>
+      <div class="callout warn"><b>到这里仍不能声称：</b>direct-unembedding 图不是 feature 级机制，whole-MLP patch 也不能区分是少数坐标还是分布式子空间在执行转换。下一小节因此直接进入 Layer 3–4 的 1024 维 post-GELU MLP intermediate，并用未参与排序的 held-out pairs 做 feature patch。</div>
+
+      <h3>8.5 Layer 3–4 MLP intermediate：从 routed evidence 到 index/close logit 的 feature 级因果分解</h3>
+      <h4>实验</h4>
+      <p>这里的 <b>MLP feature/neuron</b> 是 GPT-2 MLP 中 <code>c_fc → GELU</code> 后、<code>c_proj</code> 前的一个标量坐标，不是生物神经元。模型的 residual width 为 256，而每层 MLP intermediate width 为 <b>{mlp_feature_manifest['n_inner']}</b>；实验只分析 0-based Layer 2–3，即报告中的 <b>Layer 3–4</b>。Query、clean/corrupt pair 和 continue/close margin 与 8.3–8.4 完全相同，仍位于 teacher-forced marker <code>M_k</code>。</p>
+      <div class="protocol"><ol>
+        <li><b>严格分离 feature 排名与因果评估。</b>对每个 <code>k=1,…,29</code>，使用 {mlp_feature_manifest['fit_examples_per_k']} 个 base sequences 拟合 feature 排名，再使用不重叠的 {mlp_feature_manifest['eval_examples_per_k']} 个 sequences 做 patch；因此每个方向各有 <b>{mlp_fit_pairs_per_direction}</b> 个 fit pairs 和 <b>{mlp_eval_pairs_per_direction}</b> 个 held-out eval pairs。</li>
+        <li><b>Feature 排名。</b>对第 i 个 post-GELU feature，先计算 fit pairs 上的 clean−corrupt activation 差，再乘它经 <code>c_proj</code> 与 tied unembedding 对 target-minus-alternative margin 的线性系数。这个乘积的均值是 projected evidence score。它只用于选坐标，不直接当作因果效应。</li>
+        <li><b>Ranked feature replacement。</b>对 support <code>S</code> 中的 feature，把 corrupt receiver 在同一 <code>M_k</code> row 的 activation 坐标替换成 clean donor 值；其他 1024−|S| 个坐标、attention、residual 与后续参数都保留 receiver 值。支持大小依次为 <code>{', '.join(str(x) for x in mlp_feature_manifest['support_sizes'])}</code>。</li>
+        <li><b>Sparse mean-direction transport。</b>在 fit pairs 上求平均 clean−corrupt feature 差方向，只保留 projected-evidence 绝对值最大的 S 个坐标；对 held-out pair，仅运输该 pair 在这个稀疏方向上的投影。它检验“共享低维方向”是否足以替代逐坐标 donor 值。</li>
+        <li><b>对照。</b>每个 support 使用 {mlp_feature_manifest['random_replicates']} 组固定随机坐标做 size-matched replacement，并另测 random sparse direction。所有结果仍报告逐 pair normalized recovery 与 target-decision accuracy；没有 autoregressive rollout。</li>
+      </ol></div>
+
+      <h4>结果 A：转换证据是部分稀疏、总体分布式的</h4>
+      {figure(
+          generated['mlp_feature_concentration'],
+          'Figure 5K. Layer 3–4 MLP projected evidence 的累积集中度',
+          '<b>横轴</b>是按 projected evidence 排名后保留的 feature 数，使用 log₂ 刻度；<b>纵轴</b>是这些 features 覆盖的证据比例。实线只累计方向正确的正 evidence，虚线累计绝对 evidence；颜色表示 receiver count 区间。上、下行分别为 continue evidence 与 close evidence，左、右列分别为 Layer 3 与 Layer 4。若由单一 neuron 执行，曲线会在 support=1 附近跃升到 1；实际需要数十到数百个坐标。'
+      )}
+      <p>以反向写入 close evidence 为例，Layer 4 的 top-64 features 已覆盖三个 count 区间约 <b>59.7% / 66.5% / 71.8%</b> 的正 projected evidence，top-256 覆盖约 <b>90.1% / 91.3% / 93.6%</b>。Continue 与 close 两行都显示 evidence 有明显集中度，但都不是单-neuron code；更准确的说法是<b>分布式、部分稀疏的 decision-writing subspace</b>。</p>
+
+      <h4>结果 B：Continue evidence 的 held-out feature patch</h4>
+      {figure(
+          generated['mlp_feature_continue'],
+          'Figure 5L. Clean continue features → close receiver 的 normalized recovery',
+          '<b>横轴</b>是被替换或运输的 MLP feature support；<b>纵轴</b>是 continue margin normalized recovery。上排 Layer 3，下排 Layer 4；三列为 receiver count 1–10、11–20、21–30。蓝线替换 ranked clean coordinates，绿线运输 sparse mean direction，灰线和阴影是 matched random coordinates 的均值±标准差。虚线 1 表示达到 clean margin。'
+      )}
+      <p>Layer 4 ranked top-64 的 recovery 为 <b>{mlp_feature_value('continue_into_close','1-10',3,'ranked_feature_replacement',64)} / {mlp_feature_value('continue_into_close','11-20',3,'ranked_feature_replacement',64)} / {mlp_feature_value('continue_into_close','21-30',3,'ranked_feature_replacement',64)}</b>，而 matched random 仅为 <b>{mlp_feature_value('continue_into_close','1-10',3,'random_feature_replacement',64)} / {mlp_feature_value('continue_into_close','11-20',3,'random_feature_replacement',64)} / {mlp_feature_value('continue_into_close','21-30',3,'random_feature_replacement',64)}</b>。Top-256 recovery 升至 <b>{mlp_feature_value('continue_into_close','1-10',3,'ranked_feature_replacement',256)} / {mlp_feature_value('continue_into_close','11-20',3,'ranked_feature_replacement',256)} / {mlp_feature_value('continue_into_close','21-30',3,'ranked_feature_replacement',256)}</b>，但 target-decision accuracy 只有 <b>{mlp_feature_value('continue_into_close','1-10',3,'ranked_feature_replacement',256,'patched_target_correct')} / {mlp_feature_value('continue_into_close','11-20',3,'ranked_feature_replacement',256,'patched_target_correct')} / {mlp_feature_value('continue_into_close','21-30',3,'ranked_feature_replacement',256,'patched_target_correct')}</b>。这一区分很重要：selected features 能连续搬运 continue margin，却未必足以让中高 count receiver 的 argmax 越过关闭边界。Layer 3 即使替换全部 1024 features，recovery 也只有 <b>{mlp_feature_value('continue_into_close','1-10',2,'ranked_feature_replacement',1024)} / {mlp_feature_value('continue_into_close','11-20',2,'ranked_feature_replacement',1024)} / {mlp_feature_value('continue_into_close','21-30',2,'ranked_feature_replacement',1024)}</b>。</p>
+
+      <h4>结果 C：Close evidence 的反向 patch</h4>
+      {figure(
+          generated['mlp_feature_close'],
+          'Figure 5M. Clean close features → continue receiver 的 normalized recovery',
+          '<b>横纵轴、行列与对照</b>同 Figure 5L，但 target margin 是 <code>z(&lt;/Think&gt;)−z(&lt;k+1&gt;)</code>。这检验相同 feature-selection 方法是否能反向写入关闭 trace 的决定，而不是只普遍增强数字 token。'
+      )}
+      <p>Layer 4 ranked top-64 的 close recovery 为 <b>{mlp_feature_value('close_into_continue','1-10',3,'ranked_feature_replacement',64)} / {mlp_feature_value('close_into_continue','11-20',3,'ranked_feature_replacement',64)} / {mlp_feature_value('close_into_continue','21-30',3,'ranked_feature_replacement',64)}</b>，matched random 仅为 <b>{mlp_feature_value('close_into_continue','1-10',3,'random_feature_replacement',64)} / {mlp_feature_value('close_into_continue','11-20',3,'random_feature_replacement',64)} / {mlp_feature_value('close_into_continue','21-30',3,'random_feature_replacement',64)}</b>；top-256 为 <b>{mlp_feature_value('close_into_continue','1-10',3,'ranked_feature_replacement',256)} / {mlp_feature_value('close_into_continue','11-20',3,'ranked_feature_replacement',256)} / {mlp_feature_value('close_into_continue','21-30',3,'ranked_feature_replacement',256)}</b>。Close transport 明显弱于 continue transport，尤其高 count 的 argmax 翻转率仍低，说明没有一个上下文无关、正反完全对称的“继续/停止 neuron”。</p>
+      {table(mlp_feature_rows,[('direction','patch 方向'),('bin','count 区间'),('layer','Layer'),('features','support'),('ranked_recovery','ranked replacement recovery'),('sparse_recovery','sparse direction recovery'),('random_recovery','random replacement recovery'),('ranked_accuracy','ranked target accuracy')])}
+      <h4>分析</h4>
+      <p><b>Layer 4 是主要的 feature-level decision writer。</b>Ranked held-out patches 大幅超过 size-matched random controls，证明这些坐标不是仅在训练样本上相关，而是在新 pair 上因果运输 continue/close evidence。Layer 3 whole-MLP mediation 在 8.4 中很强，但 post-GELU 坐标替换本身较弱，说明 Layer 3 更像依赖 receiver residual、LayerNorm 与 attention-MLP 联合状态的中间转换，不能被一个固定 feature 子集独立搬走。</p>
+      <p><b>共享稀疏方向只解释一部分机制。</b>Layer 4 support-64 sparse direction 在 continue 方向达到 <b>{mlp_feature_value('continue_into_close','1-10',3,'sparse_mean_direction',64)} / {mlp_feature_value('continue_into_close','11-20',3,'sparse_mean_direction',64)} / {mlp_feature_value('continue_into_close','21-30',3,'sparse_mean_direction',64)}</b> recovery，但 close 方向只有 <b>{mlp_feature_value('close_into_continue','1-10',3,'sparse_mean_direction',64)} / {mlp_feature_value('close_into_continue','11-20',3,'sparse_mean_direction',64)} / {mlp_feature_value('close_into_continue','21-30',3,'sparse_mean_direction',64)}</b>。扩大到 dense mean direction 不总是继续改善，说明不同 k 与上下文中的有效 feature 组合并不完全共线；这更像条件化的非线性子空间，而不是一根统一的 <code>+1</code> 轴。</p>
+      <div class="callout good"><b>feature 级因果结论：</b>从 attention routed evidence 到具体 next-index/close token 的最后转换主要落在 Layer 4 MLP 的数十至数百个 post-GELU features 上；它具有可重复的稀疏结构，但仍是分布式并依赖上下文的。当前实验已经超过“hidden direction 可读性”：selected held-out feature replacement 能稳定恢复 target margin；close 方向可稳定翻转决定，而 continue 方向的中高 count 只得到部分 margin recovery，说明仍需 receiver residual 或更广的 feature 组合共同越过决策边界。</div>
+      <div class="callout limit"><b>证据边界：</b>feature 是网络坐标，不等于独立语义 neuron；排名使用 c_proj 与 unembedding 的线性近似，而真实 forward 还经过 residual 与最终 LayerNorm。结果来自单 seed、teacher-forced <code>M_k</code> query，也没有证明模型实现人类可读的符号加法。</div>
+
+      <h3>8.6 Non-thinking broad heads：在最终 &lt;Ans&gt; 局部运输 donor count</h3>
+      <h4>实验</h4>
+      <p>对 nested receiver/donor pairs，在 non-thinking 模型最终 <code>&lt;Ans&gt;</code> query，仅 patch 按 broad score 排名的 donor head slices。Prompt token rows 不被替换，因此 donor count 若进入 receiver 输出，只能经由这些最终-query attention outputs 的局部变化发生。对每个 receiver count 区间、每个 top-n 独立拟合 expected-count transport slope。</p>
+      <h4>结果</h4>
+      {figure(
+          generated['nested_nonthinking'],
+          'Figure 6A. Non-thinking broad-head output 的 donor-count transport',
+          '<b>横轴</b>是最终 <code>&lt;Ans&gt;</code> query 被替换的 donor head slices 数；<b>纵轴</b>是 expected-count shift 对 donor offset <code>m−n</code> 的回归 slope。0 表示不运输，1 表示一比一运输。三栏按 receiver count 分区；蓝线按 broad score 排名，灰色为随机路径，紫色为 random top-4 mean。'
+      )}
+      {table(direct_transport_rows,[('bin','receiver count 区间'),('heads','patched top-n'),('slope','broad-ranked slope'),('random','random mean'),('range','random min–max')])}
+      <h4>分析</h4>
+      <p>Broad-ranked top-1 已产生区间依赖的正 transport：1–10 / 11–20 / 21–30 的 slope 为 <b>{count_transport_lookup[('non-thinking broad','1-10',1)]['slope']}</b> / <b>{count_transport_lookup[('non-thinking broad','11-20',1)]['slope']}</b> / <b>{count_transport_lookup[('non-thinking broad','21-30',1)]['slope']}</b>。Top-4 后升至 <b>{count_transport_lookup[('non-thinking broad','1-10',4)]['slope']}</b> / <b>{count_transport_lookup[('non-thinking broad','11-20',4)]['slope']}</b> / <b>{count_transport_lookup[('non-thinking broad','21-30',4)]['slope']}</b>，而随机 top-4 均值仅为 <b>{count_transport_lookup[('non-thinking broad','1-10',4)]['random']}</b> / <b>{count_transport_lookup[('non-thinking broad','11-20',4)]['random']}</b> / <b>{count_transport_lookup[('non-thinking broad','21-30',4)]['random']}</b>。</p>
+      <div class="callout good"><b>因果结论：</b>non-thinking broad heads 不只“看着 needles”，其最终-query outputs 足以搬运相当比例的 donor count。低 count 的 top-4 几乎达到一比一 transport；随着 receiver count 增大，固定四枚 heads 的 slope 下降到 0.53，说明高 count 需要更多分布式 head slices 或更多 residual/MLP 支持。Top-16 达到 1 是“全部 attention output 都来自 donor”的 sanity endpoint，不能被解释为 broad ranking 的特异性。</div>
+
+      <h3>8.7 CoT trace-readout heads：最终 &lt;Ans&gt; 的 attention slices 单独不足以搬运 count</h3>
+      <h4>实验</h4>
+      <p>使用同一 nested donor/receiver protocol，但换成 thinking 模型，并按最终 <code>&lt;Ans&gt;</code> query 对全部 trace markers 的 attention mass 排名。Donor 与 receiver 的 gold trace 长度分别为 m 与 n，所以 semantic anchor 相同而绝对 position 不同。只替换 attention head-output slices；receiver 的 residual stream、MLP 输入与其余上下文仍保留 receiver 状态。</p>
+      <h4>结果</h4>
+      {figure(
+          generated['nested_thinking'],
+          'Figure 6B. CoT trace-readout head slices 的 donor-count transport',
+          '<b>横轴</b>是最终 <code>&lt;Ans&gt;</code> query 被替换的 donor slices 数；<b>纵轴</b>仍是 expected-count transport slope。三栏为 receiver count 区间。若 trace-readout heads 自身携带完整标量 count，蓝线应随 top-n 靠近 1；实际曲线大多接近 0。'
+      )}
+      {table(cot_transport_rows,[('bin','receiver count 区间'),('heads','patched top-n'),('slope','readout-ranked slope'),('random','random mean'),('range','random min–max')])}
+      <h4>分析</h4>
+      <p>CoT top-4 readout slices 的 slope 只有 <b>{count_transport_lookup[('CoT trace readout','1-10',4)]['slope']}</b> / <b>{count_transport_lookup[('CoT trace readout','11-20',4)]['slope']}</b> / <b>{count_transport_lookup[('CoT trace readout','21-30',4)]['slope']}</b>；即使 top-8 也只有 <b>{count_transport_lookup[('CoT trace readout','1-10',8)]['slope']}</b> / <b>{count_transport_lookup[('CoT trace readout','11-20',8)]['slope']}</b> / <b>{count_transport_lookup[('CoT trace readout','21-30',8)]['slope']}</b>，而且剂量曲线非单调。</p>
+      <div class="callout warn"><b>解释：</b>这不等于“CoT trace readout 无用”。它说明最终答案的 count state 不能由 selected attention slices 单独搬运；receiver residual、位置/trace-length 表征、MLP 或多头组合仍占主导。第 7 节的局部 ablation 可以证明某些 readout heads 被使用，本节则表明这些 slices 本身不具备把 m−n 一比一写入 logits 的充分性。完整 residual transplant 才是对 CoT final count state 的更合适充分性测试。</div>
+
+      <h3>8.8 本节结论与证据边界</h3>
+      <div class="mechanisms">
+        <div class="mechanism"><h3>Non-thinking</h3><p><b>当前支持：</b>early broad heads 既在第 7 节表现出必要性，也能在最终 <code>&lt;Ans&gt;</code> 局部 patch 中运输 donor count；这是“broad set aggregation → answer count state”最直接的 head-level 因果证据。</p><p><b>边界：</b>高 count 的 top-4 slope 明显低于 1，说明 count state 还分布在更多 heads、residual 或 MLP 中。</p></div>
+        <div class="mechanism"><h3>CoT</h3><p><b>当前支持：</b>数字 <code>&lt;k&gt;</code> row 的 top-2/top-4 targeted bundle 足以恢复 marker identity；marker <code>M_k</code> row 的 successor-ranked multi-head bundle 能双向运输 next-step evidence；Layer 3 MLP 参与非线性转换，Layer 4 MLP 中一个分布式、部分稀疏的 post-GELU feature 子空间负责最强的具体 token-logit 写入；最终 <code>&lt;Ans&gt;</code> row 的 readout slices 单独不能运输完整 donor count。</p><p><b>仍缺：</b>feature patch 已提供局部因果证据，但 feature 组合随 k、count 区间和 continue/close 方向变化，尚不能压缩成一根统一的符号式 <code>+1</code> 轴，也没有跨 seed 或自然语言任务验证。</p></div>
+      </div>
+    </section>
+    """
+
+    steering_section = f"""
+    <section id="steering">
+      <h2>9. Hidden-state geometry steering：相邻 transplant、非相邻直线与 centroid 曲线</h2>
+      <div class="callout good"><b>本节问题。</b>第 6 节只说明 exact-count centroids 在 residual space 中形成可读轨迹；这里直接改写 held-out 样本的 256 维 residual，再让模型完成剩余前向，检验这条轨迹是否真的控制 count logits。核心比较不是“有没有一根相关方向”，而是：完整 centroid、保留样本残差的局部位移、端点直线和沿相邻 centroids 的曲线路径，哪一种能把输出搬到指定 count。</div>
+
+      <h3>9.1 共同设置、状态分解与结果量</h3>
+      <h4>实验</h4>
+      <p>Centroids 来自独立的 direction-train split，不使用本节干预样本。对 semantic site <code>s</code>、Layer <code>l</code> 和 exact count <code>c</code>，先平均 256 维 residual，得到 <code>mu[s,l,c] = E[h | s,l,count=c]</code>。本节使用 {geometry_path_examples_per_count} 个 held-out prompts / exact count，即每个 site 有 {30 * geometry_path_examples_per_count} 个 receiver prompts；在三个 sites、四层和所有合法 donor offsets 上共记录 <b>{len(geometry_path_detail):,}</b> 条真实 patched-forward 行。</p>
+      <div class="protocol"><ol>
+        <li><b>三个 sites。</b><code>nonthinking_final_answer</code> 与 <code>thinking_final_answer</code> 都在自然序列的最终 <code>&lt;Ans&gt;</code> query 取 residual。<code>thinking_fixed_trace_answer</code> 则强制所有 prompt 使用同一条 15-step gold-format trace，只有 prompt needle count 与答案标签变化；它用于区分“prompt-derived count geometry 可读”与“该 geometry 真正控制最终答案”。</li>
+        <li><b>Receiver 分解。</b>把 receiver state 写成 <code>h_r = mu_r + epsilon</code>，其中 <code>epsilon</code> 包含该具体 prompt 相对 exact-count 均值的残差。Full transplant 使用 <code>h' = mu_t</code>；delta transport 使用 <code>h' = h_r + (mu_t - mu_r) = mu_t + epsilon</code>。二者若结果相同，说明保留 prompt-specific residual 不妨碍 count 搬运。</li>
+        <li><b>连续输出。</b>从 count-token logits 计算 <code>E[C] = sum_c c * softmax(z_count)[c]</code>。对每个 panel 回归 <code>Delta E[C] = a + b * Delta c_path</code>；<code>b=1</code> 表示输出一比一跟随指定路径坐标。<code>path-tracking MAE = mean |E_patch[C] - c_path|</code>，越接近 0 越好。</li>
+        <li><b>Layer 含义。</b>“after Layer 1–4”表示替换该 Transformer Layer 输出的 residual。较早层后仍有后续 Layers 可修正或抵消干预；after Layer 4 后只剩最终 LayerNorm 与 tied unembedding，因此更直接检验该 residual 是否已是可执行 count state。</li>
+      </ol></div>
+
+      <h3>9.2 相邻 count：完整 centroid transplant 与 residual-preserving delta</h3>
+      <h4>实验</h4>
+      <p>对 receiver count <code>r</code>，分别选择相邻 donor <code>t=r-1</code> 或 <code>r+1</code>。Full transplant 删除 receiver 的 <code>epsilon</code>，直接写入 <code>mu_t</code>；delta transport 只增加局部 centroid 差 <code>mu_t-mu_r</code>，保留 receiver prompt 的其余状态。每个 count 区间独立拟合 transport slope。</p>
+      <h4>结果</h4>
+      {figure(
+          generated['geometry_path_adjacent'],
+          'Figure 7A. 相邻 exact-count centroid 的 full transplant 与 delta transport',
+          '<b>横轴</b>是 residual 被干预在 Layer 1–4 之后；<b>纵轴</b>是 <code>Delta E[C]</code> 对目标相邻 count shift（±1）的回归 slope。蓝色实线=直接写入目标 centroid；橙色虚线=保留 receiver residual 的 centroid delta。灰虚线 1 是理想一比一搬运。三行是 non-thinking natural、CoT natural、CoT fixed-15 control；三列是 receiver count 1–10、11–20、21–30。'
+      )}
+      {table(adjacent_transport_rows,[('site','semantic site'),('bin','receiver count 区间'),('full_slope','Layer 4 full-transplant slope'),('delta_slope','Layer 4 delta slope'),('delta_r2','Layer 4 delta R²'),('delta_mae','Layer 4 path MAE')])}
+      <h4>分析</h4>
+      <p><b>自然 CoT 的 final-answer state 在所有深度都已强因果化。</b>三个 count 区间、四个 Layers 的相邻 delta slope 均为 1.000，tracking MAE 为 0；既可以把 state 完整换成相邻 centroid，也可以只加局部差向量，模型都会把 count 输出精确移动一格。</p>
+      <p><b>Non-thinking 是逐层形成的。</b>在 21–30，Layer 1 后的 delta slope 只有 <b>{fmt(path_metric('nonthinking_final_answer','21-30','adjacent_delta_transport','transport_slope',layer=0))}</b>，Layer 3 后为 <b>{fmt(path_metric('nonthinking_final_answer','21-30','adjacent_delta_transport','transport_slope',layer=2))}</b>，到 Layer 4 后才达到 <b>{fmt(path_metric('nonthinking_final_answer','21-30','adjacent_delta_transport','transport_slope',layer=3))}</b>。这与“early broad heads 收集集合证据、后层 residual/MLP 才写成明确 count state”的机制相容。</p>
+      <p><b>Fixed-15 是关键负对照。</b>低/中 count 的 Layer 4 delta slope 都为 <b>0.000</b>；即使 hidden state 在第 6 节仍能按 prompt count 分类，该方向也不能改写由固定 trace 主导的最终 logits。可读 geometry 因此不自动等于被模型用作答案控制变量。</p>
+
+      <h3>9.3 非相邻 count：直接沿端点连线移动</h3>
+      <h4>实验</h4>
+      <p>对合法 offset <code>t-r in {{±2,±3,±5,±10}}</code>，定义端点 chord：<code>p_chord(alpha) = (1-alpha) mu_r + alpha mu_t</code>，并写入 <code>h' = h_r + p_chord(alpha) - mu_r</code>。<code>alpha</code> 取 0.25、0.5、0.75、1；它检验“把两个非相邻 count centroid 直接连成一条直线”是否仍留在模型可执行的 count manifold 上。</p>
+      <h4>结果</h4>
+      {figure(
+          generated['geometry_path_chord'],
+          'Figure 7B. 非相邻 count 的端点直线（chord）transport',
+          '<b>横轴</b>是干预 Layer；<b>纵轴</b>是在所有 donor offsets 上拟合的 transport slope。颜色表示 chord 进度 alpha；虚线 1 为理想路径跟随。上行为 non-thinking natural，下行为 CoT natural；三列为 receiver count 区间。alpha=1 只测试终点，alpha<1 才测试直线内部。'
+      )}
+      <h4>分析</h4>
+      <p>端点通常可以到达，但中间 chord 点并不稳定对应线性 count。以 Layer 4、alpha=0.5 为例，non-thinking 三段 tracking MAE 为 <b>{path_metric('nonthinking_final_answer','1-10','nonadjacent_chord_transport','path_tracking_mae',alpha=.5):.3f} / {path_metric('nonthinking_final_answer','11-20','nonadjacent_chord_transport','path_tracking_mae',alpha=.5):.3f} / {path_metric('nonthinking_final_answer','21-30','nonadjacent_chord_transport','path_tracking_mae',alpha=.5):.3f}</b>；CoT 为 <b>{path_metric('thinking_final_answer','1-10','nonadjacent_chord_transport','path_tracking_mae',alpha=.5):.3f} / {path_metric('thinking_final_answer','11-20','nonadjacent_chord_transport','path_tracking_mae',alpha=.5):.3f} / {path_metric('thinking_final_answer','21-30','nonadjacent_chord_transport','path_tracking_mae',alpha=.5):.3f}</b>。这说明 exact-count endpoints 之间的欧氏捷径会穿过非自然区域。</p>
+
+      <h3>9.4 非相邻 count：沿相邻 centroids 的 piecewise curve 移动</h3>
+      <h4>实验</h4>
+      <p>把 <code>mu_r, mu_(r±1), ..., mu_t</code> 依 count 顺序连接成折线，并按 residual-space arc length 归一化。<code>p_curve(alpha)</code> 是走过总弧长 alpha 比例时的点；干预仍为 <code>h' = h_r + p_curve(alpha) - mu_r</code>。因此 curve 与 chord 在 <code>alpha=0</code>、<code>alpha=1</code> 完全相同，只在中间路径不同。</p>
+      <h4>结果</h4>
+      {figure(
+          generated['geometry_path_curve'],
+          'Figure 7C. 沿相邻 centroid 折线的非相邻 count transport',
+          '<b>横纵轴、行列与 alpha 颜色</b>同 Figure 7B，但 intervention point 改为沿相邻 exact-count centroids 的归一化弧长路径。若 count geometry 是弯曲 manifold，该方法应比端点直线更接近 slope=1。'
+      )}
+      {table(nonadjacent_path_rows,[('site','natural site'),('bin','receiver count 区间'),('chord_slope','Layer 4 chord slope (alpha=.5)'),('chord_r2','chord R²'),('chord_mae','chord MAE'),('curve_slope','Layer 4 curve slope (alpha=.5)'),('curve_r2','curve R²'),('curve_mae','curve MAE')])}
+      <h4>分析</h4>
+      <p>Layer 4 的 curve 在六个 natural site×count-bin panels 中，alpha=0.5 slope 都接近 1（范围约 0.985–1.007），tracking MAE 只有 0.109–0.139；对应 chord MAE 为 0.842–1.410。也就是说，模型不只接受目标 centroid，连相邻 centroids 所定义的中间路径也映射到正确的中间 count；直接端点连线则显著偏离。</p>
+
+      <h3>9.5 曲线是否真的优于直线，以及终点 sanity check</h3>
+      <h4>结果</h4>
+      {figure(
+          generated['geometry_path_tracking'],
+          'Figure 7D. Curve 与 chord 在中间 alpha 的 path-tracking error',
+          '<b>横轴</b>是干预 Layer；<b>纵轴</b>是 alpha<1、所有合法非相邻 offsets 上的平均绝对 path-tracking error。橙虚线=端点 chord，绿实线=相邻-centroid curve；越低越好。上行为 non-thinking，下行为 CoT；三列为 count 区间。'
+      )}
+      <p>代码级终点检查覆盖 <b>{int(endpoint_sanity['rows']):,}</b> 条 alpha=1 curve/chord 对：两种路径的预测 count 一致率为 <b>{pct(endpoint_sanity['prediction_agreement'])}</b>，expected-count 最大绝对差仅 <b>{float(endpoint_sanity['max_abs_expected_difference']):.2e}</b>。因此 curve 的优势不是终点或实现不一致造成，而来自中间路径本身。</p>
+      <h4>分析</h4>
+      <div class="callout good"><b>最强结论。</b>自然 non-thinking 与 CoT final-answer residual 都支持 exact-count centroid transport，但其几何不是全局笔直轴：局部相邻 delta 有效，长距离沿相邻 centroid 曲线也近乎一比一，而端点 chord 在中间 alpha 明显偏离。Goodfire-style steering 在这里更适合被描述为<b>沿一条 count-state manifold 做局部 transport</b>，而不是向任意 hidden state 加一根全局 <code>+n</code> 向量。</div>
+      <div class="callout warn"><b>证据边界。</b>Centroids 是同 count 样本均值，curve 是离散折线而非模型显式学习的连续坐标；本节只有单 seed、每个 exact count {geometry_path_examples_per_count} 个 held-out receiver prompts。它证明这些 residual interventions 对当前模型输出具有因果控制力，但不证明模型在线前向时真的沿同一折线逐步移动。</div>
     </section>
     """
 
@@ -2698,6 +4119,10 @@ def build_report(run_dir: Path) -> Path:
     report = report[:attention_end] + geometry_section + report[attention_end:]
     ablation_start, ablation_end = html_section_span(report, "ablation")
     report = report[:ablation_start] + ablation_section + report[ablation_end:]
+    patching_start, patching_end = html_section_span(report, "patching")
+    report = report[:patching_start] + patching_section + report[patching_end:]
+    steering_start, steering_end = html_section_span(report, "steering")
+    report = report[:steering_start] + steering_section + report[steering_end:]
 
     nav_start = report.index('<nav class="toc">')
     nav_end = report.index("</nav>", nav_start) + len("</nav>")

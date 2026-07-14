@@ -28,6 +28,29 @@ from synthetic_counting_v10.report_followups import (
     _layer_matched_order,
     _local_query_positions,
 )
+from synthetic_counting_v10.successor_patching import (
+    DIRECTION_CLOSE,
+    DIRECTION_CONTINUE,
+    run_successor_patching_rows,
+    successor_nested_example_pair,
+)
+from synthetic_counting_v10.successor_conversion import (
+    INTERVENTIONS,
+    run_successor_conversion_rows,
+    summarize_successor_conversion,
+    summarize_successor_logit_lens,
+)
+from synthetic_counting_v10.successor_mlp_features import (
+    _analysis_layers,
+    evaluate_mlp_feature_patching,
+    fit_mlp_feature_statistics,
+    summarize_feature_concentration,
+    summarize_mlp_feature_patching,
+)
+from synthetic_counting_v10.geometry_path_steering import (
+    centroid_chord_point,
+    centroid_polyline_point,
+)
 
 
 def tiny_setup():
@@ -138,3 +161,153 @@ def test_position_local_ablation_runs_at_trace_and_answer_queries_without_leakin
     assert not torch.allclose(local, baseline)
     assert torch.allclose(restored, baseline)
     assert _local_query_positions(item, "ans_token") == [item.spans.ans_pos]
+
+
+def test_successor_pair_is_identical_through_marker_k_and_then_changes_target():
+    cfg, vocab, _ = tiny_setup()
+    short, long = successor_nested_example_pair(cfg, vocab, k=4, seed=81)
+    assert short.count == 4
+    assert long.count == 5
+    assert short.needle_positions == long.needle_positions[:4]
+    assert short.needle_markers == long.needle_markers[:4]
+    assert long.needle_positions[-1] > short.needle_positions[-1]
+
+    short_item = render(short, vocab, "thinking")
+    long_item = render(long, vocab, "thinking")
+    short_query = short_item.spans.trace_marker_positions[3]
+    long_query = long_item.spans.trace_marker_positions[3]
+    assert short_query == long_query
+    assert (
+        short_item.tokens[short_item.spans.think_pos : short_query + 1]
+        == long_item.tokens[long_item.spans.think_pos : long_query + 1]
+    )
+    assert short_item.tokens[short_query + 1] == "</Think>"
+    assert long_item.tokens[long_query + 1] == "<5>"
+
+
+def test_successor_patching_smoke_records_both_directions_and_controls():
+    cfg, vocab, model = tiny_setup()
+    rankings = {
+        "successor": [(0, 0), (1, 0), (0, 1), (1, 1)],
+        "targeted_retrieval": [(1, 1), (0, 1), (1, 0), (0, 0)],
+    }
+    detail = run_successor_patching_rows(
+        model,
+        cfg,
+        vocab,
+        rankings,
+        examples_per_k=1,
+        random_replicates=1,
+        top_ns=(1, 2),
+    )
+    assert set(detail.direction) == {DIRECTION_CONTINUE, DIRECTION_CLOSE}
+    assert set(detail.family) == {
+        "successor_top",
+        "targeted_top",
+        "successor_wrong_row",
+        "random",
+    }
+    assert set(detail.donor_row) == {"marker_query", "index_query"}
+    assert detail.normalized_recovery.notna().any()
+
+
+def test_successor_conversion_smoke_records_all_sublayers_and_interventions():
+    cfg, vocab, model = tiny_setup()
+    logit_detail, patch_detail = run_successor_conversion_rows(
+        model,
+        cfg,
+        vocab,
+        examples_per_k=1,
+    )
+    assert not logit_detail.empty
+    assert not patch_detail.empty
+    assert set(logit_detail.stage) == {
+        "resid_pre",
+        "attn_out",
+        "post_attn",
+        "mlp_out",
+        "post_mlp",
+    }
+    assert set(patch_detail.intervention) == set(INTERVENTIONS)
+    assert patch_detail.patched_margin.notna().all()
+    assert not summarize_successor_logit_lens(logit_detail).empty
+    assert not summarize_successor_conversion(patch_detail).empty
+
+
+def test_successor_mlp_feature_fit_and_held_out_patch_smoke():
+    cfg, vocab, model = tiny_setup()
+    layers = _analysis_layers(cfg)
+    assert layers == (0, 1)
+    statistics, fitted = fit_mlp_feature_statistics(
+        model,
+        cfg,
+        vocab,
+        fit_examples_per_k=1,
+        layers=layers,
+    )
+    assert not statistics.empty
+    assert set(statistics.layer) == set(layers)
+    assert statistics.groupby(["direction", "count_bin", "layer"]).size().min() == cfg.n_inner
+    concentration = summarize_feature_concentration(statistics, (1, 4, cfg.n_inner))
+    assert set(concentration.support_size) == {1, 4, cfg.n_inner}
+
+    detail = evaluate_mlp_feature_patching(
+        model,
+        cfg,
+        vocab,
+        fitted,
+        eval_examples_per_k=1,
+        fit_examples_per_k=1,
+        support_sizes=(1, 4, cfg.n_inner),
+        random_replicates=1,
+        layers=layers,
+        patch_batch_size=8,
+    )
+    assert not detail.empty
+    assert set(detail.family) == {
+        "ranked_feature_replacement",
+        "random_feature_replacement",
+        "sparse_mean_direction",
+        "random_sparse_mean_direction",
+    }
+    assert detail.patched_margin.notna().all()
+    full = detail[
+        (detail.family == "ranked_feature_replacement")
+        & (detail.support_size == cfg.n_inner)
+    ]
+    assert not full.empty
+    assert np.isfinite(full.normalized_recovery).all()
+    assert not summarize_mlp_feature_patching(detail).empty
+
+
+def test_centroid_curve_differs_midway_but_matches_chord_endpoint():
+    centroids = {
+        1: np.asarray([0.0, 0.0], dtype=np.float32),
+        2: np.asarray([1.0, 0.0], dtype=np.float32),
+        3: np.asarray([1.0, 2.0], dtype=np.float32),
+    }
+    chord_mid, chord_count = centroid_chord_point(centroids, 1, 3, 0.5)
+    curve_mid, curve_count = centroid_polyline_point(centroids, 1, 3, 0.5)
+    assert np.allclose(chord_mid, [0.5, 1.0])
+    assert np.allclose(curve_mid, [1.0, 0.5])
+    assert chord_count == 2.0
+    assert curve_count == 2.25
+    chord_end, chord_end_count = centroid_chord_point(centroids, 1, 3, 1.0)
+    curve_end, curve_end_count = centroid_polyline_point(centroids, 1, 3, 1.0)
+    assert np.allclose(chord_end, centroids[3])
+    assert np.allclose(curve_end, centroids[3])
+    assert chord_end_count == curve_end_count == 3.0
+
+
+def test_centroid_curve_supports_reverse_count_transport():
+    centroids = {
+        1: np.asarray([0.0, 0.0], dtype=np.float32),
+        2: np.asarray([1.0, 0.0], dtype=np.float32),
+        3: np.asarray([1.0, 2.0], dtype=np.float32),
+    }
+    start, start_count = centroid_polyline_point(centroids, 3, 1, 0.0)
+    end, end_count = centroid_polyline_point(centroids, 3, 1, 1.0)
+    assert np.allclose(start, centroids[3])
+    assert np.allclose(end, centroids[1])
+    assert start_count == 3.0
+    assert end_count == 1.0
