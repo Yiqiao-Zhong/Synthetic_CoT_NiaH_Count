@@ -51,6 +51,15 @@ from synthetic_counting_v10.geometry_path_steering import (
     centroid_chord_point,
     centroid_polyline_point,
 )
+from synthetic_counting_v10.hidden_state_patching import (
+    _patched_forward,
+    _post_block_states,
+    _prefix_nested_pair,
+    _truncated_thinking_ids,
+    run_final_answer_patching,
+    run_trace_early_stop_patching,
+    run_trace_final_patching,
+)
 
 
 def tiny_setup():
@@ -311,3 +320,78 @@ def test_centroid_curve_supports_reverse_count_transport():
     assert np.allclose(end, centroids[1])
     assert start_count == 3.0
     assert end_count == 1.0
+
+
+def test_hidden_state_patch_uses_matched_post_block_space_and_removes_hook():
+    cfg, vocab, model = tiny_setup()
+    receiver = make_example(cfg, vocab, random.Random(91), count=3)
+    donor = make_example(cfg, vocab, random.Random(92), count=4)
+    receiver_item = render(receiver, vocab, "nonthinking")
+    donor_item = render(donor, vocab, "nonthinking")
+    receiver_ids = torch.tensor([receiver_item.input_ids], dtype=torch.long)
+    donor_ids = torch.tensor([donor_item.input_ids], dtype=torch.long)
+    baseline, receiver_states = _post_block_states(
+        model, receiver_ids, receiver_item.spans.ans_pos
+    )
+    _, donor_states = _post_block_states(model, donor_ids, donor_item.spans.ans_pos)
+    patched = _patched_forward(
+        model,
+        receiver_ids,
+        0,
+        receiver_item.spans.ans_pos,
+        donor_states[0],
+    )
+    restored = model(input_ids=receiver_ids).logits[0]
+    assert len(receiver_states) == cfg.n_layer
+    assert receiver_states[0].shape == donor_states[0].shape == (1, cfg.n_embd)
+    assert patched.shape == baseline.shape
+    assert not torch.allclose(patched, baseline)
+    assert torch.allclose(restored, baseline)
+
+
+def test_prefix_pair_and_truncated_trace_preserve_Mm_position_without_gold_tail():
+    cfg, vocab, _ = tiny_setup()
+    short, long = _prefix_nested_pair(cfg, vocab, 3, 5, seed=93)
+    assert short.needle_positions == long.needle_positions[:3]
+    assert short.needle_markers == long.needle_markers[:3]
+    short_item = render(short, vocab, "thinking")
+    long_item = render(long, vocab, "thinking")
+    truncated_ids, marker_pos, ans_pos = _truncated_thinking_ids(long, vocab, 3)
+    assert marker_pos == short_item.spans.trace_marker_positions[-1]
+    assert marker_pos == long_item.spans.trace_marker_positions[2]
+    assert vocab.decode(truncated_ids[-3:]) == [short.needle_markers[-1], "</Think>", "<Ans>"]
+    assert ans_pos == len(truncated_ids) - 1
+    assert vocab.number_id(5) not in truncated_ids[ans_pos + 1 :]
+
+
+def test_hidden_state_patching_smoke_covers_final_trace_and_early_stop_protocols():
+    cfg = preset_config("debug", count_max=4, patch_offsets=(-1, 1))
+    vocab = Vocab.build(cfg)
+    nonthinking = build_model(cfg, vocab, "cpu").eval()
+    thinking = build_model(cfg, vocab, "cpu").eval()
+    final_detail, final_summary = run_final_answer_patching(
+        {"nonthinking": nonthinking, "thinking": thinking},
+        cfg,
+        vocab,
+        examples_per_pair=1,
+    )
+    trace_detail, trace_summary = run_trace_final_patching(
+        thinking, cfg, vocab, examples_per_pair=1
+    )
+    early_detail, early_summary = run_trace_early_stop_patching(
+        thinking, cfg, vocab, examples_per_pair=1
+    )
+    assert set(final_detail["mode"]) == {"nonthinking", "thinking"}
+    assert (
+        final_detail.groupby(["mode", "receiver_count", "donor_count"])["layer"]
+        .nunique()
+        .min()
+        == cfg.n_layer
+    )
+    assert set(trace_detail["site"]) == {"trace_final_marker_to_final_marker"}
+    assert set(early_detail["site"]) == {"trace_prefix_early_stop"}
+    assert not early_detail["uses_gold_trace_tail"].any()
+    assert early_detail["forced_close_and_ans_tokens"].all()
+    assert {"transport_slope", "transport_r2"}.issubset(final_summary.columns)
+    assert {"transport_slope", "mean_close_margin_shift"}.issubset(early_summary.columns)
+    assert not trace_summary.empty

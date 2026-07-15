@@ -2148,6 +2148,27 @@ def build_report(run_dir: Path) -> Path:
     trace_coordinates.to_csv(tables / "trace_token_mean_pca_coordinates.csv", index=False)
     trace_geometry.to_csv(tables / "trace_token_mean_geometry.csv", index=False)
     trace_progress = pd.read_csv(tables / "trace_progress_transplant_by_bin.csv")
+    hidden_patch_root = run_dir / "analysis" / "hidden_state_patching"
+    hidden_patch_tables = hidden_patch_root / "tables"
+    hidden_patch_figures = hidden_patch_root / "figures"
+    hidden_patch_manifest_path = hidden_patch_root / "manifest.json"
+    hidden_patch_paths = {
+        "final": hidden_patch_tables / "final_answer_patching_summary.csv",
+        "trace_final": hidden_patch_tables / "trace_final_patching_summary.csv",
+        "early": hidden_patch_tables / "trace_early_stop_patching_summary.csv",
+    }
+    if not hidden_patch_manifest_path.exists() or not all(
+        path.exists() for path in hidden_patch_paths.values()
+    ):
+        raise FileNotFoundError(
+            "Missing hidden-state patching outputs. Run "
+            "scripts/run_v10_hidden_state_patching.py for "
+            f"{run_dir} before rebuilding the report."
+        )
+    hidden_patch_manifest = json.loads(hidden_patch_manifest_path.read_text(encoding="utf-8"))
+    hidden_final_summary = pd.read_csv(hidden_patch_paths["final"])
+    hidden_trace_final_summary = pd.read_csv(hidden_patch_paths["trace_final"])
+    hidden_early_summary = pd.read_csv(hidden_patch_paths["early"])
 
     generated = {
         "training_overall": figures / "training_overall_accuracy_and_loss.png",
@@ -2191,6 +2212,10 @@ def build_report(run_dir: Path) -> Path:
         "transplant": figures / "residual_transplant_by_count_bin.png",
         "pca_variance": figures / "pca_variance_by_site_layer.png",
         "pca_static": figures / "pca_count_mean_static.png",
+        "hidden_final_answer": hidden_patch_figures / "final_answer_transport_by_layer.png",
+        "hidden_trace_final": hidden_patch_figures / "trace_final_transport_by_layer.png",
+        "hidden_early_close": hidden_patch_figures / "trace_early_stop_close_margin.png",
+        "hidden_early_transport": hidden_patch_figures / "trace_early_stop_count_transport.png",
     }
     # The legacy inline report body is replaced below after f-string evaluation.
     # Keep these aliases until that body is removed entirely.
@@ -4082,6 +4107,192 @@ def build_report(run_dir: Path) -> Path:
     </section>
     """
 
+    def hidden_patch_value(
+        frame: pd.DataFrame,
+        *,
+        count_bin: str,
+        layer: int,
+        metric: str,
+        mode: str | None = None,
+    ) -> str:
+        rows = frame[(frame["count_bin"] == count_bin) & (frame["layer"] == layer)]
+        if mode is not None:
+            rows = rows[rows["mode"] == mode]
+        return fmt(rows.iloc[0][metric]) if len(rows) else "n/a"
+
+    hidden_final_rows: list[dict[str, object]] = []
+    for mode, mode_label in (("nonthinking", "Non-thinking"), ("thinking", "CoT")):
+        for count_bin in COUNT_BINS:
+            hidden_final_rows.append(
+                {
+                    "mode": mode_label,
+                    "bin": count_bin,
+                    "l1_slope": hidden_patch_value(
+                        hidden_final_summary,
+                        mode=mode,
+                        count_bin=count_bin,
+                        layer=1,
+                        metric="transport_slope",
+                    ),
+                    "l3_slope": hidden_patch_value(
+                        hidden_final_summary,
+                        mode=mode,
+                        count_bin=count_bin,
+                        layer=3,
+                        metric="transport_slope",
+                    ),
+                    "l4_slope": hidden_patch_value(
+                        hidden_final_summary,
+                        mode=mode,
+                        count_bin=count_bin,
+                        layer=4,
+                        metric="transport_slope",
+                    ),
+                    "l4_donor": pct(
+                        select_row(
+                            hidden_final_summary,
+                            mode=mode,
+                            count_bin=count_bin,
+                            layer=4,
+                        )["mean_follows_donor"]
+                    ),
+                }
+            )
+
+    hidden_trace_rows = [
+        {
+            "bin": count_bin,
+            "l1_slope": hidden_patch_value(
+                hidden_trace_final_summary,
+                count_bin=count_bin,
+                layer=1,
+                metric="transport_slope",
+            ),
+            "l4_slope": hidden_patch_value(
+                hidden_trace_final_summary,
+                count_bin=count_bin,
+                layer=4,
+                metric="transport_slope",
+            ),
+            "l4_receiver": pct(
+                select_row(hidden_trace_final_summary, count_bin=count_bin, layer=4)[
+                    "mean_follows_receiver"
+                ]
+            ),
+        }
+        for count_bin in COUNT_BINS
+    ]
+    hidden_early_rows = [
+        {
+            "bin": count_bin,
+            "l3_close": pct(
+                select_row(hidden_early_summary, count_bin=count_bin, layer=3)[
+                    "mean_close_predicted"
+                ]
+            ),
+            "l4_close": pct(
+                select_row(hidden_early_summary, count_bin=count_bin, layer=4)[
+                    "mean_close_predicted"
+                ]
+            ),
+            "l4_margin": hidden_patch_value(
+                hidden_early_summary,
+                count_bin=count_bin,
+                layer=4,
+                metric="mean_close_margin_shift",
+            ),
+            "l4_slope": hidden_patch_value(
+                hidden_early_summary,
+                count_bin=count_bin,
+                layer=4,
+                metric="transport_slope",
+            ),
+        }
+        for count_bin in COUNT_BINS
+    ]
+
+    transplant_section = f"""
+    <section id="transplant">
+      <h2>10. Hidden-state patching：跨 sequence 搬运 count state 与 trace progress</h2>
+      <div class="callout good"><b>本节问题。</b>第 6 节表明 count 可从 residual 读出，第 9 节表明 centroid 路径可用于 steering；这里不再使用类均值，而是把一条 donor sequence 的完整 256 维 residual 精确替换到另一条 receiver sequence 的同一语义位置，再运行剩余 Layers。这样直接检验：某个 token 位置的自然 hidden state 是否足以把 donor count 或“现在可以结束 trace”的状态搬到 receiver。</div>
+
+      <h3>10.1 表示空间、配对方式与结果量</h3>
+      <h4>实验</h4>
+      <div class="protocol"><ol>
+        <li><b>替换的是同一种表示。</b>Donor 与 receiver 都在同一个 Transformer Layer 的 block-output hook 捕获 <em>post-Layer residual</em>，即该 Layer attention、MLP 与两次 residual addition 完成后的 256 维向量；替换后只运行后续 Layers。它不是 embedding、attention value 或 MLP intermediate。</li>
+        <li><b>跨 sequence pair。</b>每个合法有序 count pair <code>m→n</code> 使用 {hidden_patch_manifest['examples_per_pair']} 个独立 nested prompt pair；donor 与 receiver 共享 noise base，count 较小者的 needle 集合是较大者的子集。结果仍按 receiver count 1–10、11–20、21–30 分栏。</li>
+        <li><b>连续结果量。</b>从 30 个 count-token logits 算 <code>E[C]</code>，回归 <code>ΔE[C]=a+b(m−n)</code>。Transport slope <code>b=1</code> 表示 patched 输出一比一随 donor count 移动，<code>b=0</code> 表示没有 count transport；<code>follows donor</code> 则要求 argmax count 恰好等于 m。</li>
+        <li><b>为什么还保留 centroid transplant。</b>Figure 8A 的 centroid intervention 平均掉 donor prompt identity；后续自然-state patch 则保留一条具体 donor sequence 的全部内容。两者一致时，才能更有把握地说 transported signal 是 count state，而不是某个平均化人工方向。</li>
+      </ol></div>
+
+      <h3>10.2 先验基线：exact-count centroid transplant</h3>
+      <h4>结果</h4>
+      {figure(
+          generated['transplant'],
+          'Figure 8A. Count centroid 与单 donor residual 的分层 transport slope',
+          '<b>横轴</b>是 residual 被替换在 Layer 1–4 哪一层之后；<b>纵轴</b>是 expected-count transport slope。蓝线写入独立 direction split 的 exact-count centroid；橙虚线写入一条 donor sequence 的 final-query residual。每行一个 semantic site，每列一个 receiver count 区间。虚线 1 表示理想的一比一 donor-count transport。'
+      )}
+      <h4>分析</h4>
+      <p>Centroid 与自然 donor residual 在后层趋于一致，说明 final-query residual 中确实存在足以控制 count logits 的状态。不过这张旧图混合了不同 patch protocol；下面的三个实验使用统一 block-output hook、明确的 donor/receiver token anchor，并将自然 sequence patch 单独报告。</p>
+
+      <h3>10.3 Final &lt;Ans&gt; patch：Non-thinking 与 CoT 的最终 count state</h3>
+      <h4>实验</h4>
+      <p>分别渲染 non-thinking 与 CoT 的完整 teacher-forced sequence。在 donor 与 receiver 各自最终 <code>&lt;Ans&gt;</code> token，取 after Layer 1–4 的 residual；把 donor count=m 的向量替换到 receiver count=n 的 <code>&lt;Ans&gt;</code>，再计算 receiver 的 count logits。语义 anchor 相同，但 CoT 的绝对位置会随 trace 长度变化，因此这是语义对齐而不是硬拷贝同一数组下标。</p>
+      <h4>结果</h4>
+      {figure(
+          generated['hidden_final_answer'],
+          'Figure 8B. 跨 sequence 的 final-<Ans> natural residual transplant',
+          '<b>横轴</b>是 patch 后继续运行前已经完成的 Layer；<b>纵轴</b>是 expected-count transport slope。三栏按 receiver count 分区；蓝线为 non-thinking，橙线为 CoT。虚线 1 表示 patched 输出一比一跟随 donor count。'
+      )}
+      {table(hidden_final_rows,[('mode','模型'),('bin','receiver count 区间'),('l1_slope','after Layer 1 slope'),('l3_slope','after Layer 3 slope'),('l4_slope','after Layer 4 slope'),('l4_donor','after Layer 4 argmax=donor')])}
+      <h4>分析</h4>
+      <p><b>After Layer 4 的 final-query residual 对两个模型都具有近乎完全的因果充分性。</b>六个 mode×count-bin 条件的 slope 均约为 1，且 argmax 100% 等于 donor count。Non-thinking 的状态随深度逐步成形：21–30 的 slope 从 Layer 1 后的 <b>0.525</b>、Layer 3 后的 <b>0.800</b> 增至 Layer 4 后的 <b>1.000</b>。CoT 则更早形成可执行 count state：11–30 在 Layer 1 后已达 0.807–0.993，Layer 2 后即约为 1。</p>
+      <div class="callout good"><b>因果含义。</b>这比“probe 可读”更强：在新的 receiver prompt 上替换完整 natural residual，输出真的变成 donor count。它支持 non-thinking 通过后层逐步汇总 prompt evidence，而 CoT 在 final <code>&lt;Ans&gt;</code> 前已经把 trace-derived count 压缩成较早可执行的 residual state。</div>
+
+      <h3>10.4 CoT final marker patch：最后一个 marker state 不是最终答案 count state</h3>
+      <h4>实验</h4>
+      <p>把 donor trace 最后一个 marker <code>M_m</code> 的 post-Layer residual，替换到 receiver trace 最后一个 marker <code>M_n</code>；随后让 receiver 自然生成 <code>&lt;/Think&gt; &lt;Ans&gt;</code> 的 readout。这里专门问“最后 marker 自身是否已经携带可直接读出的 donor count”，与 10.3 在最终 <code>&lt;Ans&gt;</code> patch 不同。</p>
+      <h4>结果</h4>
+      {figure(
+          generated['hidden_trace_final'],
+          'Figure 8C. CoT final-marker m→n patch 对最终 count 的 transport',
+          '<b>横轴</b>是 final marker residual 被替换在 Layer 1–4 哪一层之后；<b>纵轴</b>是最终 <code>&lt;Ans&gt;</code> expected-count transport slope。三栏为 receiver count 区间；虚线 1 表示理想 donor-count transport。曲线贴近 0 表示最终答案继续跟随 receiver。'
+      )}
+      {table(hidden_trace_rows,[('bin','receiver count 区间'),('l1_slope','after Layer 1 slope'),('l4_slope','after Layer 4 slope'),('l4_receiver','after Layer 4 argmax=receiver')])}
+      <h4>分析</h4>
+      <p>三个区间、四层的 transport slope 都近似 0；after Layer 4 的最终 count 仍 100% 跟随 receiver。因而“final marker residual”与“final <code>&lt;Ans&gt;</code> count residual”不是同一个状态。关闭 trace 后的 token、位置与后续计算仍会重新构造答案 readout；不能因为最后 marker 与 count 同步出现，就把它当作已经完成的标量 count register。</p>
+
+      <h3>10.5 CoT trace 内部 early-stop patch：短 trace 的终止状态能否关闭长 trace</h3>
+      <h4>实验</h4>
+      <p>构造 count=m 的短 donor 与 count=n&gt;m 的长 receiver，并保证二者前 m 个 needles、前 m 组 <code>&lt;k&gt; M_k</code> trace prefix 完全对齐。Donor 最后 marker <code>M_m</code> 是“下一步应输出 <code>&lt;/Think&gt;</code>”的位置；receiver 的同一 <code>M_m</code> 是内部位置，下一步本应输出 <code>&lt;m+1&gt;</code>。把 donor final-marker residual patch 到 receiver interior marker 后，局部结果量为 <code>logit(&lt;/Think&gt;)−logit(&lt;m+1&gt;)</code> 及是否预测关闭。</p>
+      <p>为避免 gold future trace 泄漏到最终答案，downstream readout 使用<b>另一条截断输入</b>：只包含 receiver prompt、前 m 组 trace、强制的 <code>&lt;/Think&gt;&lt;Ans&gt;</code>，不包含后续 gold trace marker，也不提供答案 token。局部 close 指标与截断 readout 因此是两个分开的 forward。</p>
+      <h4>结果 A：局部关闭决定</h4>
+      {figure(
+          generated['hidden_early_close'],
+          'Figure 8D. Donor final-marker state 是否使 receiver interior marker 提前关闭',
+          '<b>横轴</b>是 patch 所在 Layer；<b>纵轴</b>是 patched receiver 下一 token 预测为 <code>&lt;/Think&gt;</code> 的样本比例。三栏按长 receiver 的 count 分区。1 表示所有 pair 都被 donor 的“现在结束”状态关闭。'
+      )}
+      {table(hidden_early_rows,[('bin','receiver count 区间'),('l3_close','after Layer 3 close rate'),('l4_close','after Layer 4 close rate'),('l4_margin','after Layer 4 close-margin shift'),('l4_slope','forced-close count slope')])}
+      <h4>分析 A</h4>
+      <p>After Layer 4 patch 在三个区间都令 close rate 达到 100%，平均 close-margin 分别增加 <b>32.84 / 30.97 / 29.76</b>；Layer 3 的 close rate 为 <b>69.0% / 28.0% / 26.0%</b>。因此 trace marker residual 在后层确实携带强的局部 progress/termination state，而且该状态可以从“短 trace 的最后一步”因果搬到“长 trace 的内部步骤”。</p>
+      <h4>结果 B：强制关闭后的最终 count</h4>
+      {figure(
+          generated['hidden_early_transport'],
+          'Figure 8E. 截断 trace 强制关闭后，最终答案是否额外运输 donor count',
+          '<b>横轴</b>是 donor final-marker residual 的 patch Layer；<b>纵轴</b>是截断输入最终 <code>&lt;Ans&gt;</code> expected-count 对 donor offset 的 transport slope。三栏为 receiver count 区间。接近 0 表示 patch 本身没有在截断 readout 中增加额外 donor-count 位移。'
+      )}
+      <h4>分析 B</h4>
+      <p>三个区间、四层的 forced-close count transport slope 都约为 0。这里不能把“最终预测常等于 m”当作 donor-state 运输，因为截断 receiver 本身就只展示了 m 个 trace markers；即使不 patch，模型也可以仅凭可见 trace 长度读出 m。最稳健的结论是：final-marker residual 足以搬运<b>局部结束决定</b>，但没有证据表明它还能独立于截断 trace 内容搬运最终 scalar count。</p>
+
+      <h3>10.6 本节结论</h3>
+      <div class="mechanisms">
+        <div class="mechanism"><h3>Non-thinking</h3><p>Final <code>&lt;Ans&gt;</code> count state 从早层到后层逐步变得充分，高 count 最慢；after Layer 4 natural residual 能一比一把 donor count 搬到 receiver。</p></div>
+        <div class="mechanism"><h3>CoT</h3><p>最终 <code>&lt;Ans&gt;</code> 很早就含有可执行 count state；trace final marker 本身不直接等于答案 state，但 marker residual 的后层表示能控制“继续还是结束”。这支持 <b>trace progress/termination</b> 与 <b>final answer count</b> 是相关但不同的 causal states。</p></div>
+      </div>
+      <div class="callout limit"><b>证据边界。</b>所有实验为单 seed、单模型大小、teacher-forced semantic anchors；每个有序 count pair只有 {hidden_patch_manifest['examples_per_pair']} 个 nested base prompt。Early-stop 证明局部终止 state 的充分性，但没有自然 autoregressive rollout，也没有把“终止 state 如何经 <code>&lt;/Think&gt;</code> 转换成最终 count state”的每个中间 sublayer 完整分解。</div>
+    </section>
+    """
+
     report = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Trace Count v10 分层因果机制报告</title><style>{css}</style></head><body><main>
     <header><h1>Trace Count v10：Count-30 分层学习动态与因果机制</h1><p class="subtitle">比较两个独立 Transformer 的直接计数与显式 CoT 检索路径，并把所有 head ablation、head-output patching、geometry steering 与 residual transplant 按 count 1–10、11–20、21–30 重新分析。</p><p class="meta">Run: {html.escape(run_dir.name)} · seed {config['seed']} · self-contained HTML · figures embedded as data URIs</p></header>
     <nav class="toc"><b>目录</b><ol><li><a href="#object">研究对象与机制假设</a></li><li><a href="#setting">数据、模型与 sequence</a></li><li><a href="#definitions">术语、指标与公式</a></li><li><a href="#dynamics">学习动态</a></li><li><a href="#attention">Attention 候选机制</a></li><li><a href="#ablation">分层 head ablation</a></li><li><a href="#patching">分层 activation patching</a></li><li><a href="#steering">分层 geometry steering</a></li><li><a href="#transplant">分层 residual transplant</a></li><li><a href="#geometry">PCA variance 与互动 3D manifold</a></li><li><a href="#synthesis">综合结论与边界</a></li></ol></nav>
@@ -4123,6 +4334,8 @@ def build_report(run_dir: Path) -> Path:
     report = report[:patching_start] + patching_section + report[patching_end:]
     steering_start, steering_end = html_section_span(report, "steering")
     report = report[:steering_start] + steering_section + report[steering_end:]
+    transplant_start, transplant_end = html_section_span(report, "transplant")
+    report = report[:transplant_start] + transplant_section + report[transplant_end:]
 
     nav_start = report.index('<nav class="toc">')
     nav_end = report.index("</nav>", nav_start) + len("</nav>")
