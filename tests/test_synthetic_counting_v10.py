@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 
 import numpy as np
+import pandas as pd
 import torch
 
 from synthetic_counting_v10.attention_causal import (
@@ -52,13 +53,28 @@ from synthetic_counting_v10.geometry_path_steering import (
     centroid_polyline_point,
 )
 from synthetic_counting_v10.hidden_state_patching import (
+    _decode_free_rollout,
+    _directional_regression_summary,
+    _free_rollout_with_residual_patch,
     _patched_forward,
     _post_block_states,
     _prefix_nested_pair,
+    _rollout_factor_summary,
+    _thinking_prefix_ids,
     _truncated_thinking_ids,
+    default_rollout_scenarios,
     run_final_answer_patching,
+    run_misaligned_trace_rollout_patching,
     run_trace_early_stop_patching,
     run_trace_final_patching,
+)
+from synthetic_counting_v10.head_state_bidirectional import (
+    _forward_with_residual_patch_and_attention,
+    _pre_block_states,
+    run_head_to_state,
+    run_state_to_head,
+    summarize_head_to_state,
+    summarize_state_to_head,
 )
 
 
@@ -139,6 +155,62 @@ def test_v10_main_matches_requested_v2_architecture_and_count_range():
     assert cfg.early_stop_patience == 0
     assert cfg.max_render_len == 322
     assert cfg.n_positions >= cfg.max_render_len
+
+
+def test_bidirectional_residual_patch_is_pre_layer_and_hook_safe():
+    cfg, vocab, model = tiny_setup()
+    item = render(make_example(cfg, vocab, random.Random(45), count=5), vocab, "thinking")
+    ids = torch.tensor([item.input_ids], dtype=torch.long)
+    before = sum(len(module._forward_pre_hooks) for module in model.modules())
+    states = _pre_block_states(model, ids, item.spans.ans_pos)
+    logits, attentions = _forward_with_residual_patch_and_attention(
+        model, ids, 0, item.spans.ans_pos, states[0]
+    )
+    after = sum(len(module._forward_pre_hooks) for module in model.modules())
+    assert len(states) == cfg.n_layer
+    assert logits.shape[0] == ids.shape[1]
+    assert logits.shape[1] == len(vocab.id_to_token)
+    assert len(attentions) == cfg.n_layer
+    assert before == after
+
+
+def test_bidirectional_analysis_tables_cover_both_causal_directions():
+    cfg = preset_config("debug", device="cpu")
+    vocab = Vocab.build(cfg)
+    models = {mode: build_model(cfg, vocab, "cpu").eval() for mode in cfg.modes}
+    all_heads = [(layer, head) for layer in range(cfg.n_layer) for head in range(cfg.n_head)]
+    rankings = {
+        "direct_broad": all_heads,
+        "targeted_retrieval": list(reversed(all_heads)),
+        "trace_readout": all_heads,
+        "random": list(reversed(all_heads)),
+    }
+    head_detail = run_head_to_state(
+        models,
+        cfg,
+        vocab,
+        rankings,
+        centroid_examples_per_count=1,
+        eval_examples_per_count=1,
+        seed=46,
+    )
+    state_detail = run_state_to_head(
+        models, cfg, vocab, rankings, examples_per_bin=1, seed=47
+    )
+    assert set(head_detail.mechanism) == {
+        "nonthinking_broad", "cot_targeted", "cot_readout"
+    }
+    assert {"clean", "candidate_top4", "noncandidate4_control"}.issubset(
+        set(head_detail.intervention)
+    )
+    state_summary = summarize_state_to_head(state_detail)
+    assert {"candidate_top4", "all_downstream"} == set(state_summary.head_scope)
+    assert {"clean", "same_state_control", "shifted_state_patch"} == set(
+        state_detail.intervention
+    )
+    assert state_detail.patch_before_layer.min() == 1
+    assert not summarize_head_to_state(head_detail).empty
+    assert not summarize_state_to_head(state_detail).empty
 
 
 def test_layer_matched_controls_preserve_the_ranked_layer_sequence():
@@ -364,6 +436,30 @@ def test_prefix_pair_and_truncated_trace_preserve_Mm_position_without_gold_tail(
     assert vocab.number_id(5) not in truncated_ids[ans_pos + 1 :]
 
 
+def test_free_rollout_prefix_and_parser_do_not_supply_gold_trace_tail():
+    cfg, vocab, model = tiny_setup()
+    example = make_example(cfg, vocab, random.Random(94), count=5)
+    prefix, marker_pos = _thinking_prefix_ids(example, vocab, 3)
+    tokens = vocab.decode(prefix)
+    assert marker_pos == len(prefix) - 1
+    assert tokens[-2:] == ["<3>", example.needle_markers[2]]
+    assert "</Think>" not in tokens
+    assert "<Ans>" not in tokens
+    assert "<4>" not in tokens[marker_pos + 1 :]
+
+    suffix = vocab.encode(["<4>", example.needle_markers[3], "</Think>", "<Ans>", "<5>", "<EOS>"])
+    parsed = _decode_free_rollout(suffix, vocab, receiver_progress=3)
+    assert parsed["closed_trace"] == 1.0
+    assert parsed["first_generated_index"] == 4
+    assert parsed["inferred_stop_index"] == 4
+    assert parsed["final_count"] == 5
+
+    generated = _free_rollout_with_residual_patch(
+        model, prefix, vocab, max_new_tokens=2
+    )
+    assert len(generated) <= 2
+
+
 def test_hidden_state_patching_smoke_covers_final_trace_and_early_stop_protocols():
     cfg = preset_config("debug", count_max=4, patch_offsets=(-1, 1))
     vocab = Vocab.build(cfg)
@@ -382,6 +478,11 @@ def test_hidden_state_patching_smoke_covers_final_trace_and_early_stop_protocols
         thinking, cfg, vocab, examples_per_pair=1
     )
     assert set(final_detail["mode"]) == {"nonthinking", "thinking"}
+    assert set(final_detail["patch_direction"]) == {
+        "donor_gt_receiver",
+        "donor_lt_receiver",
+        "same_count",
+    }
     assert (
         final_detail.groupby(["mode", "receiver_count", "donor_count"])["layer"]
         .nunique()
@@ -389,9 +490,166 @@ def test_hidden_state_patching_smoke_covers_final_trace_and_early_stop_protocols
         == cfg.n_layer
     )
     assert set(trace_detail["site"]) == {"trace_final_marker_to_final_marker"}
+    assert set(trace_detail["patch_direction"]) == {
+        "donor_gt_receiver",
+        "donor_lt_receiver",
+    }
     assert set(early_detail["site"]) == {"trace_prefix_early_stop"}
     assert not early_detail["uses_gold_trace_tail"].any()
     assert early_detail["forced_close_and_ans_tokens"].all()
     assert {"transport_slope", "transport_r2"}.issubset(final_summary.columns)
     assert {"transport_slope", "mean_close_margin_shift"}.issubset(early_summary.columns)
     assert not trace_summary.empty
+    directional = _directional_regression_summary(
+        final_detail,
+        ["mode", "site", "count_bin", "layer"],
+    )
+    assert set(directional.patch_direction) == {
+        "donor_gt_receiver",
+        "donor_lt_receiver",
+    }
+    assert (directional.n_rows > 0).all()
+
+
+def test_misaligned_later_progress_rollout_patching_smoke():
+    cfg = preset_config("debug", count_max=6)
+    vocab = Vocab.build(cfg)
+    thinking = build_model(cfg, vocab, "cpu").eval()
+    detail, summary = run_misaligned_trace_rollout_patching(
+        thinking,
+        cfg,
+        vocab,
+        receiver_count=3,
+        receiver_progress=2,
+        donor_count=5,
+        donor_progress=4,
+        examples=1,
+        centroid_examples=1,
+        max_new_tokens=4,
+    )
+    assert not detail.empty and not summary.empty
+    assert set(detail.patch_policy) == {"none", "one_shot", "persistent"}
+    assert not detail.uses_gold_trace_tail.any()
+    assert not detail.forced_close_or_ans.any()
+    assert (detail.donor_count > detail.receiver_count).all()
+    assert (detail.donor_progress > detail.receiver_progress).all()
+    patched = detail[detail.patch_policy != "none"]
+    assert patched.layer.nunique() == cfg.n_layer
+    assert {
+        "later_progress_donor_full",
+        "total_only_centroid_delta",
+        "progress_only_centroid_delta",
+        "combined_centroid_delta",
+    }.issubset(set(patched.intervention))
+    assert {
+        "receiver_count",
+        "receiver_progress",
+        "donor_count",
+        "donor_progress",
+    }.issubset(summary.columns)
+
+
+def test_misaligned_rollout_can_select_final_layer_and_one_shot_only():
+    cfg = preset_config("debug", count_max=6)
+    vocab = Vocab.build(cfg)
+    thinking = build_model(cfg, vocab, "cpu").eval()
+    detail, _ = run_misaligned_trace_rollout_patching(
+        thinking,
+        cfg,
+        vocab,
+        receiver_count=3,
+        receiver_progress=2,
+        donor_count=5,
+        donor_progress=4,
+        examples=1,
+        centroid_examples=1,
+        max_new_tokens=2,
+        layers=[cfg.n_layer],
+        patch_policies=["one_shot"],
+    )
+    patched = detail[detail.patch_policy != "none"]
+    assert set(patched.layer) == {cfg.n_layer}
+    assert set(patched.patch_policy) == {"one_shot"}
+    assert len(detail) == 8
+
+
+def test_default_rollout_scenarios_cover_total_progress_factorial_design():
+    scenarios = default_rollout_scenarios(30)
+    assert len(scenarios) == 12
+    assert {scenario["scenario_family"] for scenario in scenarios} == {
+        "both_up",
+        "both_down",
+        "progress_only",
+        "total_only",
+        "opposed",
+    }
+    scenario_ids = {scenario["scenario_id"] for scenario in scenarios}
+    assert len(scenario_ids) == len(scenarios)
+    assert all(
+        scenario["receiver_progress"] < scenario["donor_count"]
+        and scenario["donor_progress"] <= scenario["donor_count"]
+        for scenario in scenarios
+    )
+    assert any(
+        scenario["donor_count"] > scenario["receiver_count"]
+        and scenario["donor_progress"] > scenario["receiver_progress"]
+        for scenario in scenarios
+    )
+    assert any(
+        scenario["donor_count"] < scenario["receiver_count"]
+        and scenario["donor_progress"] < scenario["receiver_progress"]
+        for scenario in scenarios
+    )
+    assert any(
+        scenario["donor_count"] == scenario["receiver_count"]
+        and scenario["donor_progress"] != scenario["receiver_progress"]
+        for scenario in scenarios
+    )
+    assert any(
+        scenario["donor_count"] != scenario["receiver_count"]
+        and scenario["donor_progress"] == scenario["receiver_progress"]
+        for scenario in scenarios
+    )
+
+
+def test_rollout_factor_summary_separates_total_and_progress_offsets():
+    rows = []
+    for total_offset, progress_offset in [
+        (-10, -7),
+        (-10, 0),
+        (0, -7),
+        (0, 3),
+        (10, 0),
+        (10, 7),
+        (20, -3),
+        (-10, 5),
+    ]:
+        receiver_count = 15
+        receiver_progress = 8
+        rows.append(
+            {
+                "scenario_id": f"t{total_offset}_p{progress_offset}",
+                "scenario_family": "synthetic",
+                "intervention": "combined_centroid_delta",
+                "patch_policy": "one_shot",
+                "layer": 4,
+                "receiver_count": receiver_count,
+                "receiver_progress": receiver_progress,
+                "donor_count": receiver_count + total_offset,
+                "donor_progress": receiver_progress + progress_offset,
+                "first_generated_index": receiver_progress + 1 + 2.0 * progress_offset,
+                "inferred_stop_index": receiver_count + 1.5 * progress_offset,
+                "final_count": receiver_count + 0.75 * total_offset,
+            }
+        )
+    summary = _rollout_factor_summary(pd.DataFrame(rows))
+    coefficients = {
+        row.outcome: (
+            row.donor_total_coefficient,
+            row.donor_progress_coefficient,
+        )
+        for row in summary.itertuples(index=False)
+    }
+    assert np.allclose(coefficients["first_index_shift"], (0.0, 2.0))
+    assert np.allclose(coefficients["stop_index_shift"], (0.0, 1.5))
+    assert np.allclose(coefficients["final_count_shift"], (0.75, 0.0))

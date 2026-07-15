@@ -245,6 +245,239 @@ def table(rows: list[dict[str, object]], columns: list[tuple[str, str]]) -> str:
     return f"<div class='table-wrap'><table><thead><tr>{head}</tr></thead><tbody>{''.join(body)}</tbody></table></div>"
 
 
+def build_head_state_interaction_section(run_dir: Path) -> str:
+    """Render Section 11 from the formal bidirectional causal-analysis tables."""
+    analysis_dir = run_dir / "analysis" / "head_state_bidirectional"
+    tables_dir = analysis_dir / "tables"
+    figures_dir = analysis_dir / "figures"
+    head_path = tables_dir / "head_to_state_summary.csv"
+    state_path = tables_dir / "state_to_head_summary.csv"
+    manifest_path = analysis_dir / "manifest.json"
+    if not head_path.exists() or not state_path.exists():
+        return """
+        <section id="interaction">
+          <h2>11. Attention head 与 hidden state 的双向因果联系</h2>
+          <div class="callout warn"><b>尚未运行：</b>未找到 <code>analysis/head_state_bidirectional</code> 的正式结果。运行 <code>scripts/run_v10_head_state_bidirectional.py</code> 后重建报告。</div>
+        </section>
+        """
+
+    head = pd.read_csv(head_path)
+    state = pd.read_csv(state_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+
+    def fnum(value: object, digits: int = 3) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "n/a"
+        return "n/a" if not math.isfinite(number) else f"{number:.{digits}f}"
+
+    def fpct(value: object, digits: int = 1) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "n/a"
+        return "n/a" if not math.isfinite(number) else f"{100 * number:.{digits}f}%"
+
+    intervention_labels = {
+        "clean": "clean",
+        "candidate_top1": "候选 top-1",
+        "candidate_top4": "候选 top-4",
+        "matched_control_top1": "同层 control-1",
+        "noncandidate4_control": "候选外 control-4",
+    }
+    mechanism_labels = {
+        "nonthinking_broad": "Non-thinking broad → count state",
+        "cot_targeted": "CoT k-to-k → marker-identity state",
+        "cot_readout": "CoT trace-readout → final count state",
+    }
+
+    final_layer = int(head["eval_layer"].max())
+    head_final = head[head["eval_layer"] == final_layer].copy()
+    head_rows: list[dict[str, object]] = []
+    for mechanism in ("nonthinking_broad", "cot_targeted", "cot_readout"):
+        for count_bin in COUNT_BINS:
+            subset = head_final[(head_final["mechanism"] == mechanism) & (head_final["count_bin"] == count_bin)]
+            for intervention in ("clean", "candidate_top1", "candidate_top4", "noncandidate4_control"):
+                row = subset[subset["intervention"] == intervention]
+                if row.empty:
+                    continue
+                record = row.iloc[0]
+                head_rows.append(
+                    {
+                        "mechanism": mechanism_labels[mechanism],
+                        "bin": count_bin,
+                        "intervention": intervention_labels[intervention],
+                        "geometry": fpct(record["nearest_centroid_accuracy"]),
+                        "output": fpct(record["output_accuracy"]),
+                        "geometry_margin": fnum(record["mean_centroid_margin"]),
+                        "output_margin": fnum(record["mean_output_margin"]),
+                    }
+                )
+
+    targeted_state = state[
+        (state["mechanism"] == "cot_targeted")
+        & (state["intervention"] == "shifted_state_patch")
+        & (state["head_scope"] == "candidate_top4")
+    ]
+    targeted_rows: list[dict[str, object]] = []
+    for count_bin in COUNT_BINS:
+        for _, row in targeted_state[targeted_state["count_bin"] == count_bin].sort_values("patch_before_layer").iterrows():
+            targeted_rows.append(
+                {
+                    "bin": count_bin,
+                    "layer": f"进入 Layer {int(row['patch_before_layer'])} 前",
+                    "shift": fnum(row["mean_signature_shift"]),
+                    "abs_shift": fnum(row["mean_abs_signature_shift"]),
+                    "max_shift": fnum(row["max_abs_signature_shift"]),
+                }
+            )
+
+    final_state = state[
+        (state["intervention"] == "shifted_state_patch")
+        & (state["head_scope"] == "all_downstream")
+        & (state["mechanism"].isin(["nonthinking_broad", "cot_readout"]))
+    ]
+    final_state_rows: list[dict[str, object]] = []
+    for mechanism in ("nonthinking_broad", "cot_readout"):
+        for count_bin in COUNT_BINS:
+            subset = final_state[(final_state["mechanism"] == mechanism) & (final_state["count_bin"] == count_bin)]
+            for _, row in subset.sort_values("patch_before_layer").iterrows():
+                final_state_rows.append(
+                    {
+                        "mechanism": "Non-thinking" if mechanism == "nonthinking_broad" else "CoT final readout",
+                        "bin": count_bin,
+                        "layer": f"Layer {int(row['patch_before_layer'])}",
+                        "routing": fnum(row["mean_abs_signature_shift"]),
+                        "margin": fnum(row["mean_count_margin_shift"], 2),
+                        "receiver": fpct(row["receiver_count_retention"]),
+                        "donor": fpct(row["shifted_donor_adoption"]),
+                    }
+                )
+
+    sample_note = (
+        f"centroid bank 每个 exact count {manifest.get('centroid_examples_per_count', 6)} 个样本；"
+        f"head→state 每个 exact count {manifest.get('eval_examples_per_count', 3)} 个样本；"
+        f"state→head 每个 count bin {manifest.get('state_to_head_examples_per_bin', 5)} 组 donor/receiver pairs。"
+    )
+
+    head_table = table(
+        head_rows,
+        [
+            ("mechanism", "因果链"),
+            ("bin", "count 区间"),
+            ("intervention", "局部 head-output intervention"),
+            ("geometry", "末层 state 分类准确率"),
+            ("output", "局部输出准确率"),
+            ("geometry_margin", "state centroid margin"),
+            ("output_margin", "output logit margin"),
+        ],
+    )
+    targeted_table = table(
+        targeted_rows,
+        [
+            ("bin", "count 区间"),
+            ("layer", "residual patch 位置"),
+            ("shift", "候选 top-4 平均 routing shift"),
+            ("abs_shift", "平均绝对 shift"),
+            ("max_shift", "最大绝对 shift"),
+        ],
+    )
+    final_state_table = table(
+        final_state_rows,
+        [
+            ("mechanism", "模式"),
+            ("bin", "count 区间"),
+            ("layer", "patch 进入该 Layer 前"),
+            ("routing", "下游 heads 平均绝对 routing shift"),
+            ("margin", "receiver-count margin shift"),
+            ("receiver", "仍输出 receiver count"),
+            ("donor", "改输出 donor count"),
+        ],
+    )
+
+    geometry_figure = figure(
+        figures_dir / "head_to_state_geometry.png",
+        "Figure 11A. 局部 head-output mask 对后续 hidden-state geometry 的影响",
+        "三个面板分别对应 direct broad、CoT k-to-k retrieval 与 CoT trace readout。横轴是 intervention；颜色是 gold-count 区间。纵轴是末层局部 state 的 held-out nearest-centroid accuracy。direct/readout 的 centroid 标签是 exact count；targeted 链的标签是当前应写出的 marker identity。这里测的是 head 输出被改动后，后续 residual 是否仍保留正确语义，而不是只看最终 argmax。",
+    )
+    output_figure = figure(
+        figures_dir / "head_to_state_output.png",
+        "Figure 11B. 同一 head intervention 对局部 marker / final-count 输出的影响",
+        "横轴与 Figure 11A 相同；纵轴是局部输出准确率。Non-thinking 和 readout 面板评估 final count，targeted 面板评估当前 trace marker。把 11A 与 11B 并列阅读，可以判断 state geometry 的损伤是否与输出损伤同步。",
+    )
+    routing_figure = figure(
+        figures_dir / "state_to_head_routing.png",
+        "Figure 11C. hidden-state transplant 是否反向改变下游 attention routing",
+        "横轴表示 donor residual 被替换到 receiver 的哪一个 Transformer Layer 之前；纵轴是候选 top-4 heads 的平均 attention-signature shift。实线为 shifted donor，虚线为 same-state donor control；颜色为 count 区间。Targeted 链的 shifted donor 保持总 count 不变，只把 trace progress 从较早 k 换成较晚 j，因此其大幅正 shift 表示 progress state 足以重定向后续 k-to-k routing。",
+    )
+    mediation_figure = figure(
+        figures_dir / "head_state_mediation.png",
+        "Figure 11D. head 导致的 state-margin 损伤是否追踪 output-margin 损伤",
+        "每个点是一个 mechanism × count-bin × intervention。横轴是 hidden centroid margin 相对 clean 的下降，纵轴是 marker/final-count logit margin 的下降；点越靠右上，越符合“head intervention 先损伤语义 state，再损伤输出”的中介链。该图是跨 intervention 的效应对齐，不单独构成 mediation 的统计识别。",
+    )
+
+    return f"""
+    <section id="interaction">
+      <h2>11. Attention head 与 hidden state 的双向因果联系</h2>
+      <p>第 5–6 节只描述 head signature 与 count/marker geometry，第 7–10 节分别证明了若干组件的必要性或可控性。本节把两类干预放到同一批样本上，直接检验两条方向：<b>head → downstream state</b> 与 <b>state → downstream head routing</b>。双向不意味着循环反馈；它只要求两个方向都由实际 intervention 支持。</p>
+      <div class="callout info"><b>统计单位。</b>{sample_note} 本节是单 seed 的机制定位实验，样本量用于稳定复现局部效应，不作为总体显著性检验。</div>
+
+      <h3>11.1 共同实验设计与三个机制链</h3>
+      <div class="definition-grid">
+        <article><h4>方向 A：head → state</h4><p>在语义 query 位置，把指定 attention head 的 <code>c_proj</code> 输入切片置零，只影响该 token 的该 head output；随后在每个 Layer 后读取 residual。Direct/readout 用 exact-count centroid，k-to-k 链用 marker-identity centroid。对照包括 clean、候选 top-1/top-4、同层 control-1 与严格不属于候选 top-4 的 control-4。</p></article>
+        <article><h4>方向 B：state → head</h4><p>先缓存 donor 在某 token 的 residual，再替换 receiver 进入指定 Layer 前的 residual，并读取该层及后续所有 heads 的 attention。Direct/readout 使用不同 count 的 donor→receiver；k-to-k 保持总 count 不变，只改变 trace progress。same-state donor 来自与 receiver 同一语义状态的另一条样本。</p></article>
+      </div>
+      <ul>
+        <li><b>Non-thinking broad chain：</b><code>&lt;Ans&gt;</code> query 的 Layer-1 broad heads → 后续 scalar-count state。</li>
+        <li><b>CoT targeted chain：</b>trace 数字 <code>&lt;k&gt;</code> query 的 k-to-k heads → 当前 marker-identity state。</li>
+        <li><b>CoT readout chain：</b>最终 <code>&lt;Ans&gt;</code> query 的 trace-readout heads → final scalar-count state。</li>
+      </ul>
+
+      <h3>11.2 方向 A：head intervention 是否损伤下游语义 state</h3>
+      <h4>实验</h4>
+      <p>对上述三个 query 分别做局部 per-head output mask，并在最终 Layer 后同时测 nearest-centroid accuracy、centroid margin、局部输出 accuracy 与 logit margin。<code>candidate_top4</code> 是按对应描述性 score 排名前四的 heads；<code>noncandidate4_control</code> 与这四头严格不重叠。</p>
+      <h4>结果</h4>
+      {head_table}
+      {geometry_figure}
+      {output_figure}
+      <h4>分析</h4>
+      <p><b>Non-thinking：</b>mask broad top-1 后末层 count-state accuracy 为 16.7% / 6.7% / 76.7%，累计 top-4 后为 0% / 10% / 0%；输出准确率几乎同步下降，而候选外 control-4 保持 100%。这支持 early broad heads 在 direct counting 中因果上游于 scalar count state。</p>
+      <p><b>CoT targeted：</b>单头 top-1 可被替代，但累计 top-4 后 marker-identity state 降到 53.3% / 40.0% / 40.0%，marker 输出降到 56.7% / 46.7% / 43.3%。不过候选外 control-4 在 21–30 也降到 30%，说明高 count 的 retrieval 依赖分布式 heads；结果支持“候选组必要”，不支持“只有这四头有用”。</p>
+      <p><b>CoT readout：</b>这些局部 mask 下 state 与 final argmax 仍为 100%，但 margin 普遍下降。这表明最终 readout 在当前模型中高度冗余；仅凭高 trace-marker mass 不能断言某个 readout head 独立写入最终 count。</p>
+
+      <h3>11.3 方向 B：hidden progress/count state 是否反向控制 attention routing</h3>
+      <h4>实验</h4>
+      <p>Targeted 链固定 prompt 总 count，只把较早 progress state 移植到较晚 progress query 的对照或反向移植；routing signature 是候选 top-4 对 donor-matching needle 相对 receiver-matching needle 的 attention 差。Direct/readout 使用 5→8、15→18、25→28 的 count donors；同时记录所有下游 heads 的 signature 变化和最终预测是否采用 donor count。</p>
+      <h4>结果：CoT targeted progress → retrieval routing</h4>
+      {targeted_table}
+      {routing_figure}
+      <h4>分析</h4>
+      <p>same-state controls 接近零；shifted progress state 在四个 patch 深度均显著把 targeted heads 推向 donor 所对应的 routing，低/中/高 count 的平均 shift 约为 0.98–1.18、0.53–0.69、0.47–0.61。因而 targeted retrieval 不只是把 marker 写进 hidden state；当前 progress residual 也因果决定下一步 heads 去读哪个 needle。这是本节最强的双向局部耦合证据。</p>
+
+      <h4>结果：scalar count state → direct/readout routing 与输出</h4>
+      {final_state_table}
+      <h4>分析</h4>
+      <p><b>Direct 模式是非对称链。</b>进入 Layer 1 前的 <code>&lt;Ans&gt;</code> residual 只有 token+position embedding，跨 count 相同，因此 patch 不改变 Layer-1 broad routing。进入 Layer 2–4 前移植 count state 后，低 count 会 100% 采用 donor count；中 count 主要发生连续 margin 搬运，只有 Layer 4 达到 40% exact donor adoption；高 count 更弱。与此同时 broad signature 的平均绝对变化很小。这说明 broad heads 先写入 count state，但后期 count state 并不会反向重建已经发生过的 early broad attention。</p>
+      <p><b>CoT final state 对输出充分，但对 readout routing 的控制不稳定。</b>三个区间在四个深度均 100% 采用 donor count；然而候选 readout signature 的变化随 Layer/count 改变方向，高 count 甚至为轻微负值。更合理的解释是 final count residual 可以直接驱动 logits，而 readout heads 是形成该 state 的冗余上游，不是必须被该 state 反向控制的一组固定路由。</p>
+
+      <h3>11.4 head→state→output 的效应对齐</h3>
+      <h4>实验与结果</h4>
+      {mediation_figure}
+      <h4>分析</h4>
+      <p>Direct broad 与 CoT targeted 的大幅 state-margin 损伤通常伴随大幅 output-margin 损伤，符合“head output 改变后续语义 residual，随后影响 logits”的串联解释。CoT readout 的点集中在较小损伤范围，再次显示局部冗余。由于这里没有在同一 intervention 内进一步随机化中介 state，该散点只能作为效应对齐，不能单独声称完成统计 mediation。</p>
+
+      <h3>11.5 综合结论与边界</h3>
+      <div class="mechanism-grid">
+        <article><h4>Non-thinking</h4><p><b>支持：</b>Layer-1 broad heads → downstream scalar-count state → final logits。后期 count-state transplant 足以搬运低 count 输出。<br><b>不支持：</b>count state 反向重建早期 broad routing；这是一条前馈、非对称因果链。</p></article>
+        <article><h4>CoT targeted retrieval</h4><p><b>支持：</b>targeted head 组 → marker-identity state，且 progress state → 下一步 targeted routing。二者组成最清楚的局部双向耦合。<br><b>边界：</b>单头可替代，高 count 下候选外 heads 也重要，circuit 是分布式的。</p></article>
+        <article><h4>CoT final readout</h4><p><b>支持：</b>final scalar state 对 count 输出高度充分。<br><b>尚缺：</b>固定 readout-head 组与该 state 的强双向耦合；局部 mask 与 routing shift 都显示冗余和异质性。</p></article>
+      </div>
+      <div class="callout warn"><b>证据边界：</b>单 seed、局部 query intervention、有限 donor/receiver pairs；nearest-centroid 只测预先定义的 count/marker geometry。结论应表述为该训练实例中的因果 circuit 定位，而不是所有 counting Transformer 的普遍定理。</div>
+    </section>
+    """
+
+
 def html_section_span(document: str, section_id: str) -> tuple[int, int]:
     marker = f'<section id="{section_id}">'
     start = document.index(marker)
@@ -252,7 +485,7 @@ def html_section_span(document: str, section_id: str) -> tuple[int, int]:
     return start, end
 
 
-def finalize_report_numbering(report: str) -> str:
+def finalize_report_numbering(report: str, run_dir: Path | None = None) -> str:
     """Apply the public section order after replacing legacy report sections."""
     replacements = {
         "<h2>7. 分层 activation patching：候选 heads 是否局部充分</h2>":
@@ -283,6 +516,8 @@ def finalize_report_numbering(report: str) -> str:
           <div class="callout warn"><b>当前状态：</b>本节是明确的实验路线图，不把尚未运行的双向干预写成结果。现有证据只支持分别定位候选 attention circuit 与 count-state residual，而不能独立证明前者写入后者，或后者反向控制前者。</div>
         </section>
         """
+        if run_dir is not None:
+            interaction_section = build_head_state_interaction_section(run_dir)
         synthesis_start = report.index('<section id="synthesis">')
         report = report[:synthesis_start] + interaction_section + report[synthesis_start:]
     return report
@@ -1894,14 +2129,14 @@ def interactive_trace_pca(coordinates: pd.DataFrame, geometry: pd.DataFrame) -> 
 
 
 def mechanism_explorer() -> str:
-    """Return a self-contained step-through animation for the two hypotheses."""
+    """Return a self-contained step-through animation for the evidence-updated mechanisms."""
 
     return r"""
     <figure class="mechanism-explorer" aria-labelledby="mechanism-explorer-title">
       <div class="mechanism-explorer-head">
         <div>
-          <h3 id="mechanism-explorer-title">互动机制图：同一个 prompt，两种候选计算路径</h3>
-          <p>这是待检验的计算图，不是把 attention 图直接画成结论。切换模式并逐步播放，观察每一步读取什么、把信息写到哪里，以及对应的因果预测。</p>
+          <h3 id="mechanism-explorer-title">互动机制图：同一个 prompt，两种证据更新后的工作模型</h3>
+          <p>实线步骤已有必要性或局部充分性实验支持；虚线桥接表示当前仍未定位完整 circuit。切换模式并逐步播放，可查看每一步读取什么、写入什么，以及证据边界。</p>
         </div>
         <div class="mechanism-mode-switch" role="group" aria-label="选择计数模式">
           <button type="button" class="mechanism-mode active" data-mechanism-mode="direct" aria-pressed="true">Non-thinking</button>
@@ -1968,7 +2203,7 @@ def mechanism_explorer() -> str:
           </g>
           <g data-step="2" class="mech-step">
             <g class="mech-node trace-marker active-marker"><rect x="470" y="274" width="58" height="44" rx="7"/><text x="499" y="302">M₃</text></g>
-            <g class="mech-node state"><rect x="820" y="82" width="245" height="82" rx="11"/><text x="942" y="113">progress / count state</text><text class="mech-subtext" x="942" y="138">three successful retrievals</text></g>
+             <g class="mech-node state"><rect x="820" y="82" width="245" height="82" rx="11"/><text x="942" y="113">trace progress state</text><text class="mech-subtext" x="942" y="138">retrieval step k; not final scalar count</text></g>
             <path class="mech-flow-arrow cot" d="M 528 296 C 680 292, 760 190, 835 153"/>
           </g>
           <g data-step="3" class="mech-step">
@@ -1977,9 +2212,11 @@ def mechanism_explorer() -> str:
             <text x="620" y="372">successor step: emit k+1, then repeat retrieval</text>
           </g>
           <g data-step="4" class="mech-step">
-            <g class="mech-node answer"><rect x="940" y="270" width="150" height="72" rx="10"/><text x="1015" y="298">final readout</text><text class="mech-answer-token" x="1015" y="325">&lt;Cₙ&gt;</text></g>
-            <path class="mech-flow-arrow cot" d="M 942 164 C 925 205, 940 236, 970 269"/>
-            <text x="795" y="230">after trace close</text>
+             <g class="mech-node state"><rect x="785" y="265" width="205" height="78" rx="10"/><text x="887" y="294">final scalar-count state</text><text class="mech-subtext" x="887" y="320">causally sufficient; source unresolved</text></g>
+             <g class="mech-node answer"><rect x="1030" y="268" width="115" height="72" rx="10"/><text x="1087" y="296">output</text><text class="mech-answer-token" x="1087" y="323">&lt;Cₙ&gt;</text></g>
+             <path class="mech-uncertain-arrow" d="M 942 164 C 920 205, 900 230, 892 264"/>
+             <path class="mech-flow-arrow cot" d="M 990 304 L 1025 304"/>
+             <text x="760" y="222">unresolved compression from trace/context</text>
           </g>
         </svg>
       </div>
@@ -1991,24 +2228,24 @@ def mechanism_explorer() -> str:
         <button id="mechanism-play" type="button" class="mechanism-play" aria-label="播放动画">▶ 播放</button>
       </div>
       <div id="mechanism-step-copy" class="mechanism-step-copy" aria-live="polite"></div>
-      <figcaption>箭头表示本报告要检验的信息路由方向，不等同于单张 attention map。Non-thinking 图中的并行聚合不要求单个 head 独自完成求和；CoT 图中的循环也不预设模型真的执行符号加法，successor 与 progress state 都需要后续 patching、ablation 和 residual transplant 来验证。</figcaption>
+      <figcaption>实线表示已有多类因果证据共同支持的主路径，不表示由单一 head 独立完成；灰色虚线表示当前仍缺完整路径分解。Non-thinking 的 count state 是后层才完全可执行的前馈状态。CoT 的 trace progress state 能控制 retrieval/successor，但不等于最终 scalar-count state；从完整 trace/context 到 final state 的压缩 circuit 仍是开放问题。</figcaption>
     </figure>
     <script>
     (() => {
       const copy = {
         direct: [
           {title:'Step 1 · 形成待计数集合', read:'读取：完整 prompt 中 marker/needle token 的身份与位置。', write:'写入：各位置的局部表示；此时还没有外显计数轨迹。', test:'可证伪预测：若模型完全不区分 needle 与 noise，后续 broad score 和 count probe 不应出现。'},
-          {title:'Step 2 · 并行 broad retrieval', read:'读取：final <Ans> query 通过若干 attention heads 同时访问多个 prompt needles。', write:'写入：needle value vectors 的加权组合，而不是按 k=1,2,… 逐个输出。', test:'可证伪预测：高 broad-score heads 的全局 mask 应比固定随机删除路径更早破坏 final accuracy。'},
-          {title:'Step 3 · 聚合为 cardinality state', read:'读取：多个 head outputs 与既有 residual。', write:'写入：answer-query residual 中可区分 count 1…30 的分布式状态。', test:'可证伪预测：把 donor count 的 head slices 或 residual 搬给 receiver，输出应朝 donor count 移动。'},
-          {title:'Step 4 · 后层变换与离散化', read:'读取：连续的 count-related residual geometry。', write:'写入：30 个 number-token logits 之间更大的正确 margin。', test:'可证伪预测：早层可能负责集合聚合，后层 residual transplant 应更接近一比一决定最终 count。'},
+          {title:'Step 2 · 并行 broad retrieval（已有必要性证据）', read:'读取：final <Ans> query 通过若干 Layer-1 heads 同时访问多个 prompt needles。', write:'写入：needle value vectors 的分布式加权组合，而不是可观察的逐 k trace。', test:'已观察：position-local broad-head ablation 显著伤害 final accuracy，且中高 count 早于同层随机对照下降。'},
+          {title:'Step 3 · 写入 cardinality state（已有局部充分性证据）', read:'读取：多个 broad-head outputs 与既有 residual。', write:'写入：answer-query residual 中可区分 count 1…30 的分布式状态。', test:'已观察：donor broad slices 能运输部分 count；mask broad group 会同步破坏 count geometry 与输出。'},
+          {title:'Step 4 · 后层变换与离散化（结果强，内部算法尚缺）', read:'读取：连续且弯曲的 count-related residual manifold。', write:'写入：30 个 count-token logits 之间的正确 margin。', test:'已观察：Layer-4 residual transplant 一比一搬运 count；尚未像 CoT successor 那样分解 non-thinking MLP features 的具体算术。'},
           {title:'Step 5 · 直接答案读出', read:'读取：<Ans> 位置最后一层 residual。', write:'输出：共享数字 token <Cₙ>，没有中间 trace token。', test:'机制边界：成功输出只证明最终状态足够，不证明内部一定沿一条线性 +1 轴计算。'}
         ],
         cot: [
           {title:'Step 1 · 启动 indexed trace', read:'读取：prompt 与 <Think> 前缀；trace 已生成 1,M₁,2,M₂，当前 query 是数字 3。', write:'写入：当前进度 k=3 的 query state。', test:'可证伪预测：数字 query 的表示应含当前 k/progress 信息，而不仅是绝对位置。'},
-          {title:'Step 2 · k-to-k targeted retrieval', read:'读取：query <3> 定位 prompt 中按位置排序的第 3 个 needle。', write:'写入：该 needle 的 marker identity，为下一 token M₃ 提供证据。', test:'可证伪预测：clean 第 k 个 marker 的 retrieval-head activation patch 应恢复 corrupt run 的 Mₖ logit margin。'},
-          {title:'Step 3 · 写出 marker 并更新进度', read:'读取：retrieved marker identity 与此前 trace。', write:'写入：M₃ token 及“已经完成 3 次有效检索”的 progress/count state。', test:'可证伪预测：trace-marker residual transplant 应改变下一 index/close 决策，而不只是复制 marker identity。'},
-          {title:'Step 4 · successor 与循环', read:'读取：当前 marker 后 residual/progress。', write:'写入：下一数字 4，再以 <4> 查询第 4 个 prompt needle；无下一 needle 时生成 </Think>。', test:'可证伪预测：若只是看前一数字做 +1，移除 prompt retrieval 不应破坏 marker；若是纯检索，successor/close 又不应依赖 progress state。'},
-          {title:'Step 5 · trace-mediated final readout', read:'读取：完整 trace、trace 长度/进度 residual，以及可能仍可访问的 prompt。', write:'输出：最终共享数字 token <Cₙ>。', test:'可证伪预测：固定或冲突 trace、final residual patching 可区分答案究竟跟随 prompt count、trace count，还是二者的混合。'}
+          {title:'Step 2 · k-to-k targeted retrieval（强多头因果证据）', read:'读取：query <3> 定位 prompt 中按位置排序的第 3 个 needle。', write:'写入：该 needle 的 marker identity，为下一 token M₃ 提供证据。', test:'已观察：top-2/top-4 clean head-output patch 恢复 Mₖ margin；position-local group ablation 显著伤害 marker accuracy，但单头可替代。'},
+          {title:'Step 3 · 写出 marker 并更新 progress', read:'读取：retrieved marker identity 与此前 trace。', write:'写入：M₃ token 及“已完成 3 次检索”的 trace-progress state；该 state 不是最终 scalar count register。', test:'已观察：marker residual transplant 能改变下一 index/close，却不能独立搬运最终 count。'},
+          {title:'Step 4 · successor/close 与循环（强局部因果证据）', read:'读取：当前 Mₖ 后 residual/progress 以及 prompt 中是否仍有下一 needle。', write:'写入：下一数字 k+1，或在无下一 needle 时生成 </Think>。', test:'已观察：successor-head bundle 可双向搬运 continue/close evidence；Layer-3 MLP 转换证据，Layer-4 分布式 features 写入具体 token logit。'},
+          {title:'Step 5 · final scalar readout（状态充分，上游 circuit 尚缺）', read:'读取：完整 trace/context 压缩后的 final <Ans> residual；具体由哪些 trace、position、prompt 信号构造仍未完全定位。', write:'输出：最终共享数字 token <Cₙ>。', test:'已观察：final residual transplant 一比一搬运 donor count；但固定 trace-readout heads 的 local ablation 高度冗余，head-slice patch 也不足以搬运 scalar。'}
         ]
       };
       let mode='direct', step=0, timer=null;
@@ -2154,8 +2391,15 @@ def build_report(run_dir: Path) -> Path:
     hidden_patch_manifest_path = hidden_patch_root / "manifest.json"
     hidden_patch_paths = {
         "final": hidden_patch_tables / "final_answer_patching_summary.csv",
+        "final_directional": hidden_patch_tables
+        / "final_answer_patching_directional_summary.csv",
         "trace_final": hidden_patch_tables / "trace_final_patching_summary.csv",
+        "trace_final_directional": hidden_patch_tables
+        / "trace_final_patching_directional_summary.csv",
         "early": hidden_patch_tables / "trace_early_stop_patching_summary.csv",
+        "rollout": hidden_patch_tables / "misaligned_trace_rollout_summary.csv",
+        "rollout_factors": hidden_patch_tables
+        / "misaligned_trace_rollout_factor_summary.csv",
     }
     if not hidden_patch_manifest_path.exists() or not all(
         path.exists() for path in hidden_patch_paths.values()
@@ -2167,8 +2411,14 @@ def build_report(run_dir: Path) -> Path:
         )
     hidden_patch_manifest = json.loads(hidden_patch_manifest_path.read_text(encoding="utf-8"))
     hidden_final_summary = pd.read_csv(hidden_patch_paths["final"])
+    hidden_final_directional = pd.read_csv(hidden_patch_paths["final_directional"])
     hidden_trace_final_summary = pd.read_csv(hidden_patch_paths["trace_final"])
+    hidden_trace_final_directional = pd.read_csv(
+        hidden_patch_paths["trace_final_directional"]
+    )
     hidden_early_summary = pd.read_csv(hidden_patch_paths["early"])
+    hidden_rollout_summary = pd.read_csv(hidden_patch_paths["rollout"])
+    hidden_rollout_factors = pd.read_csv(hidden_patch_paths["rollout_factors"])
 
     generated = {
         "training_overall": figures / "training_overall_accuracy_and_loss.png",
@@ -2216,6 +2466,16 @@ def build_report(run_dir: Path) -> Path:
         "hidden_trace_final": hidden_patch_figures / "trace_final_transport_by_layer.png",
         "hidden_early_close": hidden_patch_figures / "trace_early_stop_close_margin.png",
         "hidden_early_transport": hidden_patch_figures / "trace_early_stop_count_transport.png",
+        "hidden_upward_transport": hidden_patch_figures
+        / "donor_gt_receiver_scalar_transport.png",
+        "hidden_rollout_first": hidden_patch_figures
+        / "misaligned_rollout_first_index.png",
+        "hidden_rollout_stop": hidden_patch_figures
+        / "misaligned_rollout_stop_index.png",
+        "hidden_rollout_final": hidden_patch_figures
+        / "misaligned_rollout_final_count.png",
+        "hidden_rollout_factors": hidden_patch_figures
+        / "misaligned_rollout_factor_coefficients.png",
     }
     # The legacy inline report body is replaced below after f-string evaluation.
     # Keep these aliases until that body is removed entirely.
@@ -3230,7 +3490,7 @@ def build_report(run_dir: Path) -> Path:
     css = """
     :root{--ink:#172033;--muted:#526078;--line:#dce4ef;--soft:#f5f8fc;--blue:#2563eb;--green:#15803d;--orange:#ea580c;--red:#b91c1c}
     *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:#edf2f7;color:var(--ink);font-family:Inter,"Noto Sans SC","Microsoft YaHei",Arial,sans-serif;line-height:1.72}main{max-width:1460px;margin:auto;background:white;min-height:100vh;padding:46px 58px 84px}h1{font-size:36px;line-height:1.22;margin:0 0 12px}h2{font-size:27px;margin:54px 0 20px;padding-top:12px;border-top:1px solid var(--line)}h3{font-size:18px;margin:0 0 12px}p,li{font-size:16px}.subtitle{font-size:18px;color:var(--muted);max-width:1120px}.meta,.small{font-size:14px;color:var(--muted)}code{background:#edf2f7;padding:2px 6px;border-radius:4px;font-family:"Cascadia Mono",Consolas,monospace;overflow-wrap:anywhere}.toc{columns:2;border:1px solid var(--line);background:var(--soft);padding:20px 28px;margin:28px 0}.toc a{color:#1d4ed8;text-decoration:none}.callout{border-left:5px solid var(--blue);background:#eff6ff;padding:16px 20px;margin:18px 0;border-radius:0 8px 8px 0}.callout.good{border-color:#16a34a;background:#f0fdf4}.callout.warn{border-color:#f59e0b;background:#fffbeb}.callout.limit{border-color:#dc2626;background:#fef2f2}.protocol{border:1px solid var(--line);background:#fbfdff;padding:18px 22px;border-radius:8px;margin:16px 0}.formula{border:1px solid var(--line);background:#f8fafc;padding:13px 17px;margin:12px 0;font-family:"Cambria Math",serif;overflow-x:auto}.table-wrap{overflow-x:auto;margin:16px 0 24px}table{width:100%;border-collapse:collapse;font-size:14.5px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#eaf0f7;text-align:left}tr:nth-child(even) td{background:#fbfdff}.figure,.interactive-figure{border:1px solid var(--line);border-radius:8px;padding:18px;margin:22px 0;background:#fff}.figure img{display:block;width:100%;max-height:930px;object-fit:contain;margin:auto}.figure figcaption,.interactive-figure figcaption{color:#44526a;font-size:14.5px;margin-top:12px}.controls{display:flex;flex-wrap:wrap;gap:12px 18px;align-items:end;background:var(--soft);padding:12px;border-radius:6px}.controls label{font-size:13px;font-weight:650;display:flex;flex-direction:column;gap:4px}.controls select,.controls button{font:inherit;padding:7px 9px;border:1px solid #b8c4d5;border-radius:4px;background:white}.stats{margin:10px 0;color:#334155;font-size:14px}.interactive-figure canvas{display:block;width:100%;height:590px;border:1px solid var(--line);background:#fbfdff}.mechanisms{display:grid;grid-template-columns:1fr 1fr;gap:18px}.mechanism{border:1px solid var(--line);border-radius:8px;padding:18px;background:#fbfdff}.flow{display:flex;align-items:center;justify-content:center;flex-wrap:wrap;gap:8px;padding:14px 0}.node{padding:9px 12px;border:1px solid #93c5fd;background:#eff6ff;border-radius:5px;font-weight:650}.arrow{font-size:22px;color:#64748b}
-    .metric-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin:16px 0 26px}.metric-card{border:1px solid #d3ddea;border-radius:7px;background:#fbfdff;padding:16px 17px;min-width:0}.metric-card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:11px}.metric-card-head code{font-size:14px;font-weight:750;color:#1e3a5f;background:#e7f0fb}.metric-context{font-size:12px;text-align:right;color:#526078;line-height:1.35}.metric-context span{display:block;text-transform:uppercase;font-size:10px;font-weight:800;color:#7c8ba1;letter-spacing:.04em}.metric-card p{font-size:14px;line-height:1.58;color:#44526a;margin:11px 0 0}.equation{display:flex;align-items:center;justify-content:center;min-height:92px;text-align:center;color:#111827;background:#fff;border:1px solid #e0e7f0;border-radius:5px;padding:12px 14px;overflow-x:auto;overflow-y:hidden}.equation.compact{min-height:64px;margin-top:8px}.equation math{display:block;margin:auto;font-family:"STIX Two Math","Latin Modern Math","Cambria Math",serif;font-size:24px;line-height:1.25}.equation mtext{font-family:Inter,"Noto Sans SC","Microsoft YaHei",Arial,sans-serif;font-size:.72em}.formula-block{border:1px solid var(--line);background:#f8fafc;padding:15px 17px;margin:13px 0;border-radius:6px}.formula-block h4{font-size:15px;margin:0 0 9px}.formula-block p{font-size:14.5px;color:#44526a;margin:10px 0 0}.symbol-key{display:flex;flex-wrap:wrap;gap:8px 18px;margin:10px 0}.symbol-key span{font-size:14px;color:#44526a}.symbol-key b{font-family:"STIX Two Math","Latin Modern Math","Cambria Math",serif;font-size:17px;color:#172033}.mechanism-explorer{border:1px solid var(--line);border-radius:8px;padding:20px;margin:22px 0;background:#fff}.mechanism-explorer-head{display:flex;justify-content:space-between;gap:24px;align-items:flex-start}.mechanism-explorer-head p{margin:5px 0 0;color:var(--muted);font-size:14.5px;max-width:780px}.mechanism-mode-switch{display:flex;min-width:290px;border:1px solid #aebbd0;border-radius:6px;overflow:hidden}.mechanism-mode{flex:1;border:0;border-right:1px solid #aebbd0;background:#fff;color:#334155;padding:10px 13px;font:inherit;font-size:14px;font-weight:700;cursor:pointer}.mechanism-mode:last-child{border-right:0}.mechanism-mode.active{background:#1d4ed8;color:#fff}.mechanism-player{margin-top:16px;border:1px solid var(--line);border-radius:6px;background:#fbfdff;overflow:hidden}.mechanism-scene{display:none;width:100%;height:auto;min-height:390px}.mechanism-scene.active{display:block}.mechanism-scene text{font-family:Inter,"Noto Sans SC","Microsoft YaHei",Arial,sans-serif;fill:#243047;font-size:16px;text-anchor:middle}.mechanism-scene .mech-region{fill:#f7faff;stroke:#b9c6d8;stroke-width:2}.mechanism-scene .mech-region.trace{fill:#f2fbf5;stroke:#a6d4b2}.mechanism-scene .mech-region-title{text-anchor:start;font-size:17px;font-weight:750}.mechanism-scene .mech-node rect{stroke-width:2}.mechanism-scene .mech-node.needle rect,.mechanism-scene .mech-node.trace-marker rect{fill:#dcfce7;stroke:#22a55b}.mechanism-scene .mech-node.query rect,.mechanism-scene .mech-node.trace-token rect{fill:#dbeafe;stroke:#3b82f6}.mechanism-scene .mech-node.state rect{fill:#fff7ed;stroke:#f97316}.mechanism-scene .mech-node.transform rect{fill:#f3e8ff;stroke:#8b5cf6}.mechanism-scene .mech-node.answer rect{fill:#fee2e2;stroke:#dc2626}.mechanism-scene .mech-node.target rect,.mechanism-scene .mech-node.active-marker rect,.mechanism-scene .mech-node.successor rect{stroke-width:4}.mechanism-scene .mech-node text{font-weight:750}.mechanism-scene .mech-subtext{font-size:13px;font-weight:500;fill:#526078}.mechanism-scene .mech-answer-token{font-size:18px;font-weight:850;fill:#b91c1c}.mechanism-scene .mech-noise circle{fill:#cbd5e1}.mechanism-scene .mech-ellipsis{font-size:25px}.mechanism-scene .mech-step{opacity:.1;transition:opacity .45s ease}.mechanism-scene .mech-step.visible{opacity:1}.mechanism-scene .mech-step.current .mech-node{filter:drop-shadow(0 0 7px rgba(37,99,235,.33))}.mechanism-scene .mech-links path,.mechanism-scene .mech-flow-arrow,.mechanism-scene .mech-loop-arrow{fill:none;stroke:#2563eb;stroke-width:3;color:#2563eb;marker-end:url(#direct-arrow)}.mechanism-scene .targeted-link path,.mechanism-scene .mech-flow-arrow.cot,.mechanism-scene .mech-loop-arrow{stroke:#16a34a;color:#16a34a;marker-end:url(#cot-arrow)}.mechanism-scene .aggregate-links path{stroke:#ea580c;color:#ea580c}.mechanism-scene .mech-step.current path{stroke-dasharray:9 7;animation:mechanismDash 1.1s linear infinite}.mechanism-timeline{display:flex;align-items:center;justify-content:center;gap:14px;margin:16px 0 12px}.mechanism-timeline>button{border:1px solid #aebbd0;border-radius:5px;background:#fff;color:#243047;min-width:42px;height:38px;font-size:23px;cursor:pointer}.mechanism-timeline .mechanism-play{font-size:14px;min-width:92px;font-weight:700}.mechanism-dots{display:flex;gap:10px}.mechanism-dot{width:12px;height:12px;border:1px solid #64748b;border-radius:50%;padding:0;background:#fff;cursor:pointer}.mechanism-dot.active{background:#2563eb;border-color:#2563eb;box-shadow:0 0 0 4px #dbeafe}.mechanism-step-copy{border-left:5px solid #2563eb;border-radius:0 7px 7px 0;background:#eff6ff;padding:13px 17px}.mechanism-step-title{font-size:17px;font-weight:800;margin-bottom:7px}.mechanism-step-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.mechanism-step-grid p{margin:0;background:rgba(255,255,255,.74);border:1px solid #d7e3f5;border-radius:5px;padding:9px 11px;font-size:14px;line-height:1.55}.mechanism-explorer figcaption{color:#44526a;font-size:14.5px;margin-top:13px}@keyframes mechanismDash{to{stroke-dashoffset:-32px}}@media(prefers-reduced-motion:reduce){.mechanism-scene .mech-step{transition:none}.mechanism-scene .mech-step.current path{animation:none}}
+    .metric-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin:16px 0 26px}.metric-card{border:1px solid #d3ddea;border-radius:7px;background:#fbfdff;padding:16px 17px;min-width:0}.metric-card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:11px}.metric-card-head code{font-size:14px;font-weight:750;color:#1e3a5f;background:#e7f0fb}.metric-context{font-size:12px;text-align:right;color:#526078;line-height:1.35}.metric-context span{display:block;text-transform:uppercase;font-size:10px;font-weight:800;color:#7c8ba1;letter-spacing:.04em}.metric-card p{font-size:14px;line-height:1.58;color:#44526a;margin:11px 0 0}.equation{display:flex;align-items:center;justify-content:center;min-height:92px;text-align:center;color:#111827;background:#fff;border:1px solid #e0e7f0;border-radius:5px;padding:12px 14px;overflow-x:auto;overflow-y:hidden}.equation.compact{min-height:64px;margin-top:8px}.equation math{display:block;margin:auto;font-family:"STIX Two Math","Latin Modern Math","Cambria Math",serif;font-size:24px;line-height:1.25}.equation mtext{font-family:Inter,"Noto Sans SC","Microsoft YaHei",Arial,sans-serif;font-size:.72em}.formula-block{border:1px solid var(--line);background:#f8fafc;padding:15px 17px;margin:13px 0;border-radius:6px}.formula-block h4{font-size:15px;margin:0 0 9px}.formula-block p{font-size:14.5px;color:#44526a;margin:10px 0 0}.symbol-key{display:flex;flex-wrap:wrap;gap:8px 18px;margin:10px 0}.symbol-key span{font-size:14px;color:#44526a}.symbol-key b{font-family:"STIX Two Math","Latin Modern Math","Cambria Math",serif;font-size:17px;color:#172033}.mechanism-explorer{border:1px solid var(--line);border-radius:8px;padding:20px;margin:22px 0;background:#fff}.mechanism-explorer-head{display:flex;justify-content:space-between;gap:24px;align-items:flex-start}.mechanism-explorer-head p{margin:5px 0 0;color:var(--muted);font-size:14.5px;max-width:780px}.mechanism-mode-switch{display:flex;min-width:290px;border:1px solid #aebbd0;border-radius:6px;overflow:hidden}.mechanism-mode{flex:1;border:0;border-right:1px solid #aebbd0;background:#fff;color:#334155;padding:10px 13px;font:inherit;font-size:14px;font-weight:700;cursor:pointer}.mechanism-mode:last-child{border-right:0}.mechanism-mode.active{background:#1d4ed8;color:#fff}.mechanism-player{margin-top:16px;border:1px solid var(--line);border-radius:6px;background:#fbfdff;overflow:hidden}.mechanism-scene{display:none;width:100%;height:auto;min-height:390px}.mechanism-scene.active{display:block}.mechanism-scene text{font-family:Inter,"Noto Sans SC","Microsoft YaHei",Arial,sans-serif;fill:#243047;font-size:16px;text-anchor:middle}.mechanism-scene .mech-region{fill:#f7faff;stroke:#b9c6d8;stroke-width:2}.mechanism-scene .mech-region.trace{fill:#f2fbf5;stroke:#a6d4b2}.mechanism-scene .mech-region-title{text-anchor:start;font-size:17px;font-weight:750}.mechanism-scene .mech-node rect{stroke-width:2}.mechanism-scene .mech-node.needle rect,.mechanism-scene .mech-node.trace-marker rect{fill:#dcfce7;stroke:#22a55b}.mechanism-scene .mech-node.query rect,.mechanism-scene .mech-node.trace-token rect{fill:#dbeafe;stroke:#3b82f6}.mechanism-scene .mech-node.state rect{fill:#fff7ed;stroke:#f97316}.mechanism-scene .mech-node.transform rect{fill:#f3e8ff;stroke:#8b5cf6}.mechanism-scene .mech-node.answer rect{fill:#fee2e2;stroke:#dc2626}.mechanism-scene .mech-node.target rect,.mechanism-scene .mech-node.active-marker rect,.mechanism-scene .mech-node.successor rect{stroke-width:4}.mechanism-scene .mech-node text{font-weight:750}.mechanism-scene .mech-subtext{font-size:13px;font-weight:500;fill:#526078}.mechanism-scene .mech-answer-token{font-size:18px;font-weight:850;fill:#b91c1c}.mechanism-scene .mech-noise circle{fill:#cbd5e1}.mechanism-scene .mech-ellipsis{font-size:25px}.mechanism-scene .mech-step{opacity:.1;transition:opacity .45s ease}.mechanism-scene .mech-step.visible{opacity:1}.mechanism-scene .mech-step.current .mech-node{filter:drop-shadow(0 0 7px rgba(37,99,235,.33))}.mechanism-scene .mech-links path,.mechanism-scene .mech-flow-arrow,.mechanism-scene .mech-loop-arrow{fill:none;stroke:#2563eb;stroke-width:3;color:#2563eb;marker-end:url(#direct-arrow)}.mechanism-scene .targeted-link path,.mechanism-scene .mech-flow-arrow.cot,.mechanism-scene .mech-loop-arrow{stroke:#16a34a;color:#16a34a;marker-end:url(#cot-arrow)}.mechanism-scene .aggregate-links path{stroke:#ea580c;color:#ea580c}.mechanism-scene .mech-uncertain-arrow{fill:none;stroke:#64748b;stroke-width:3;stroke-dasharray:9 7;marker-end:url(#cot-arrow)}.mechanism-scene .mech-step.current path{stroke-dasharray:9 7;animation:mechanismDash 1.1s linear infinite}.mechanism-timeline{display:flex;align-items:center;justify-content:center;gap:14px;margin:16px 0 12px}.mechanism-timeline>button{border:1px solid #aebbd0;border-radius:5px;background:#fff;color:#243047;min-width:42px;height:38px;font-size:23px;cursor:pointer}.mechanism-timeline .mechanism-play{font-size:14px;min-width:92px;font-weight:700}.mechanism-dots{display:flex;gap:10px}.mechanism-dot{width:12px;height:12px;border:1px solid #64748b;border-radius:50%;padding:0;background:#fff;cursor:pointer}.mechanism-dot.active{background:#2563eb;border-color:#2563eb;box-shadow:0 0 0 4px #dbeafe}.mechanism-step-copy{border-left:5px solid #2563eb;border-radius:0 7px 7px 0;background:#eff6ff;padding:13px 17px}.mechanism-step-title{font-size:17px;font-weight:800;margin-bottom:7px}.mechanism-step-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.mechanism-step-grid p{margin:0;background:rgba(255,255,255,.74);border:1px solid #d7e3f5;border-radius:5px;padding:9px 11px;font-size:14px;line-height:1.55}.mechanism-explorer figcaption{color:#44526a;font-size:14.5px;margin-top:13px}@keyframes mechanismDash{to{stroke-dashoffset:-32px}}@media(prefers-reduced-motion:reduce){.mechanism-scene .mech-step{transition:none}.mechanism-scene .mech-step.current path{animation:none}}
     @media(max-width:900px){main{padding:28px 18px}.toc{columns:1}.mechanisms,.metric-grid{grid-template-columns:1fr}.interactive-figure canvas{height:430px}.mechanism-explorer-head{display:block}.mechanism-mode-switch{min-width:0;width:100%;margin-top:14px}.mechanism-step-grid{grid-template-columns:1fr}.mechanism-scene{min-height:300px}.metric-card-head{display:block}.metric-context{text-align:left;margin-top:8px}}
     @media print{body{background:white}main{max-width:none;padding:20px}.interactive-figure,.mechanism-timeline{display:none}.figure{break-inside:avoid}.mechanism-scene .mech-step{opacity:1}.mechanism-step-copy{break-inside:avoid}}
     """
@@ -3259,59 +3519,63 @@ def build_report(run_dir: Path) -> Path:
     )
     mechanism_rows = [
         {
-            "aspect": "直接优化的输出",
-            "direct": "给定 prompt，紧接 <Ans> 预测唯一的 count token C_n；没有可观察的中间步骤。",
-            "cot": "先生成 1,M1,2,M2,…,n,Mn 的 indexed trace，再在 </Think><Ans> 后预测同一套数字 token C_n。",
+            "aspect": "已支持的主要路由",
+            "direct": "Layer-1 broad-head bundle 在 <Ans> 并行访问 needle set，并把集合证据写入后续 count residual。",
+            "cot": "progress residual 控制数字 <k> 的 targeted multi-head routing；retrieved marker 再进入 successor/close 更新。",
         },
         {
-            "aspect": "候选 attention 路由",
-            "direct": "final query 并行访问多个 prompt needles；候选 broad heads 同时满足较高 needle mass 与较高 needle-subset entropy。",
-            "cot": "每个数字 query <k> 定向访问排序后的第 k 个 prompt needle；候选 targeted heads 具有较高 k-to-k mass。",
+            "aspect": "head-level 因果状态",
+            "direct": "Broad top-n local ablation 破坏 final count；donor broad slices 可运输部分 count，且 head mask 同步破坏 count geometry 与输出。",
+            "cot": "Targeted top-2/top-4 clean patch 恢复 M_k；successor bundle 双向运输 continue/close evidence；单头均可替代。",
         },
         {
-            "aspect": "候选计数状态",
-            "direct": "多个 needle value 的聚合结果被写入 <Ans> residual；后层把分布式 cardinality state 变为 count logits。",
-            "cot": "每次成功检索写出 M_k，并在 trace token residual 中更新 progress/count state；successor 决定 k+1 或关闭 trace。",
+            "aspect": "hidden-state 因果状态",
+            "direct": "Final <Ans> count state 随 Layer 逐步成形；Layer-4 natural residual/centroid 对 donor count 近一比一充分。",
+            "cot": "Trace marker residual 是 progress/termination state；final <Ans> residual 是另一种 scalar-count state，二者不能互换。",
         },
         {
-            "aspect": "最终答案从哪里读",
-            "direct": "直接从 natural final-answer query 的最后 residual 读出。",
-            "cot": "可能从完整 trace、最终 progress state、prompt，或这些来源的混合中读出；固定/冲突 trace 干预用于拆分来源。",
+            "aspect": "最清楚的双向联系",
+            "direct": "未观察到对称反馈；更符合 broad heads → count state → logits 的前馈链。",
+            "cot": "Targeted heads → marker-identity state，且 progress state → 下一步 targeted routing；这是当前最强的局部双向耦合。",
         },
         {
-            "aspect": "关键因果预测",
-            "direct": "mask broad heads 应降低 final accuracy；donor head/residual patch 应让预测随 donor count 移动。",
-            "cot": "targeted patch 应恢复 M_k；progress transplant 应改变 next-index/close；final-state patch 应搬运最终 count。",
+            "aspect": "仍未定位的桥接",
+            "direct": "Broad evidence 经哪些具体 non-thinking MLP features 完成集合求和与 30-way logit 离散化，尚未像 CoT successor 那样分解。",
+            "cot": "完整 trace/context 如何压缩成 final scalar-count state 尚不清楚；固定 trace-readout heads 的必要性与 donor transport 都弱。",
         },
         {
-            "aspect": "什么结果会推翻纯版本",
-            "direct": "若有效 head 只盯单个位置，或 count residual 无法被搬运，则“纯 broad aggregation”不足。",
-            "cot": "若 marker 预测不依赖 matching needle，或最终答案完全忽略 trace/progress，则“纯 retrieval loop”不足。",
+            "aspect": "被当前结果排除的纯版本",
+            "direct": "不支持一根跨 1–30 恒定的全局 +1 轴，也不支持后期 count state 反向重建早期 broad routing。",
+            "cot": "不支持唯一 retrieval head、final marker=scalar count register，或一组固定 readout heads 独立写出最终 count。",
         },
     ]
     object_section = f"""
     <section id="object">
-      <h2>1. 研究对象、目标与两个机制假设</h2>
-      <p>两个模型看到同一类 256-token prompt、同一套 marker tokens 和同一套 count tokens，模型规模也完全相同；差别只在于<b>被要求生成什么输出序列</b>。Non-thinking 模型必须把 prompt 直接压缩成一个 count，CoT 模型必须先把每个被计数对象以 indexed trace 外显出来，再回答 count。我们关心的不是给这两种格式贴一个名字，而是检验它们是否诱导了不同的信息路由、状态表示与最终读出路径。</p>
-      <div class="callout warn"><b>假设边界。</b>下面是两个可检验的机制模型，不是先验结论。Non-thinking 仍可能在内部形成多阶段计算；CoT 也可能同时使用 targeted retrieval、broad aggregation 和位置捷径。真实机制可以是两者的混合，后文的 mask、patch、steering 与 transplant 用来判断每个环节的必要性和局部充分性。</div>
+      <h2>1. 研究对象、目标与证据更新后的两个工作机制</h2>
+      <p>两个独立模型看到同一类 256-token prompt、同一套 marker tokens 和同一套 count tokens，模型规模完全相同；差别只在于<b>被要求生成什么输出序列</b>。Non-thinking 模型把 prompt 直接压缩成一个 count。CoT 模型则先生成逐项 indexed trace，再回答同一个 count。最初我们把它们分别假设为“并行集合聚合”和“逐项检索循环”；经过第 5–11 节的描述、ablation、clean-to-corrupt patch、MLP feature patch、geometry steering 与 residual transplant 后，现在可以把若干箭头升级为工作机制，同时保留尚未闭合的桥接。</p>
+      <div class="callout good"><b>当前最稳健的总图景。</b>Non-thinking 是非对称前馈链：<code>Layer-1 broad routing → distributed count residual → later-Layer discretization → C_n</code>。CoT 的 trace 内部形成局部双向循环：<code>progress state → targeted retrieval → M_k → successor/close → updated progress</code>；但 trace/context 如何进一步压缩成 final <code>&lt;Ans&gt;</code> scalar-count state，尚未由一组固定 readout heads 解释。</div>
+      <div class="callout warn"><b>证据边界。</b>这里的“支持”表示干预效应大于匹配随机对照，或 clean/donor activation 能在 held-out pair 中运输目标信息；不是跨 seed 的总体统计定理。实线工作路径也不意味着由单个 head 完成。CoT 的 progress state 与 final scalar-count state 必须分开：前者控制下一 index/close，后者直接控制最终 count logits。</div>
       <div class="mechanisms">
         <div class="mechanism">
-          <h3>假设 A · Non-thinking：并行集合聚合后直接读出</h3>
-          <p><b>任务分解：</b>把 prompt 中散布的 needle token 看成一个无序集合，计算其基数 <code>n</code>，然后在唯一的 <code>&lt;Ans&gt;</code> query 输出 <code>&lt;C_n&gt;</code>。</p>
-          <p><b>候选算法：</b>早期 broad heads 从 final query 并行读取多个 needles 的 value；这些 head outputs 与 MLP 在 residual stream 中形成分布式 cardinality state；后层把连续状态离散化为 30 个 count-token logits。它不需要在输出序列中保存“现在数到第几个”。</p>
+          <h3>工作机制 A · Non-thinking：broad set routing 写入后层 count state</h3>
+          <p><b>已支持：</b>最终 <code>&lt;Ans&gt;</code> query 的 Layer-1 broad heads 并行覆盖多个 prompt needles。Position-local ablation 使 final accuracy 大幅下降；donor broad slices 能运输部分 count；mask broad group 又会同步破坏末层 count geometry 与输出。Layer-4 natural residual/centroid transplant 最终可以一比一搬运 donor count。</p>
+          <p><b>当前解释：</b>早期 attention 负责收集集合证据，后续 residual/MLP 将其逐层压缩成分布式 cardinality state，再离散化为 30 个 count logits。高 count 的 state 成形更晚，且局部 centroid path 有效而全局直线 <code>+1</code> 轴不成立。</p>
+          <p><b>仍缺：</b>尚未把 non-thinking 中“多个 value 如何变成具体数值”的 MLP intermediate features 与算术步骤完整拆开；也没有证据表明后期 count state 会反向控制早期 broad routing。</p>
           <div class="flow"><span class="node">needle set</span><span class="arrow">→</span><span class="node">parallel broad retrieval</span><span class="arrow">→</span><span class="node">count residual</span><span class="arrow">→</span><span class="node">C_n</span></div>
         </div>
         <div class="mechanism">
-          <h3>假设 B · Thinking：逐项检索、进度更新、trace-mediated 读出</h3>
-          <p><b>任务分解：</b>对 <code>k=1,2,…</code>，用数字 query <code>&lt;k&gt;</code> 找到按位置排序的第 k 个 prompt needle，写出其 marker <code>M_k</code>；随后生成 <code>k+1</code>，重复直到关闭 trace，最后输出 <code>&lt;C_n&gt;</code>。</p>
-          <p><b>候选算法：</b>targeted heads 负责 k-to-k retrieval；marker 后的 residual 保存已完成检索次数或 progress；successor/close circuit 决定继续还是停止；final query 再从 trace/progress state 读出 count。这一假设不等同于“模型只看上一个数字做 +1”。</p>
-          <div class="flow"><span class="node">index k</span><span class="arrow">→</span><span class="node">needle k</span><span class="arrow">→</span><span class="node">M_k + progress</span><span class="arrow">→</span><span class="node">k+1 / close</span><span class="arrow">→</span><span class="node">C_n</span></div>
+          <h3>工作机制 B · CoT：targeted retrieval/progress loop，加上独立 final count state</h3>
+          <p><b>已支持的 trace loop：</b>数字 <code>&lt;k&gt;</code> 的 targeted multi-head bundle 定位第 k 个 prompt needle并写出 <code>M_k</code>；marker 后 residual 保存可执行 progress/termination state；Layer-3 MLP 转换 routed evidence，Layer-4 的分布式 feature 子空间把它写成 <code>&lt;k+1&gt;</code> 或 <code>&lt;/Think&gt;</code> logit。Progress transplant 还能反向改变下一步 targeted routing，形成当前最清楚的局部双向因果耦合。</p>
+          <p><b>必须分开的 final state：</b>最后一个 marker residual 能改变继续/关闭，却不能独立运输最终 scalar count。真正可以一比一搬运 donor count 的是 final <code>&lt;Ans&gt;</code> residual；它从早层起就比 non-thinking 更可执行。</p>
+          <p><b>仍缺：</b>完整 trace、trace 长度/位置和 prompt evidence 如何压缩成 final scalar-count state尚未定位。Trace-readout top heads 的局部必要性较弱，head-slice patch 也不足以运输 donor count，所以不能把虚线桥接冒充为已找到的 readout circuit。</p>
+          <div class="flow"><span class="node">progress k</span><span class="arrow">↔</span><span class="node">targeted retrieval</span><span class="arrow">→</span><span class="node">M_k</span><span class="arrow">→</span><span class="node">k+1 / close</span></div>
+          <div class="flow"><span class="node">complete trace/context</span><span class="arrow">⇢</span><span class="node">final scalar-count state</span><span class="arrow">→</span><span class="node">C_n</span></div>
         </div>
       </div>
       {mechanism_explorer()}
-      <h3>两种机制的可区分预测</h3>
-      {table(mechanism_rows, [('aspect','比较维度'),('direct','Non-thinking：direct aggregation'),('cot','Thinking：indexed retrieval loop')])}
-      <div class="callout"><b>证据等级。</b>attention 与 PCA 只能给出候选结构；probe 只说明状态可被读取；global head mask 测全局必要性；clean-to-corrupt head-output patch 测某个 query 上的局部充分性；donor-to-receiver residual transplant 测完整状态是否足以搬运 count。只有多种证据方向一致时，才把某个组件称为候选 circuit。</div>
+      <h3>两种工作机制的证据对账</h3>
+      {table(mechanism_rows, [('aspect','机制问题'),('direct','Non-thinking：direct aggregation'),('cot','Thinking：retrieval/progress loop')])}
+      <div class="callout"><b>如何阅读后文。</b>Attention/PCA 只提出候选；position-local ablation 测某组件在指定 query 的必要性；clean-to-corrupt head-output patch 与 held-out MLP-feature patch 测局部充分性；donor-to-receiver residual transplant 测完整状态是否可执行。只有这些证据方向一致，本文才使用“候选 circuit”。第 7–10 节分别拆组件，第 11 节再检验 head 与 hidden state 是否处在同一条因果链上。</div>
     </section>
     """
     attention_metric_rows = [
@@ -4211,6 +4475,141 @@ def build_report(run_dir: Path) -> Path:
         for count_bin in COUNT_BINS
     ]
 
+    upward_transport_rows: list[dict[str, object]] = []
+    for mode, label, frame in (
+        ("nonthinking", "Non-thinking final <Ans>", hidden_final_directional),
+        ("thinking", "CoT final <Ans>", hidden_final_directional),
+        ("thinking", "CoT final trace marker", hidden_trace_final_directional),
+    ):
+        selected = frame[frame["patch_direction"] == "donor_gt_receiver"]
+        if "mode" in selected.columns:
+            selected = selected[selected["mode"] == mode]
+        for count_bin in COUNT_BINS:
+            row: dict[str, object] = {"site": label, "bin": count_bin}
+            for layer in (1, 2, 3, 4):
+                matches = selected[
+                    (selected["count_bin"] == count_bin)
+                    & (selected["layer"] == layer)
+                ]
+                row[f"l{layer}"] = (
+                    fmt(matches.iloc[0]["transport_slope"]) if len(matches) else "n/a"
+                )
+            upward_transport_rows.append(row)
+
+    rollout_intervention_labels = {
+        "baseline_no_patch": "无 patch",
+        "same_progress_donor_total_full": "自然 donor：只改 total",
+        "later_progress_donor_full": "自然 donor：total 与 progress 一起改",
+        "total_only_centroid_delta": "centroid delta：只改 total",
+        "progress_only_centroid_delta": "centroid delta：只改 progress",
+        "combined_centroid_delta": "centroid delta：total + progress",
+    }
+    rollout_rows: list[dict[str, object]] = []
+    scenario_view = hidden_rollout_summary[
+        (hidden_rollout_summary["patch_policy"] == "one_shot")
+        & (hidden_rollout_summary["layer"] == 4)
+        & (hidden_rollout_summary["intervention"] == "later_progress_donor_full")
+    ].copy()
+    for match in scenario_view.itertuples(index=False):
+        rollout_rows.append(
+            {
+                "family": str(match.scenario_family),
+                "pair": (
+                    f"R{int(match.receiver_count)}@I{int(match.receiver_progress)} ← "
+                    f"D{int(match.donor_count)}@I{int(match.donor_progress)}"
+                ),
+                "first": fmt(match.mean_first_generated_index),
+                "stop": fmt(match.mean_stop_index),
+                "final": fmt(match.mean_final_count),
+                "receiver": f"I{int(match.receiver_progress) + 1} / I{int(match.receiver_count)} / C{int(match.receiver_count)}",
+                "donor": f"I{int(match.donor_progress) + 1} / I{int(match.donor_count)} / C{int(match.donor_count)}",
+            }
+        )
+
+    rollout_factor_rows: list[dict[str, object]] = []
+    factor_view = hidden_rollout_factors[
+        (hidden_rollout_factors["patch_policy"] == "one_shot")
+        & (hidden_rollout_factors["layer"] == 4)
+        & hidden_rollout_factors["intervention"].isin(
+            [
+                "later_progress_donor_full",
+                "total_only_centroid_delta",
+                "progress_only_centroid_delta",
+                "combined_centroid_delta",
+            ]
+        )
+    ]
+    for row in factor_view.itertuples(index=False):
+        rollout_factor_rows.append(
+            {
+                "intervention": rollout_intervention_labels.get(
+                    str(row.intervention), str(row.intervention)
+                ),
+                "outcome": str(row.outcome),
+                "b_total": fmt(row.donor_total_coefficient),
+                "b_progress": fmt(row.donor_progress_coefficient),
+                "r2": fmt(row.r2),
+                "n": int(row.n_scenarios),
+            }
+        )
+
+    rollout_primary = hidden_rollout_summary[
+        (hidden_rollout_summary["patch_policy"] == "one_shot")
+        & (hidden_rollout_summary["layer"] == 4)
+        & (hidden_rollout_summary["intervention"] == "progress_only_centroid_delta")
+    ].copy()
+    rollout_distinct_total = rollout_primary[
+        rollout_primary["receiver_count"] != rollout_primary["donor_count"]
+    ]
+    rollout_total_only = hidden_rollout_summary[
+        (hidden_rollout_summary["patch_policy"] == "one_shot")
+        & (hidden_rollout_summary["layer"] == 4)
+        & hidden_rollout_summary["intervention"].isin(
+            ["same_progress_donor_total_full", "total_only_centroid_delta"]
+        )
+    ].copy()
+
+    def _weighted_rate(frame: pd.DataFrame, rate_col: str) -> float:
+        weights = frame["n"].astype(float)
+        return float((frame[rate_col].astype(float) * weights).sum() / weights.sum())
+
+    rollout_donor_successor = _weighted_rate(
+        rollout_primary, "donor_successor_rate"
+    )
+    rollout_closed = _weighted_rate(rollout_primary, "closed_rate")
+    rollout_total_only_receiver = _weighted_rate(
+        rollout_total_only, "receiver_total_hit"
+    )
+    rollout_total_only_closed = _weighted_rate(rollout_total_only, "closed_rate")
+    rollout_distinct_answer_n = float(
+        (
+            rollout_distinct_total["ans_rate"].astype(float)
+            * rollout_distinct_total["n"].astype(float)
+        ).sum()
+    )
+    rollout_distinct_receiver_given_answer = float(
+        (
+            rollout_distinct_total["receiver_total_hit"].astype(float)
+            * rollout_distinct_total["n"].astype(float)
+        ).sum()
+        / rollout_distinct_answer_n
+    )
+    rollout_distinct_donor_given_answer = float(
+        (
+            rollout_distinct_total["donor_total_hit"].astype(float)
+            * rollout_distinct_total["n"].astype(float)
+        ).sum()
+        / rollout_distinct_answer_n
+    )
+    rollout_progress_factor = factor_view[
+        (factor_view["intervention"] == "progress_only_centroid_delta")
+        & (factor_view["outcome"] == "first_index_shift")
+    ].iloc[0]
+    rollout_final_factor = factor_view[
+        (factor_view["intervention"] == "progress_only_centroid_delta")
+        & (factor_view["outcome"] == "final_count_shift")
+    ].iloc[0]
+
     transplant_section = f"""
     <section id="transplant">
       <h2>10. Hidden-state patching：跨 sequence 搬运 count state 与 trace progress</h2>
@@ -4226,6 +4625,15 @@ def build_report(run_dir: Path) -> Path:
       </ol></div>
 
       <h3>10.2 先验基线：exact-count centroid transplant</h3>
+      <h4>实验设定</h4>
+      <p>这个基线先问一个最宽松的问题：<b>同一 count 类别的平均 residual 几何，是否已经足以控制最终 count logits？</b>对每个模型、semantic site、Layer 与 count <code>c</code>，我们用独立 direction split 的样本计算 256 维均值 <code>mu(layer, site, c)</code>。均值样本不包含被测试 receiver，因此 intervention 不会复制同一条 prompt 的内容。</p>
+      <div class="method"><b>具体例子：receiver=8，目标 donor count=18。</b><ol>
+        <li>正常运行 count=8 的 receiver，并定位它的最终 <code>&lt;Ans&gt;</code> query。</li>
+        <li>若测试 after Layer 2，就把 receiver 在该 token 经过 Layer 2 后的 residual <code>h2(receiver, Ans)</code> 整体替换成 <code>mu(2, Ans, 18)</code>。</li>
+        <li>从 Layer 3 继续运行到 LM head；输入中尚未出现答案 count token，因此输出只能由 patched state 与后续 Layers 决定。</li>
+        <li>从 30 个 count-token logits 计算 argmax count 与 expected count，并对多个 <code>receiver n ← donor m</code> pair 拟合 transport slope。</li>
+      </ol></div>
+      <p>图中的 natural donor residual 是更严格的比较：不用类均值，而把一条独立 count=18 donor 在同一 semantic site 的完整 residual 放进 count=8 receiver。Centroid 成功只说明“平均 count geometry 可执行”；natural residual 也成功，才说明单样本状态同样可运输。</p>
       <h4>结果</h4>
       {figure(
           generated['transplant'],
@@ -4236,8 +4644,15 @@ def build_report(run_dir: Path) -> Path:
       <p>Centroid 与自然 donor residual 在后层趋于一致，说明 final-query residual 中确实存在足以控制 count logits 的状态。不过这张旧图混合了不同 patch protocol；下面的三个实验使用统一 block-output hook、明确的 donor/receiver token anchor，并将自然 sequence patch 单独报告。</p>
 
       <h3>10.3 Final &lt;Ans&gt; patch：Non-thinking 与 CoT 的最终 count state</h3>
-      <h4>实验</h4>
-      <p>分别渲染 non-thinking 与 CoT 的完整 teacher-forced sequence。在 donor 与 receiver 各自最终 <code>&lt;Ans&gt;</code> token，取 after Layer 1–4 的 residual；把 donor count=m 的向量替换到 receiver count=n 的 <code>&lt;Ans&gt;</code>，再计算 receiver 的 count logits。语义 anchor 相同，但 CoT 的绝对位置会随 trace 长度变化，因此这是语义对齐而不是硬拷贝同一数组下标。</p>
+      <h4>实验设定</h4>
+      <p>这里不再使用 centroid，而是做<b>单 donor sequence 到单 receiver sequence</b>的 natural-state patch。Donor 与 receiver 是独立样本，但由 nested construction 共享 noise base；较小 count 的 needle 集合是较大 count 的子集。这样 count 差异明确，又不会把完全不同的 prompt 当作同一干预对。</p>
+      <div class="method"><b>具体例子：receiver=8，donor=18。</b><ul>
+        <li>Non-thinking receiver 输入停在 <code>&lt;BOS&gt; prompt(count=8) &lt;Ans&gt;</code>；donor 是 <code>&lt;BOS&gt; prompt(count=18) &lt;Ans&gt;</code>。</li>
+        <li>CoT receiver 输入停在 <code>... &lt;Think&gt; &lt;1&gt; M1 ... &lt;8&gt; M8 &lt;/Think&gt; &lt;Ans&gt;</code>；donor 对应地停在 <code>... &lt;18&gt; M18 &lt;/Think&gt; &lt;Ans&gt;</code>。</li>
+        <li>在 donor 与 receiver 各自的 <code>&lt;Ans&gt;</code> token，缓存 after Layer L 的完整 256 维 residual；把 donor residual 替换进 receiver，再运行 Layer L+1 到 LM head。</li>
+        <li><b>答案 token没有作为输入。</b>我们只读取 receiver <code>&lt;Ans&gt;</code> 后下一 token 的 30 个 count logits。CoT 两条 trace 长度不同，所以 patch 对齐的是 semantic anchor，而不是相同绝对数组下标。</li>
+      </ul></div>
+      <p>每个 Layer 都分别重做 patch；baseline 是同一个 receiver 未干预时的 logits。结果量包括 expected-count shift、transport slope、argmax 是否等于 donor count，以及是否仍等于 receiver count。</p>
       <h4>结果</h4>
       {figure(
           generated['hidden_final_answer'],
@@ -4250,8 +4665,14 @@ def build_report(run_dir: Path) -> Path:
       <div class="callout good"><b>因果含义。</b>这比“probe 可读”更强：在新的 receiver prompt 上替换完整 natural residual，输出真的变成 donor count。它支持 non-thinking 通过后层逐步汇总 prompt evidence，而 CoT 在 final <code>&lt;Ans&gt;</code> 前已经把 trace-derived count 压缩成较早可执行的 residual state。</div>
 
       <h3>10.4 CoT final marker patch：最后一个 marker state 不是最终答案 count state</h3>
-      <h4>实验</h4>
-      <p>把 donor trace 最后一个 marker <code>M_m</code> 的 post-Layer residual，替换到 receiver trace 最后一个 marker <code>M_n</code>；随后让 receiver 自然生成 <code>&lt;/Think&gt; &lt;Ans&gt;</code> 的 readout。这里专门问“最后 marker 自身是否已经携带可直接读出的 donor count”，与 10.3 在最终 <code>&lt;Ans&gt;</code> patch 不同。</p>
+      <h4>实验设定</h4>
+      <p>本实验只把 patch anchor 从最终 <code>&lt;Ans&gt;</code> 提前到 CoT trace 的最后一个 marker，检验“完成第 n 次 retrieval 后的 marker state”是否已经等于可执行的 scalar count state。</p>
+      <div class="method"><b>具体例子：receiver=8，donor=18。</b><ol>
+        <li>Receiver 的 anchor 是 trace 尾部 <code>&lt;8&gt; M8</code> 中的 <code>M8</code>；donor anchor 是 <code>&lt;18&gt; M18</code> 中的 <code>M18</code>。</li>
+        <li>在 after Layer L，把 <code>hL(donor, M18)</code> 替换到 <code>hL(receiver, M8)</code>，再继续运行 receiver 的剩余 Layers。</li>
+        <li>Receiver 后缀仍是自己的 <code>&lt;/Think&gt; &lt;Ans&gt;</code>；答案 count token不作为输入。最终在 <code>&lt;Ans&gt;</code> 后读取 count logits。</li>
+      </ol></div>
+      <p>因此 10.3 与 10.4 的 donor/receiver pair 和结果量相同，唯一关键差别是 patch site：前者直接 patch final-answer query，后者 patch 更早的 final trace marker。两者的差异定位了 scalar readout 在哪一步才形成。</p>
       <h4>结果</h4>
       {figure(
           generated['hidden_trace_final'],
@@ -4262,14 +4683,34 @@ def build_report(run_dir: Path) -> Path:
       <h4>分析</h4>
       <p>三个区间、四层的 transport slope 都近似 0；after Layer 4 的最终 count 仍 100% 跟随 receiver。因而“final marker residual”与“final <code>&lt;Ans&gt;</code> count residual”不是同一个状态。关闭 trace 后的 token、位置与后续计算仍会重新构造答案 readout；不能因为最后 marker 与 count 同步出现，就把它当作已经完成的标量 count register。</p>
 
-      <h3>10.5 CoT trace 内部 early-stop patch：短 trace 的终止状态能否关闭长 trace</h3>
-      <h4>实验</h4>
-      <p>构造 count=m 的短 donor 与 count=n&gt;m 的长 receiver，并保证二者前 m 个 needles、前 m 组 <code>&lt;k&gt; M_k</code> trace prefix 完全对齐。Donor 最后 marker <code>M_m</code> 是“下一步应输出 <code>&lt;/Think&gt;</code>”的位置；receiver 的同一 <code>M_m</code> 是内部位置，下一步本应输出 <code>&lt;m+1&gt;</code>。把 donor final-marker residual patch 到 receiver interior marker 后，局部结果量为 <code>logit(&lt;/Think&gt;)−logit(&lt;m+1&gt;)</code> 及是否预测关闭。</p>
-      <p>为避免 gold future trace 泄漏到最终答案，downstream readout 使用<b>另一条截断输入</b>：只包含 receiver prompt、前 m 组 trace、强制的 <code>&lt;/Think&gt;&lt;Ans&gt;</code>，不包含后续 gold trace marker，也不提供答案 token。局部 close 指标与截断 readout 因此是两个分开的 forward。</p>
+      <h3>10.5 只看 donor count &gt; receiver count：较大的 scalar 能否向上搬运</h3>
+      <h4>实验设定</h4>
+      <p>这不是另一种 patch，而是对 10.3 与 10.4 的逐 pair 记录做<b>有方向的子集分析</b>。原 transport slope 同时混合 <code>8←18</code> 与 <code>18←8</code>；如果模型只容易把大数向下拉，却不能把小 receiver 向更大的 donor 推动，双向平均可能掩盖这种不对称。</p>
+      <div class="method"><b>保留哪些例子。</b>只保留 <code>donor_count &gt; receiver_count</code>，例如 <code>8←18</code>、<code>12←24</code> 和 <code>20←30</code>；删除同 count 与 donor 更小的 pair。对 final <code>&lt;Ans&gt;</code> patch 和 final-marker patch 分别在每个 Layer、每个 receiver count 区间拟合 <code>patched expected-count shift = a + b(donor−receiver)</code>。<code>b=1</code> 表示 donor 每大 1，输出也向上移动 1；<code>b=0</code> 表示没有上行运输。</div>
+      <p>由于 patch 本身与 10.3/10.4 完全相同，这一节检验的是结论的方向稳定性，而不是引入新 intervention。</p>
+      <h4>结果</h4>
+      {figure(
+          generated['hidden_upward_transport'],
+          'Figure 8D. 仅 donor count > receiver count 的上行 scalar transport',
+          '<b>列</b>按 receiver count 1–10、11–20、21–30 分区；<b>横轴</b>是 residual patch 在 Layer 1–4 哪层之后发生；<b>纵轴</b>是只用 donor&gt;receiver pairs 拟合的 expected-count transport slope。上两行分别在 non-thinking 与 CoT 的最终 <code>&lt;Ans&gt;</code> patch；第三行在 CoT 最后 trace marker patch。绿虚线 1 为理想的一比一上行搬运，灰点线 0 为无搬运。'
+      )}
+      {table(upward_transport_rows,[('site','patch site'),('bin','receiver count 区间'),('l1','after Layer 1'),('l2','after Layer 2'),('l3','after Layer 3'),('l4','after Layer 4')])}
+      <h4>分析</h4>
+      <p>最终 <code>&lt;Ans&gt;</code> residual 的上行搬运在后层仍然成立：Non-thinking 到 Layer 4、CoT 通常从 Layer 2 起，slope 都约为 1。高 count 的 non-thinking 形成最慢，21–30 区间在 Layer 1/2/3 后仅约 0.002/0.254/0.304，到 Layer 4 才跃升到 1。相反，CoT 最后 trace-marker residual 的 slope 在所有区间和 Layer 都约为 0。这个方向性分析排除了“原结论只是较大 receiver 被较小 donor 向下拉容易”的解释：<b>真正能向上运输较大 scalar 的是 final-answer state，不是最后 marker state。</b></p>
+
+      <h3>10.6 CoT trace 内部 early-stop patch：短 trace 的终止状态能否关闭长 trace</h3>
+      <h4>实验设定</h4>
+      <p>这里把 total count 与当前 trace progress 故意拆开。构造短 donor count=<code>m</code> 与长 receiver count=<code>n&gt;m</code>，并让两者共享前 m 个 needle 及对应 marker identity。于是同一个 marker <code>M_m</code> 在 donor 是终点，在 receiver 只是中间点。</p>
+      <div class="method"><b>具体例子：receiver=10，donor=5，在 I5/M5 patch。</b><ul>
+        <li>Donor 局部上下文为 <code>... &lt;5&gt; M5</code>，正确下一 token 是 <code>&lt;/Think&gt;</code>。</li>
+        <li>Receiver 局部上下文也到 <code>... &lt;5&gt; M5</code>，但 prompt 里还有 5 个 needles，正确下一 token 是 <code>&lt;6&gt;</code>。</li>
+        <li>在 after Layer L，把 donor 的 <code>M5</code> residual 替换到 receiver 的 <code>M5</code>，再读取 receiver 下一 token logits。局部结果量是 <code>close margin = logit(&lt;/Think&gt;) − logit(&lt;6&gt;)</code>。</li>
+      </ul></div>
+      <p><b>最终 count 使用第二个、独立的 forward。</b>输入只保留 receiver prompt 与前 5 组 trace，然后人为接上 <code>&lt;/Think&gt;&lt;Ans&gt;</code>；不提供 I6–I10/M6–M10，也不提供答案 count token。我们再次在相同 marker site patch，再从 <code>&lt;Ans&gt;</code> 后读取 count logits。这样“局部关闭决定”与“截断 trace 后的 count readout”不会被 gold trace tail 混在一起。</p>
       <h4>结果 A：局部关闭决定</h4>
       {figure(
           generated['hidden_early_close'],
-          'Figure 8D. Donor final-marker state 是否使 receiver interior marker 提前关闭',
+          'Figure 8E. Donor final-marker state 是否使 receiver interior marker 提前关闭',
           '<b>横轴</b>是 patch 所在 Layer；<b>纵轴</b>是 patched receiver 下一 token 预测为 <code>&lt;/Think&gt;</code> 的样本比例。三栏按长 receiver 的 count 分区。1 表示所有 pair 都被 donor 的“现在结束”状态关闭。'
       )}
       {table(hidden_early_rows,[('bin','receiver count 区间'),('l3_close','after Layer 3 close rate'),('l4_close','after Layer 4 close rate'),('l4_margin','after Layer 4 close-margin shift'),('l4_slope','forced-close count slope')])}
@@ -4278,18 +4719,75 @@ def build_report(run_dir: Path) -> Path:
       <h4>结果 B：强制关闭后的最终 count</h4>
       {figure(
           generated['hidden_early_transport'],
-          'Figure 8E. 截断 trace 强制关闭后，最终答案是否额外运输 donor count',
+          'Figure 8F. 截断 trace 强制关闭后，最终答案是否额外运输 donor count',
           '<b>横轴</b>是 donor final-marker residual 的 patch Layer；<b>纵轴</b>是截断输入最终 <code>&lt;Ans&gt;</code> expected-count 对 donor offset 的 transport slope。三栏为 receiver count 区间。接近 0 表示 patch 本身没有在截断 readout 中增加额外 donor-count 位移。'
       )}
       <h4>分析 B</h4>
       <p>三个区间、四层的 forced-close count transport slope 都约为 0。这里不能把“最终预测常等于 m”当作 donor-state 运输，因为截断 receiver 本身就只展示了 m 个 trace markers；即使不 patch，模型也可以仅凭可见 trace 长度读出 m。最稳健的结论是：final-marker residual 足以搬运<b>局部结束决定</b>，但没有证据表明它还能独立于截断 trace 内容搬运最终 scalar count。</p>
 
-      <h3>10.6 本节结论</h3>
+      <h3>10.7 不提供 gold tail 的 12 场景自由生成：拆开 total count 与 trace progress</h3>
+      <h4>实验设定</h4>
+      <p>单个 <code>R5@I4 ← D10@I7</code> 只能说明一个方向。这里使用 12 个预注册场景覆盖低、中、高 count，并把 donor 的<b>总 needle 数</b>与<b>当前 trace progress</b>做近似 2×2 因子拆分。记号 <code>Ra@Ii ← Db@Ij</code> 表示：receiver prompt 总数为 a，输入 trace 只给到 <code>&lt;i&gt; Mi</code>；donor prompt 总数为 b，residual 取自 <code>&lt;j&gt; Mj</code>。</p>
+      <div class="method"><b>12 个场景分为五类。</b><ul>
+        <li><b>total 与 progress 同向上移：</b><code>R5@I4←D10@I7</code>、<code>R10@I7←D20@I14</code>、<code>R20@I14←D30@I24</code>。</li>
+        <li><b>total 与 progress 同向下移：</b><code>R10@I4←D5@I2</code>、<code>R20@I9←D10@I5</code>、<code>R30@I18←D20@I10</code>。这些 progress 特意满足 receiver 当前 I 仍存在于较小 donor 中，因此“同 progress、只换 total”的自然 donor 控制有定义。</li>
+        <li><b>只改 progress：</b><code>R10@I4←D10@I7</code> 与 <code>R20@I14←D20@I7</code>，total 相同。</li>
+        <li><b>只改 total：</b><code>R10@I7←D20@I7</code> 与 <code>R20@I7←D10@I7</code>，progress 相同。</li>
+        <li><b>total 与 progress 反向冲突：</b><code>R10@I7←D20@I4</code> 与 <code>R20@I7←D10@I9</code>。</li>
+      </ul></div>
+      <p>每条 receiver 输入都<b>严格停在当前 marker</b>；后面不提供 gold trace tail，不强制 <code>&lt;/Think&gt;</code>、<code>&lt;Ans&gt;</code>，也不提供答案 token。Patch 后 greedy rollout 最多 {hidden_patch_manifest['free_rollout_protocol']['max_new_tokens']} tokens。每个场景使用 {hidden_patch_manifest['free_rollout_protocol']['examples']} 个独立 prompt pairs。正式实验只在 <b>after Layer {hidden_patch_manifest['free_rollout_protocol']['layers'][0]} 做一次 one-shot patch</b>；下一 token 生成后 hook 即失效，所以结果不能归因于持续重复注入。</p>
+      <div class="method"><b>以 <code>R10@I7 ← D20@I14</code> 为例，七种 intervention 如何构造。</b><ul>
+        <li><code>baseline</code>：不 patch，receiver 通常应从 I8 继续并在 I10 附近结束，最终答 C10。</li>
+        <li><code>natural total-only</code>：使用另一条 total=20、但同样位于 I7 的 donor residual，测试只换 prompt total evidence。</li>
+        <li><code>natural total+progress</code>：使用 total=20、位于 I14 的 donor residual，同时改 total 与 progress。</li>
+        <li><code>centroid total delta</code>：在 receiver state 上加 <code>mu(20,I7)−mu(10,I7)</code>。</li>
+        <li><code>centroid progress delta</code>：加 <code>mu(20,I14)−mu(20,I7)</code>，只沿 donor total 条件下的 progress 方向移动。</li>
+        <li><code>centroid combined delta</code>：加 <code>mu(20,I14)−mu(10,I7)</code>。</li>
+        <li>另有 self-state 与 same-semantics cross-prompt controls，用来估计 hook 本身和无关 prompt identity 的影响。</li>
+      </ul></div>
+      <p>我们记录三个彼此不同的结果量：<b>first index</b> 是 patch 后第一个生成的 index，主要反映局部 progress；<b>stop index</b> 是生成 <code>&lt;/Think&gt;</code> 前最后一个 index；<b>final count</b> 是 <code>&lt;Ans&gt;</code> 后生成的 scalar count。对于每个结果，还拟合 <code>outcome shift = a + b_total(donor total−receiver total) + b_progress(donor progress−receiver progress)</code>，用偏回归区分两种 offset 的独立作用。</p>
+
+      <h4>结果 A：patch 后的第一个 trace index</h4>
+      {figure(
+          generated['hidden_rollout_first'],
+          'Figure 8G. 12 个 total/progress 场景的第一个自由生成 index',
+          '<b>纵轴</b>是场景 <code>receiver←donor</code>；<b>横轴</b>是 after Layer 4 one-shot intervention。单元格为跨样本平均的第一个 index。每行应同时对照 receiver progress+1 与 donor progress+1：靠近前者表示未运输，靠近后者表示 donor progress 被运输。'
+      )}
+      <div class="callout good"><b>局部 progress 被精确搬运。</b>对 progress-centroid intervention，{pct(rollout_donor_successor)} 的样本把 patch 后第一个 index 改成 donor progress+1；跨 12 场景偏回归得到 <code>b_progress={fmt(rollout_progress_factor.donor_progress_coefficient)}</code>、<code>b_total={fmt(rollout_progress_factor.donor_total_coefficient)}</code>、<code>R²={fmt(rollout_progress_factor.r2)}</code>。例如 <code>R10@I7←D20@I14</code> 不再从 I8 继续，而是从 I15 开始；反向的 <code>R10@I4←D5@I2</code> 则从 I3 开始。这不是“总 count 大小”的附带效应，因为只改 total、保持 I7 不变时，第一个 index 仍是 receiver 的 I8。</div>
+      <h4>结果 B：trace 最终停止 index</h4>
+      {figure(
+          generated['hidden_rollout_stop'],
+          'Figure 8H. 12 个场景自由生成 trace 的停止 index',
+          '<b>纵轴与横轴</b>同 Figure 8G；单元格是生成 <code>&lt;/Think&gt;</code> 前最后一个 index。应分别比较 receiver total、donor total、receiver progress 与 donor progress，不能只把某一个数预设为正确答案。'
+      )}
+      <p><b>停止位置没有同样干净的一维搬运。</b>Progress intervention 后只有 {pct(rollout_closed)} 的 rollout 在 40-token 预算内自然产生 <code>&lt;/Think&gt;</code>。典型边界是 <code>R10@I7←D20@I14</code>：模型先生成 I15，但没有在预算内恢复成一条合法、可关闭的 receiver trace；而 <code>R20@I9←D10@I5</code> 会从 I6 重新开始，随后仍在 I20 左右关闭。说明 one-shot residual 足以设定“下一步在哪里”，却不总是足以把后续状态机稳定接到 donor 或 receiver 的完整终止轨迹上。</p>
+      <h4>结果 C：关闭 trace 后的最终 scalar count</h4>
+      {figure(
+          generated['hidden_rollout_final'],
+          'Figure 8I. 12 个场景自由生成的最终 count',
+          '<b>纵轴与横轴</b>同 Figure 8G；单元格是 <code>&lt;Ans&gt;</code> 后 count token 的均值。若 marker state 独立携带 scalar，final count 应随 donor total offset 系统移动；若 scalar 被 receiver prompt/readout 重建，则应留在 receiver total。'
+      )}
+      <p><b>最终 scalar 没有随 donor total 搬运。</b>在 donor/receiver total 不同且成功生成答案的样本中，{pct(rollout_distinct_receiver_given_answer)} 的 final count 等于 receiver total，{pct(rollout_distinct_donor_given_answer)} 等于 donor total；少数偏差只多出 1（C10→C11 或 C20→C21）。相反，两个 total-only intervention 共 {int(rollout_total_only['n'].sum())} 条记录全部自然关闭（{pct(rollout_total_only_closed)}），并且 {pct(rollout_total_only_receiver)} 保持 receiver count。也就是说，在这个 marker site 单独注入“donor 总数”既不改变下一 index，也不改变最终答案。</p>
+      <h4>结果 D：跨场景 total/progress 偏回归</h4>
+      {figure(
+          generated['hidden_rollout_factors'],
+          'Figure 8J. Donor total offset 与 progress offset 对三个 rollout 结果的独立系数',
+          '<b>横轴</b>是 intervention；每个 outcome 分别显示 <code>b_total</code> 与 <code>b_progress</code>。系数 1 表示 donor offset 每增加 1，结果同向移动 1；0 表示在控制另一个 offset 后没有独立线性作用。仅使用 after Layer 4 one-shot 的 12 个场景均值。'
+      )}
+      {table(rollout_factor_rows,[('intervention','intervention'),('outcome','结果量'),('b_total','b_total'),('b_progress','b_progress'),('r2','R²'),('n','场景数')])}
+      <h4>代表性场景的原始均值</h4>
+      {table(rollout_rows,[('family','场景类别'),('pair','receiver ← donor'),('first','第一个 index'),('stop','停止 index'),('final','最终 count'),('receiver','receiver 参照：next / stop / count'),('donor','donor 参照：next / stop / count')])}
+      <h4>综合分析</h4>
+      <p>五类场景共同给出一个稳定分离：<b>marker residual 中可执行的是局部 trace progress，而不是独立的 prompt-total scalar。</b>Natural donor、progress-centroid 与 combined-centroid 三种 intervention 产生相同的第一 index 行为；total-only natural state 与 total-only centroid delta 则完全不动。这使结论不依赖某一个 5→10 例子，也不依赖 donor total 与 progress 恰好同向。</p>
+      <p>偏回归也支持同一结论。第一 index 的 <code>b_progress=1</code>、<code>b_total≈0</code> 且 <code>R²=1</code>；final count 的两个系数都接近 0（<code>b_total={fmt(rollout_final_factor.donor_total_coefficient)}</code>、<code>b_progress={fmt(rollout_final_factor.donor_progress_coefficient)}</code>），但其 <code>R²={fmt(rollout_final_factor.r2)}</code> 较低，因为 27.1% 的 progress-intervention rollout 未自然关闭，线性 final-count 回归只能覆盖成功产生答案的子集。因此 final-count 的更可靠证据是上面的条件命中率与 total-only 零效应，而不是低 R² 回归本身。</p>
+      <div class="callout good"><b>综合答案。</b>把 D10@I7 的状态放到 R5@I4，或者把 D20@I14 放到 R10@I7，确实会把下一步分别推进到 I8、I15；反向 donor 也会把下一步拉回 I3、I6。可是它不会把最终答案系统改成 C10、C20。最一致的机制是：<b>trace marker state 搬运“当前走到第几步/下一步从哪开始”；receiver prompt 与后续 readout 再决定在哪里关闭，并在 final <code>&lt;Ans&gt;</code> site 重建 scalar count。</b>因此“progress register”和“final count register”在本模型中是因果可分的。</div>
+
+      <h3>10.8 本节结论</h3>
       <div class="mechanisms">
         <div class="mechanism"><h3>Non-thinking</h3><p>Final <code>&lt;Ans&gt;</code> count state 从早层到后层逐步变得充分，高 count 最慢；after Layer 4 natural residual 能一比一把 donor count 搬到 receiver。</p></div>
         <div class="mechanism"><h3>CoT</h3><p>最终 <code>&lt;Ans&gt;</code> 很早就含有可执行 count state；trace final marker 本身不直接等于答案 state，但 marker residual 的后层表示能控制“继续还是结束”。这支持 <b>trace progress/termination</b> 与 <b>final answer count</b> 是相关但不同的 causal states。</p></div>
       </div>
-      <div class="callout limit"><b>证据边界。</b>所有实验为单 seed、单模型大小、teacher-forced semantic anchors；每个有序 count pair只有 {hidden_patch_manifest['examples_per_pair']} 个 nested base prompt。Early-stop 证明局部终止 state 的充分性，但没有自然 autoregressive rollout，也没有把“终止 state 如何经 <code>&lt;/Think&gt;</code> 转换成最终 count state”的每个中间 sublayer 完整分解。</div>
+      <div class="callout limit"><b>证据边界。</b>所有实验为单 seed、单模型大小；成对 slope 每个有序 count pair 只有 {hidden_patch_manifest['examples_per_pair']} 个 nested base prompts，自由 rollout 每个 intervention、每个场景只有 {hidden_patch_manifest['free_rollout_protocol']['examples']} 个 prompts。12 场景已覆盖 total/progress 同向上移、同向下移、单因素变化与反向冲突，并移除 gold trace tail；但正式 suite 只检验 after Layer 4 one-shot state，且 40-token 截断会把“暂时失稳”和“永不关闭”混在一起。它还没有分解 progress state 经过后续 attention/MLP、<code>&lt;/Think&gt;</code> 与 <code>&lt;Ans&gt;</code> 转换成最终 answer state 的每个中间步骤。</div>
     </section>
     """
 
@@ -4357,7 +4855,7 @@ def build_report(run_dir: Path) -> Path:
     """
     report = report[:nav_start] + new_nav + report[nav_end:]
 
-    report = finalize_report_numbering(report)
+    report = finalize_report_numbering(report, run_dir)
     output.write_text(report, encoding="utf-8")
     return output
 
