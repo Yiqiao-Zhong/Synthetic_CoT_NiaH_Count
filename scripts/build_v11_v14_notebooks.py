@@ -41,12 +41,16 @@ VERSIONS = {
         "runs": "1 positional encoding x 2 output modes = 2 independently trained models",
     },
     "v14": {
-        "title": "Shakespeare Character Haystack at Small Capacity",
+        "title": "Standard Tiny Shakespeare Character Haystack at Small Capacity",
         "summary": (
-            "保持 v11 的 APE、小模型与 count 设置，将 uniform noise 换成 Shakespeare 公版文本的"
-            "连续 character-level token window，再随机覆盖位置插入 marker。"
+            "保持 v11 的 APE、小模型与 count 设置，将 uniform noise 换成标准 Tiny Shakespeare "
+            "corpus（Karpathy char-rnn 的 data/tinyshakespeare/input.txt）的连续 "
+            "character-level token window，再随机覆盖位置插入 marker。"
         ),
-        "data": "prompt length 256; needle count 1-30; contiguous Shakespeare character haystack",
+        "data": (
+            "prompt length 256; needle count 1-30; contiguous standard Tiny Shakespeare "
+            "character-level haystack"
+        ),
         "positions": "learned APE only",
         "runs": "1 positional encoding x 2 output modes = 2 independently trained models",
     },
@@ -188,6 +192,22 @@ def build_cells(version: str, spec: dict[str, str]) -> list[dict]:
                 [sys.executable, "-m", "pip", "install", "-q", "-e", ".", "--no-deps"],
                 check=True,
             )
+
+            # `pip install -e` writes an editable .pth file in a subprocess.
+            # The already-running Jupyter kernel does not re-process new .pth
+            # files, so expose src/ immediately without requiring a restart.
+            src_root = (repo / "src").resolve()
+            if not (src_root / "synthetic_counting_v11" / "config.py").exists():
+                raise FileNotFoundError(
+                    "The checked-out repo does not contain synthetic_counting_v11. "
+                    "Run git pull in the repo setup cell, then rerun this cell."
+                )
+            if str(src_root) not in sys.path:
+                sys.path.insert(0, str(src_root))
+
+            from synthetic_counting_v11.config import preset_config as _import_probe
+
+            print("v11-v14 source import ready:", src_root)
             try:
                 import plotly
             except ImportError:

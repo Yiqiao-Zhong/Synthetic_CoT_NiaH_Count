@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import random
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
+from urllib.error import URLError
+from urllib.request import urlretrieve
 
 import numpy as np
 import torch
@@ -16,12 +19,49 @@ from .config import ExperimentConfig
 
 
 IGNORE_INDEX = -100
+TINY_SHAKESPEARE_URL = (
+    "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+)
+TINY_SHAKESPEARE_ENV_VAR = "SYNTHETIC_COUNTING_TINY_SHAKESPEARE_PATH"
+TINY_SHAKESPEARE_MIN_BYTES = 1_000_000
+
+
+def tiny_shakespeare_path() -> Path:
+    override = os.environ.get(TINY_SHAKESPEARE_ENV_VAR)
+    if override:
+        return Path(override).expanduser()
+    return Path(__file__).with_name("resources") / "tiny_shakespeare" / "input.txt"
+
+
+def ensure_tiny_shakespeare_corpus(path: str | Path | None = None, *, allow_download: bool = True) -> Path:
+    corpus_path = Path(path).expanduser() if path is not None else tiny_shakespeare_path()
+    if corpus_path.exists() and corpus_path.stat().st_size >= TINY_SHAKESPEARE_MIN_BYTES:
+        return corpus_path
+    if not allow_download:
+        raise FileNotFoundError(
+            f"Standard Tiny Shakespeare corpus not found at {corpus_path}. "
+            f"Run `python scripts/fetch_tiny_shakespeare.py` or set {TINY_SHAKESPEARE_ENV_VAR}."
+        )
+    corpus_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        urlretrieve(TINY_SHAKESPEARE_URL, corpus_path)
+    except (OSError, URLError) as exc:
+        raise FileNotFoundError(
+            f"Could not download standard Tiny Shakespeare from {TINY_SHAKESPEARE_URL}. "
+            f"Run `python scripts/fetch_tiny_shakespeare.py` when network is available, "
+            f"or set {TINY_SHAKESPEARE_ENV_VAR} to a local input.txt."
+        ) from exc
+    if corpus_path.stat().st_size < TINY_SHAKESPEARE_MIN_BYTES:
+        raise RuntimeError(
+            f"Downloaded Tiny Shakespeare file is unexpectedly small: {corpus_path} "
+            f"({corpus_path.stat().st_size} bytes)."
+        )
+    return corpus_path
 
 
 @lru_cache(maxsize=1)
 def shakespeare_text() -> str:
-    path = Path(__file__).with_name("resources") / "tiny_shakespeare_public_domain.txt"
-    return path.read_text(encoding="utf-8")
+    return ensure_tiny_shakespeare_corpus().read_text(encoding="utf-8")
 
 
 def _char_token(character: str) -> str:

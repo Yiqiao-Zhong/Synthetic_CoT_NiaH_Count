@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import random
+from pathlib import Path
 
 import numpy as np
 import torch
 
 from synthetic_counting_v11.config import preset_config
 from synthetic_counting_v11.data import (
+    TINY_SHAKESPEARE_URL,
     Vocab,
     _noise_sequence,
     load_or_create_fixed_pool,
@@ -16,6 +18,9 @@ from synthetic_counting_v11.data import (
     shakespeare_text,
 )
 from synthetic_counting_v11.model import build_model
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_v11_v14_architecture_is_always_four_layers_four_heads_and_d64():
@@ -108,7 +113,25 @@ def test_v14_haystack_is_a_contiguous_shakespeare_character_window():
     vocab = Vocab.build(cfg)
     sequence = _noise_sequence(cfg, vocab, random.Random(13))
     recovered = "".join(chr(int(token[4:-1], 16)) for token in sequence)
+    corpus = shakespeare_text()
 
-    assert recovered in shakespeare_text()
+    assert "karpathy/char-rnn" in TINY_SHAKESPEARE_URL
+    assert "First Citizen:" in corpus
+    assert len(corpus) > 1_000_000
+    assert recovered in corpus
     assert cfg.noise_vocab_size == 64  # ignored by the character-level vocabulary
-    assert len(vocab.noise) == len(set(shakespeare_text()))
+    assert len(vocab.noise) == len(set(corpus))
+
+
+def test_colab_notebooks_expose_src_to_the_current_kernel_before_runtime_import():
+    for version in range(11, 15):
+        path = ROOT / "notebooks" / f"Trace_Count_v{version}_Colab.ipynb"
+        notebook = json.loads(path.read_text(encoding="utf-8"))
+        cells = {cell.get("id"): "".join(cell.get("source", [])) for cell in notebook["cells"]}
+
+        setup = cells["environment-setup"]
+        runtime = cells["runtime-settings"]
+        assert 'src_root = (repo / "src").resolve()' in setup
+        assert 'sys.path.insert(0, str(src_root))' in setup
+        assert "from synthetic_counting_v11.config import preset_config as _import_probe" in setup
+        assert "PLANNED_CONFIG.n_embd" in runtime

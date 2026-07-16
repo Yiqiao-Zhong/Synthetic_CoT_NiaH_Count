@@ -124,6 +124,11 @@ class ExperimentConfig:
         result["rpe_definition"] = "learned per-layer, per-head causal relative-distance attention bias"
         result["separate_transformers"] = True
         result["shared_trace_and_answer_numbers"] = True
+        if self.noise_source == "shakespeare_char":
+            result["tiny_shakespeare_source"] = (
+                "Karpathy char-rnn data/tinyshakespeare/input.txt; "
+                "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+            )
         return result
 
 
@@ -205,6 +210,7 @@ def config_from_dict(values: dict[str, Any]) -> ExperimentConfig:
         "separate_transformers",
         "shared_trace_and_answer_numbers",
         "count_bins",
+        "tiny_shakespeare_source",
     ):
         data.pop(derived, None)
     data["position_encodings"] = tuple(data["position_encodings"])
