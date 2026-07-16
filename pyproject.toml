@@ -30,6 +30,10 @@ packages = [
     "src/synthetic_counting_v6",
     "src/synthetic_counting_extensions",
     "src/synthetic_counting_v10",
+    "src/synthetic_counting_v11",
+    "src/synthetic_counting_v12",
+    "src/synthetic_counting_v13",
+    "src/synthetic_counting_v14",
 ]
 
 [dependency-groups]

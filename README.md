@@ -25,6 +25,10 @@ Importable code follows a standard `src/` layout. Public module names are unchan
 | `synthetic_counting_v6` | v6 separator-trace experiment |
 | `synthetic_counting_extensions` | v2.2, v5.2, and v7-v9 extensions |
 | `synthetic_counting_v10` | v10 two-model count-30 dynamics, attention causality, and count-state interventions |
+| `synthetic_counting_v11` | Shared small-model core for v11-v14 positional, scaling, fixed-data, and Shakespeare experiments |
+| `synthetic_counting_v12` | v12 APE wrapper: length 512 and count range 1-50 |
+| `synthetic_counting_v13` | v13 APE wrapper: finite fixed-dataset training |
+| `synthetic_counting_v14` | v14 APE wrapper: Shakespeare character haystacks |
 
 Commands such as `python -m synthetic_niah_v4.run_v4` therefore remain valid after
 `pip install -e .`.
@@ -106,6 +110,31 @@ head-output patching, per-Layer 2/3/6-PC count manifolds, geometry steering, fin
 `m -> n` transplants, and within-CoT progress/early-stop transplants. The full protocol
 and mathematical definitions are in
 `docs/pipelines/pipeline_v10_two_model_count30_causal.md`.
+
+For the controlled small-architecture follow-ups, use:
+
+```bash
+python -m synthetic_counting_v11.run_v11 --preset main --stage all --device cuda
+python -m synthetic_counting_v12.run_v12 --preset main --stage all --device cuda
+python -m synthetic_counting_v13.run_v13 --preset main --stage all --device cuda
+python -m synthetic_counting_v14.run_v14 --preset main --stage all --device cuda
+```
+
+The matching Colab entry points are `notebooks/Trace_Count_v11_Colab.ipynb` through
+`Trace_Count_v14_Colab.ipynb`. All four versions are hard-locked to **4 layers, 4 heads,
+`d_model=64`, and MLP size 256**. v12-v14 reuse the v10-style implementation path but
+never the v10 `d_model=256` model. v11 compares learned APE, RoPE, and learned relative
+position bias (RPE); v12 uses APE with length 512 and counts 1-50; v13 uses a persisted
+finite training set; and v14 replaces i.i.d. noise with contiguous Shakespeare character
+windows. Each version trains separate non-thinking and thinking models and reports only
+learning dynamics, descriptive attention, and descriptive hidden-state geometry. See
+`docs/pipelines/pipeline_v11_v14_small_architecture.md` for the controlled protocol.
+
+Regenerate all four notebooks after editing their shared builder:
+
+```bash
+python scripts/build_v11_v14_notebooks.py
+```
 
 To rebuild the v3 notebook after editing its generator:
 
