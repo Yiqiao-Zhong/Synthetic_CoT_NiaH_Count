@@ -1,2 +1,1 @@
-"""v17: high-count-biased v10-style synthetic counting."""
-
+"""v17: decreasing long-tail v10-style counting with RoPE."""

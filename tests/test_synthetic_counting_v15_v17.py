@@ -23,12 +23,15 @@ from synthetic_counting_v11.training import _cpu_byte_rng_state, _restore_rng_st
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_v15_v17_restore_v10_width_and_completion_only_loss():
+def test_v15_v17_restore_v10_width_with_versioned_loss_scopes():
     for version in ("v15", "v16", "v17"):
         cfg = preset_config(version, "main", device="cpu")
         assert (cfg.n_layer, cfg.n_head, cfg.n_embd, cfg.n_inner) == (4, 4, 256, 1024)
-        assert cfg.loss_scope == "completion"
-        assert "completion-only" in cfg.to_dict()["training_objective"]
+        expected_scope = "all_sequence" if version in {"v15", "v16"} else "completion"
+        assert cfg.loss_scope == expected_scope
+        objective = cfg.to_dict()["training_objective"]
+        assert ("every non-padding token" in objective) == (version in {"v15", "v16"})
+        assert ("completion-only" in objective) == (version == "v17")
 
 
 def test_v15_and_v16_have_exactly_four_rope_rpe_mode_variants():
@@ -69,7 +72,7 @@ def test_checkpoint_rng_restore_normalizes_mapped_rng_tensors():
     assert restored_rng.getstate() == python_rng.getstate()
 
 
-def test_v15_v17_label_boundaries_match_v10_completion_only_training():
+def test_v15_v16_supervise_prompt_and_completion_while_v14_v17_remain_completion_only():
     old_cfg = preset_config("v14", "debug")
     old_vocab = Vocab.build(old_cfg)
     old_item = render(make_example(old_cfg, old_vocab, random.Random(1), count=2), old_vocab, "nonthinking")
@@ -82,11 +85,17 @@ def test_v15_v17_label_boundaries_match_v10_completion_only_training():
     nonthinking = render(example, new_vocab, "nonthinking")
     thinking = render(example, new_vocab, "thinking")
 
-    assert nonthinking.labels[nonthinking.spans.prompt_start] == IGNORE_INDEX
-    assert sum(label != IGNORE_INDEX for label in nonthinking.labels) == 2
-    first_trace_index = thinking.spans.trace_index_positions[0]
-    assert all(label == IGNORE_INDEX for label in thinking.labels[:first_trace_index])
-    assert all(label != IGNORE_INDEX for label in thinking.labels[first_trace_index:])
+    assert nonthinking.labels == nonthinking.input_ids
+    assert thinking.labels == thinking.input_ids
+    assert all(label != IGNORE_INDEX for label in nonthinking.labels)
+    assert all(label != IGNORE_INDEX for label in thinking.labels)
+
+    v17_cfg = preset_config("v17", "debug")
+    v17_vocab = Vocab.build(v17_cfg)
+    v17_example = make_example(v17_cfg, v17_vocab, random.Random(3), count=2)
+    v17_item = render(v17_example, v17_vocab, "nonthinking")
+    assert v17_item.labels[v17_item.spans.prompt_start] == IGNORE_INDEX
+    assert sum(label != IGNORE_INDEX for label in v17_item.labels) == 2
 
 
 def test_v15_uses_shakespeare_haystack_with_inserted_marker_needles():
@@ -120,9 +129,8 @@ def test_v16_counts_native_target_characters_and_names_the_target_in_the_prompt(
     item = render(examples[0], vocab, "thinking")
     assert item.tokens[1:4] == ["<CountChar>", examples[0].target_token, "<Sep>"]
     assert item.spans.prompt_start == 4
-    first_trace_index = item.spans.trace_index_positions[0]
-    assert all(label == IGNORE_INDEX for label in item.labels[:first_trace_index])
-    assert all(label != IGNORE_INDEX for label in item.labels[first_trace_index:])
+    assert item.labels == item.input_ids
+    assert all(label != IGNORE_INDEX for label in item.labels)
 
 
 def test_v17_power_and_exponential_samplers_are_decreasing_long_tails():
@@ -134,6 +142,29 @@ def test_v17_power_and_exponential_samplers_are_decreasing_long_tails():
         assert np.all(np.diff(probabilities) < 0)
         assert float(np.sum(counts * probabilities)) < 10.0
         assert probabilities[0] > probabilities[-1] * 20
+
+
+def test_v17_matches_reference_rope_architecture_and_optimizer():
+    cfg = preset_config("v17", "main", device="cpu")
+    assert cfg.position_encodings == ("rope",)
+    assert cfg.model_variants == (("rope", "nonthinking"), ("rope", "thinking"))
+    assert (cfg.n_layer, cfg.n_head, cfg.n_embd, cfg.n_inner) == (4, 4, 256, 1024)
+    assert cfg.n_embd // cfg.n_head == 64
+    assert cfg.rope_base == 10_000.0
+    assert cfg.train_steps == 10_000
+    assert cfg.batch_size == 32
+    assert cfg.warmup_steps == 200
+    assert cfg.lr == 3e-4
+    assert (cfg.adam_beta1, cfg.adam_beta2) == (0.9, 0.95)
+    assert cfg.weight_decay == 0.01
+    assert cfg.grad_clip == 1.0
+    assert cfg.precision == "bf16"
+
+    vocab = Vocab.build(cfg)
+    model = build_model(cfg, vocab, "rope", "cpu")
+    assert model.position_embedding is None
+    assert model.config.rope_base == 10_000.0
+    assert model.layers[0].attention.rope_base == 10_000.0
 
 
 def test_v15_v17_models_forward_at_d256_for_every_requested_position_encoding():
@@ -163,3 +194,12 @@ def test_v15_v17_notebooks_are_colab_ready_and_mount_drive_first():
         for cell in code_cells:
             source = "".join(cell.get("source", []))
             compile(source, f"{path.name}:{cell.get('id', 'code-cell')}", "exec")
+
+    v17_notebook = json.loads(
+        (ROOT / "notebooks" / "Trace_Count_v17_Colab.ipynb").read_text(encoding="utf-8")
+    )
+    v17_source = "\n".join("".join(cell.get("source", [])) for cell in v17_notebook["cells"])
+    assert 'RUN_NAME = f"{VERSION}_{PRESET}_rope_completion_seed{SEED}"' in v17_source
+    assert 'position_encodings == ("rope",)' in v17_source
+    assert "PLANNED_CONFIG.rope_base == 10_000.0" in v17_source
+    assert "PLANNED_CONFIG.batch_size == 32" in v17_source

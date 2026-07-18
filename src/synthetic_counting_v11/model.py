@@ -18,7 +18,7 @@ class CausalLMOutput:
     hidden_states: tuple[torch.Tensor, ...] | None = None
 
 
-def _apply_rope(tensor: torch.Tensor) -> torch.Tensor:
+def _apply_rope(tensor: torch.Tensor, *, base: float = 10_000.0) -> torch.Tensor:
     """Apply standard interleaved rotary position embeddings to B,H,T,D."""
 
     _, _, length, head_dim = tensor.shape
@@ -26,7 +26,7 @@ def _apply_rope(tensor: torch.Tensor) -> torch.Tensor:
         raise ValueError("RoPE requires an even attention head dimension")
     positions = torch.arange(length, device=tensor.device, dtype=torch.float32)
     inverse = 1.0 / (
-        10_000
+        float(base)
         ** (torch.arange(0, head_dim, 2, device=tensor.device, dtype=torch.float32) / head_dim)
     )
     angles = torch.outer(positions, inverse).to(dtype=tensor.dtype)
@@ -44,6 +44,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = int(cfg.n_head)
         self.head_dim = int(cfg.n_embd // cfg.n_head)
         self.position_encoding = position_encoding
+        self.rope_base = float(cfg.rope_base)
         self.max_relative_distance = int(cfg.max_relative_distance)
         self.qkv = nn.Linear(cfg.n_embd, 3 * cfg.n_embd)
         self.output = nn.Linear(cfg.n_embd, cfg.n_embd)
@@ -69,8 +70,8 @@ class CausalSelfAttention(nn.Module):
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
         if self.position_encoding == "rope":
-            query = _apply_rope(query)
-            key = _apply_rope(key)
+            query = _apply_rope(query, base=self.rope_base)
+            key = _apply_rope(key, base=self.rope_base)
 
         scores = query @ key.transpose(-2, -1) / math.sqrt(self.head_dim)
         if self.relative_bias is not None:
@@ -146,6 +147,7 @@ class TinyPositionCausalLM(nn.Module):
             n_embd=cfg.n_embd,
             n_positions=cfg.n_positions,
             position_encoding=position_encoding,
+            rope_base=cfg.rope_base,
             output_attentions=False,
             output_hidden_states=False,
             use_cache=False,

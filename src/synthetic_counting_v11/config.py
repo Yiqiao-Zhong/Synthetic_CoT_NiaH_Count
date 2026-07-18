@@ -37,8 +37,11 @@ class ExperimentConfig:
     batch_size: int = 128
     lr: float = 3e-4
     weight_decay: float = 0.01
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
     warmup_steps: int = 500
     grad_clip: float = 1.0
+    precision: str = "float32"
     log_every: int = 50
     eval_every: int = 500
     ar_eval_every: int = 1_000
@@ -52,6 +55,7 @@ class ExperimentConfig:
     n_inner: int = 256
     n_positions: int = 384
     max_relative_distance: int = 256
+    rope_base: float = 10_000.0
 
     attention_examples_per_count: int = 20
     state_train_examples_per_count: int = 40
@@ -125,6 +129,12 @@ class ExperimentConfig:
             raise ValueError(f"Unsupported loss scope: {self.loss_scope}")
         if self.count_sampling not in {"uniform", "power", "exponential"}:
             raise ValueError(f"Unsupported count sampling: {self.count_sampling}")
+        if not (0.0 <= self.adam_beta1 < 1.0 and 0.0 <= self.adam_beta2 < 1.0):
+            raise ValueError("Adam betas must be in [0, 1)")
+        if self.precision not in {"float32", "bf16"}:
+            raise ValueError(f"Unsupported precision: {self.precision}")
+        if self.rope_base <= 0:
+            raise ValueError("rope_base must be positive")
         if not self.target_characters or any(len(char) != 1 for char in self.target_characters):
             raise ValueError("target_characters must contain one-character strings")
         if self.training_data_mode not in {"streaming", "fixed"}:
@@ -135,10 +145,12 @@ class ExperimentConfig:
             raise ValueError(f"{self.version} must use APE only")
         if self.version in {"v15", "v16"} and self.position_encodings != ("rope", "rpe"):
             raise ValueError(f"{self.version} must compare RoPE and RPE")
-        if self.version == "v17" and self.position_encodings != ("ape",):
-            raise ValueError("v17 must use APE only")
-        if self.version in {"v15", "v16", "v17"} and self.loss_scope != "completion":
-            raise ValueError(f"{self.version} must use the v10 completion-only autoregressive loss")
+        if self.version == "v17" and self.position_encodings != ("rope",):
+            raise ValueError("v17 must use RoPE only")
+        if self.version in {"v15", "v16"} and self.loss_scope != "all_sequence":
+            raise ValueError(f"{self.version} must use all-sequence autoregressive loss")
+        if self.version == "v17" and self.loss_scope != "completion":
+            raise ValueError("v17 must use the v10 completion-only autoregressive loss")
         if self.version == "v15" and (
             self.noise_source != "shakespeare_char" or self.task_type != "inserted_marker"
         ):
@@ -158,6 +170,7 @@ class ExperimentConfig:
         result["architecture"] = (
             "v10-style random-init GPT-2/pre-LN causal Transformer core; "
             f"4 layers; 4 heads; d_model={self.n_embd}; MLP={self.n_inner}; "
+            f"position_encoding={','.join(self.position_encodings)}; "
             "tied token embedding/unembedding"
         )
         result["architecture_note"] = (
@@ -165,6 +178,18 @@ class ExperimentConfig:
             "v10 d_model=256 and MLP=1024 capacity while keeping 4 layers and 4 heads"
         )
         result["rpe_definition"] = "learned per-layer, per-head causal relative-distance attention bias"
+        result["rope_definition"] = (
+            f"standard rotary position embedding applied to query/key with base={self.rope_base:g}"
+        )
+        result["optimizer"] = (
+            f"AdamW(beta1={self.adam_beta1:g}, beta2={self.adam_beta2:g}, "
+            f"weight_decay={self.weight_decay:g})"
+        )
+        result["precision_definition"] = (
+            "CUDA bfloat16 autocast for forward/loss; float32 otherwise"
+            if self.precision == "bf16"
+            else "float32"
+        )
         result["separate_transformers"] = True
         result["shared_trace_and_answer_numbers"] = True
         result["training_objective"] = (
@@ -217,7 +242,7 @@ def _main_config(version: str) -> ExperimentConfig:
             version="v15",
             preset="main",
             noise_source="shakespeare_char",
-            loss_scope="completion",
+            loss_scope="all_sequence",
             position_encodings=("rope", "rpe"),
             n_embd=256,
             n_inner=1024,
@@ -228,7 +253,7 @@ def _main_config(version: str) -> ExperimentConfig:
             preset="main",
             noise_source="shakespeare_char",
             task_type="target_character",
-            loss_scope="completion",
+            loss_scope="all_sequence",
             position_encodings=("rope", "rpe"),
             n_embd=256,
             n_inner=1024,
@@ -239,7 +264,13 @@ def _main_config(version: str) -> ExperimentConfig:
             preset="main",
             loss_scope="completion",
             count_sampling="power",
-            position_encodings=("ape",),
+            position_encodings=("rope",),
+            batch_size=32,
+            warmup_steps=200,
+            adam_beta1=0.9,
+            adam_beta2=0.95,
+            precision="bf16",
+            rope_base=10_000.0,
             n_embd=256,
             n_inner=1024,
         )
@@ -293,6 +324,9 @@ def config_from_dict(values: dict[str, Any]) -> ExperimentConfig:
         "architecture",
         "architecture_note",
         "rpe_definition",
+        "rope_definition",
+        "optimizer",
+        "precision_definition",
         "separate_transformers",
         "shared_trace_and_answer_numbers",
         "count_bins",

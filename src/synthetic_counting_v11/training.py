@@ -5,6 +5,7 @@ import math
 import os
 import random
 import shutil
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +65,18 @@ def learning_rate(cfg: ExperimentConfig, step: int) -> float:
         return cfg.lr * step / max(1, cfg.warmup_steps)
     progress = (step - cfg.warmup_steps) / max(1, cfg.train_steps - cfg.warmup_steps)
     return cfg.lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+
+
+def _autocast_context(cfg: ExperimentConfig):
+    enabled = (
+        cfg.precision == "bf16"
+        and str(cfg.device).startswith("cuda")
+        and torch.cuda.is_available()
+        and torch.cuda.is_bf16_supported()
+    )
+    if enabled:
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
 
 
 def _paired_model(
@@ -366,7 +379,12 @@ def train_variant(
         print(f"[skip] {position_encoding}/{mode}: final checkpoint exists", flush=True)
         return
     model = _paired_model(cfg, vocab, position_encoding)
-    optimizer = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    optimizer = AdamW(
+        model.parameters(),
+        lr=cfg.lr,
+        betas=(cfg.adam_beta1, cfg.adam_beta2),
+        weight_decay=cfg.weight_decay,
+    )
     # Pair the prompt stream across output modes. Rendering still changes the
     # supervised completion, but each optimization step sees the same haystack.
     rng = random.Random(cfg.seed)
@@ -394,8 +412,9 @@ def train_variant(
         model.train()
         rendered = _sample_training_batch(cfg, vocab, mode, rng, fixed_pool)
         ids, labels, attention_mask = collate(rendered, vocab, cfg.device)
-        output = model(input_ids=ids, attention_mask=attention_mask)
-        loss, token_losses = shifted_token_losses(output.logits, labels)
+        with _autocast_context(cfg):
+            output = model(input_ids=ids, attention_mask=attention_mask)
+            loss, token_losses = shifted_token_losses(output.logits, labels)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         gradient_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip))

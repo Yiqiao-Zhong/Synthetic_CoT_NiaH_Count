@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from textwrap import dedent
 
@@ -29,15 +30,23 @@ SPECS = {
         "task": "count native occurrences of an explicitly named target character",
     },
     "v17": {
-        "title": "Decreasing Long-Tail Synthetic Needles",
+        "title": "Decreasing Long-Tail Synthetic Needles with RoPE",
         "summary": (
             "保持 v10 的长度 256、APE、uniform synthetic haystack 与 inserted-marker 任务；"
             "训练 count 使用常规递减长尾分布，即 needle 越多，样本越少。balanced validation 仍逐 count 等量。"
         ),
-        "models": "APE x non-thinking/thinking = 2",
+        "models": "RoPE x non-thinking/thinking = 2",
         "task": "count inserted marker needles under a decreasing long-tail training distribution",
     },
 }
+
+# Keep the v17 description ASCII-safe because this generator is also run from
+# Windows terminals whose legacy code pages can corrupt non-ASCII literals.
+SPECS["v17"]["summary"] = (
+    "Keeps the v10 length-256 inserted-marker task and decreasing long-tail "
+    "count distribution, but replaces learned absolute positions with RoPE "
+    "(base 10000). Balanced validation still evaluates every count equally."
+)
 
 
 def markdown(text: str, cell_id: str) -> dict:
@@ -60,8 +69,78 @@ def code(text: str, cell_id: str, tags: list[str] | None = None) -> dict:
     }
 
 
+def title_cell(version: str, spec: dict[str, str]) -> dict:
+    if version in {"v15", "v16"}:
+        objective = """
+        **训练目标：prompt + completion 全序列 causal language modeling。**
+
+        令完整 token 序列为 `x_0, ..., x_T`，其中 `x_0=<BOS>`。训练损失为
+        `-(1/T) * sum_{t=1..T} log p(x_t | x_0, ..., x_{t-1})`。因此 task prefix、
+        256-token prompt/haystack、thinking trace、最终答案和 `<EOS>` 都作为预测目标；
+        `<BOS>` 只提供第一个条件，不作为预测目标，batch padding 仍以 `-100` 忽略。
+
+        这是 teacher-forced causal next-token training，不是训练时自由 rollout。
+        v15/v16 的新运行名包含 `all_sequence`，不会误用旧的 completion-only checkpoint。
+        """
+        objective_name = "prompt + completion all-sequence causal next-token loss"
+    else:
+        objective = """
+        **训练目标：v10-style completion-only causal language modeling。**
+
+        完整 gold prefix 作为 causal context，但 task prefix 与 prompt/haystack 标签为 `-100`。
+        non-thinking 只监督最终 count 与 `<EOS>`；thinking 从第一个 trace 数字开始监督到 `<EOS>`。
+        """
+        objective_name = "v10-style completion-only causal next-token loss"
+
+    return markdown(
+        f"""
+        # Trace Count {version}: {spec['title']}
+
+        | 项目 | 正式设置 |
+        | --- | --- |
+        | 模型 | 每个 position-encoding x mode 组合独立 random init；4 layers；4 heads；d_model=256；MLP=1024 |
+        | 任务 | {spec['task']} |
+        | prompt/count | prompt length 256；count 1-30 |
+        | 模型数 | {spec['models']} |
+        | 训练目标 | **{objective_name}** |
+        | 数字 token | trace index 与最终答案共享 `<1>...<30>` |
+
+        {objective}
+        """,
+        "title",
+    )
+
+
+def learning_definitions_cell(version: str) -> dict:
+    if version in {"v15", "v16"}:
+        total_loss = (
+            "`train_total_loss`：对 shifted labels 中所有非 padding token 平均的 next-token CE；"
+            "它包含 task prefix、prompt/haystack、completion 与 `<EOS>`。"
+        )
+    else:
+        total_loss = "`train_total_loss`：只在 supervised completion suffix 上平均的 next-token CE。"
+    return markdown(
+        f"""
+        ## 5. Inspect settings and learning dynamics
+
+        - {total_loss}
+        - `tf_final_accuracy`：给定 gold prefix，在最终 count 位置对 count vocabulary 取 argmax。
+        - `tf_trace_marker_accuracy`：仅用于 thinking；给定 gold trace prefix，预测每个 marker identity。
+        - `ar_final_accuracy`：从 prompt 后自由生成完整 completion，再检查最终 count；它会暴露 trace 错误传播。
+        - v17 训练分布递减，但 `eval_by_count.csv` 始终对 1-30 每个 count 等量评估。
+        """,
+        "learning-definitions",
+    )
+
+
 def cells(version: str, spec: dict[str, str]) -> list[dict]:
     module = f"synthetic_counting_{version}.run_{version}"
+    loss_scope = "all_sequence" if version in {"v15", "v16"} else "completion"
+    run_scope = (
+        "rope_completion"
+        if version == "v17"
+        else ("all_sequence" if loss_scope == "all_sequence" else "completion")
+    )
     v17_overrides = (
         "count_sampling=COUNT_SAMPLING, power_alpha=POWER_ALPHA, "
         "exponential_beta=EXPONENTIAL_BETA,"
@@ -75,7 +154,7 @@ def cells(version: str, spec: dict[str, str]) -> list[dict]:
         "SEED = 1234",
         'DEVICE = "cuda" if torch.cuda.is_available() else "cpu"',
         'OUT_ROOT = f"runs/synthetic_counting_{VERSION}"',
-        'RUN_NAME = f"{VERSION}_{PRESET}_completion_seed{SEED}"',
+        f'RUN_NAME = f"{{VERSION}}_{{PRESET}}_{run_scope}_seed{{SEED}}"',
         "SKIP_COMPLETED = True",
     ]
     if version == "v17":
@@ -107,7 +186,25 @@ def cells(version: str, spec: dict[str, str]) -> list[dict]:
             ")",
             "assert (PLANNED_CONFIG.n_layer, PLANNED_CONFIG.n_head) == (4, 4)",
             "assert (PLANNED_CONFIG.n_embd, PLANNED_CONFIG.n_inner) == (256, 1024)",
-            'assert PLANNED_CONFIG.loss_scope == "completion"',
+            f'assert PLANNED_CONFIG.loss_scope == "{loss_scope}"',
+        ]
+    )
+    if version == "v17":
+        settings_lines.extend(
+            [
+                'assert PLANNED_CONFIG.position_encodings == ("rope",)',
+                "assert PLANNED_CONFIG.n_embd // PLANNED_CONFIG.n_head == 64",
+                "assert PLANNED_CONFIG.rope_base == 10_000.0",
+                'assert PLANNED_CONFIG.precision == "bf16"',
+                "if PRESET == \"main\":",
+                "    assert PLANNED_CONFIG.train_steps == 10_000",
+                "    assert PLANNED_CONFIG.batch_size == 32",
+                "    assert PLANNED_CONFIG.warmup_steps == 200",
+                "    assert (PLANNED_CONFIG.adam_beta1, PLANNED_CONFIG.adam_beta2) == (0.9, 0.95)",
+            ]
+        )
+    settings_lines.extend(
+        [
             "print({",
             '    "version": VERSION,',
             '    "preset": PRESET,',
@@ -118,9 +215,20 @@ def cells(version: str, spec: dict[str, str]) -> list[dict]:
             '    "noise_source": PLANNED_CONFIG.noise_source,',
             '    "count_sampling": PLANNED_CONFIG.count_sampling,',
             '    "training_objective": PLANNED_CONFIG.to_dict()["training_objective"],',
-            "})",
         ]
     )
+    if version == "v17":
+        settings_lines.extend(
+            [
+                '    "rope_base": PLANNED_CONFIG.rope_base,',
+                '    "head_dim": PLANNED_CONFIG.n_embd // PLANNED_CONFIG.n_head,',
+                '    "batch_size": PLANNED_CONFIG.batch_size,',
+                '    "warmup_steps": PLANNED_CONFIG.warmup_steps,',
+                '    "adam_betas": (PLANNED_CONFIG.adam_beta1, PLANNED_CONFIG.adam_beta2),',
+                '    "precision": PLANNED_CONFIG.precision,',
+            ]
+        )
+    settings_lines.append("})")
 
     run_lines = [
         "cmd = [",
@@ -436,8 +544,14 @@ def cells(version: str, spec: dict[str, str]) -> list[dict]:
 
 
 def build(version: str) -> Path:
+    notebook_cells = cells(version, SPECS[version])
+    replacements = {
+        "title": title_cell(version, SPECS[version]),
+        "learning-definitions": learning_definitions_cell(version),
+    }
+    notebook_cells = [replacements.get(cell.get("id"), cell) for cell in notebook_cells]
     notebook = {
-        "cells": cells(version, SPECS[version]),
+        "cells": notebook_cells,
         "metadata": {
             "accelerator": "GPU",
             "colab": {"name": f"Trace_Count_{version}_Colab.ipynb", "provenance": []},
@@ -454,5 +568,9 @@ def build(version: str) -> Path:
 
 if __name__ == "__main__":
     NOTEBOOKS.mkdir(parents=True, exist_ok=True)
-    for version in SPECS:
+    requested = sys.argv[1:] or list(SPECS)
+    unknown = sorted(set(requested) - set(SPECS))
+    if unknown:
+        raise SystemExit(f"Unknown notebook version(s): {', '.join(unknown)}")
+    for version in requested:
         print(build(version))

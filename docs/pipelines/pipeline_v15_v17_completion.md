@@ -1,4 +1,4 @@
-# v15-v17: v10-style completion-only counting experiments
+# v15-v17: full-sequence and completion-only counting experiments
 
 ## Shared controlled setting
 
@@ -17,9 +17,26 @@ thinking:     <BOS> [task prefix] prompt <Think> <1> M1 ... <n> Mn </Think> <Ans
 
 Trace indices and final answers share the same numeric tokens `<1>...<30>`.
 
-### v10-style completion-only causal objective
+### v15/v16 prompt + completion all-sequence causal objective
 
-The complete gold sequence is present as teacher-forced causal context, but the
+For v15 and v16, every non-padding token after `<BOS>` is a next-token target.
+This includes the optional task prefix, all 256 prompt/haystack tokens, the
+thinking trace when present, the final answer, and `<EOS>`. For a sequence
+`x_0=<BOS>, x_1, ..., x_T`, both modes minimize:
+
+```text
+L_all = -(1/T) sum_{t=1..T} log p_theta(x_t | x_0,...,x_{t-1}).
+```
+
+`<BOS>` is conditioning context rather than a prediction target, and padded
+batch positions remain ignored with label `-100`. This is teacher-forced causal
+next-token training, not free-running rollout. Because the objective changed,
+v15/v16 run names contain `all_sequence` and old completion-only checkpoints
+must not be reused.
+
+### v17 v10-style completion-only causal objective
+
+For v17, the complete gold sequence is present as teacher-forced causal context, but the
 task prefix and prompt/haystack do not contribute to the loss.
 
 For non-thinking, only the final answer and EOS are supervised:
@@ -78,8 +95,9 @@ occurrence of the named character without a separate marker vocabulary.
 
 ## v17: decreasing long-tail synthetic training distribution
 
-v17 keeps v10's synthetic length-256 haystack, inserted marker task, learned
-absolute position embedding (APE), and separate non-thinking/thinking models.
+v17 keeps v10's synthetic length-256 haystack, inserted marker task, and
+separate non-thinking/thinking models, but replaces learned absolute positions
+with rotary position embeddings (RoPE) applied to attention queries and keys.
 Only the training distribution over exact count changes. Both exposed samplers
 assign less probability to examples with more needles:
 
@@ -93,8 +111,13 @@ examples for each count 1-30, so performance across count bins is comparable eve
 though the training stream is imbalanced. The theoretical probabilities and the
 realized batch statistics are both saved.
 
-- Position encoding: APE only.
+- Position encoding: RoPE only, base 10000, head dimension 64.
 - Models: `1 position encoding x 2 modes = 2` independent Transformers.
+- Core: four pre-norm layers, four heads, `d_model=256`, MLP `256 -> 1024 -> 256`,
+  final LayerNorm, tied token embedding/unembedding, and no additive position table.
+- Optimization: AdamW with beta `(0.9, 0.95)` and weight decay `0.01`; learning
+  rate `3e-4`, 200-step linear warmup, cosine decay to zero, batch size 32,
+  10,000 steps, global gradient clipping at 1.0, and CUDA bf16 autocast.
 
 ## Training and outputs
 
@@ -105,8 +128,9 @@ sync checkpoints during training.
 
 Each run records:
 
-- completion-only total loss plus trace-index, trace-marker, final-answer, and EOS
-  component losses where applicable;
+- total loss under the version's configured scope (all-sequence for v15/v16,
+  completion-only for v17), plus trace-index, trace-marker, final-answer, and
+  EOS component losses where applicable;
 - teacher-forced final-count and trace-marker accuracy;
 - free-running autoregressive final-count accuracy;
 - balanced exact-count and 1-10 / 11-20 / 21-30 summaries;
