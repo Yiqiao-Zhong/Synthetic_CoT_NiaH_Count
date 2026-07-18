@@ -62,24 +62,117 @@ def code(text: str, cell_id: str, tags: list[str] | None = None) -> dict:
 
 def cells(version: str, spec: dict[str, str]) -> list[dict]:
     module = f"synthetic_counting_{version}.run_{version}"
-    v17_settings = """
-    COUNT_SAMPLING = "power"       # "power" or "exponential"
-    POWER_ALPHA = 1.0              # p(n) proportional to n ** (-alpha)
-    EXPONENTIAL_BETA = 0.15        # p(n) proportional to exp(-beta * (n - 1))
-    """ if version == "v17" else ""
-    v17_cmd = """
-    if VERSION == "v17":
-        cmd += [
-            "--count-sampling", COUNT_SAMPLING,
-            "--power-alpha", str(POWER_ALPHA),
-            "--exponential-beta", str(EXPONENTIAL_BETA),
-        ]
-    """ if version == "v17" else ""
     v17_overrides = (
         "count_sampling=COUNT_SAMPLING, power_alpha=POWER_ALPHA, "
         "exponential_beta=EXPONENTIAL_BETA,"
         if version == "v17"
         else ""
+    )
+    settings_lines = [
+        f'VERSION = "{version}"',
+        'PRESET = "main"                  # use "debug" for an end-to-end check',
+        'STAGE = "all"                    # train, attention, state, plots, or all',
+        "SEED = 1234",
+        'DEVICE = "cuda" if torch.cuda.is_available() else "cpu"',
+        'OUT_ROOT = f"runs/synthetic_counting_{VERSION}"',
+        'RUN_NAME = f"{VERSION}_{PRESET}_completion_seed{SEED}"',
+        "SKIP_COMPLETED = True",
+    ]
+    if version == "v17":
+        settings_lines.extend(
+            [
+                'COUNT_SAMPLING = "power"       # "power" or "exponential"',
+                "POWER_ALPHA = 1.0              # p(n) proportional to n ** (-alpha)",
+                "EXPONENTIAL_BETA = 0.15        # p(n) proportional to exp(-beta * (n - 1))",
+            ]
+        )
+    settings_lines.extend(
+        [
+            "CHECKPOINT_SYNC_ROOT = (",
+            '    DRIVE_RESULTS_ROOT / f"{VERSION}_live_checkpoints" if DRIVE_READY else None',
+            ")",
+            "",
+            "from synthetic_counting_v11.config import preset_config",
+            "PLANNED_CONFIG = preset_config(",
+            "    VERSION,",
+            "    PRESET,",
+            "    seed=SEED,",
+            "    device=DEVICE,",
+        ]
+    )
+    if v17_overrides:
+        settings_lines.append(f"    {v17_overrides}")
+    settings_lines.extend(
+        [
+            ")",
+            "assert (PLANNED_CONFIG.n_layer, PLANNED_CONFIG.n_head) == (4, 4)",
+            "assert (PLANNED_CONFIG.n_embd, PLANNED_CONFIG.n_inner) == (256, 1024)",
+            'assert PLANNED_CONFIG.loss_scope == "completion"',
+            "print({",
+            '    "version": VERSION,',
+            '    "preset": PRESET,',
+            '    "device": DEVICE,',
+            '    "model_variants": PLANNED_CONFIG.model_variants,',
+            '    "number_of_models": len(PLANNED_CONFIG.model_variants),',
+            '    "task_type": PLANNED_CONFIG.task_type,',
+            '    "noise_source": PLANNED_CONFIG.noise_source,',
+            '    "count_sampling": PLANNED_CONFIG.count_sampling,',
+            '    "training_objective": PLANNED_CONFIG.to_dict()["training_objective"],',
+            "})",
+        ]
+    )
+
+    run_lines = [
+        "cmd = [",
+        f'    sys.executable, "-u", "-m", "{module}",',
+        '    "--preset", PRESET,',
+        '    "--stage", STAGE,',
+        '    "--device", DEVICE,',
+        '    "--seed", str(SEED),',
+        '    "--out-root", OUT_ROOT,',
+        '    "--run-name", RUN_NAME,',
+        "]",
+        "if SKIP_COMPLETED:",
+        '    cmd.append("--skip-completed")',
+        "if CHECKPOINT_SYNC_ROOT is not None:",
+        '    cmd += ["--checkpoint-sync-root", str(CHECKPOINT_SYNC_ROOT)]',
+    ]
+    if version == "v17":
+        run_lines.extend(
+            [
+                "cmd += [",
+                '    "--count-sampling", COUNT_SAMPLING,',
+                '    "--power-alpha", str(POWER_ALPHA),',
+                '    "--exponential-beta", str(EXPONENTIAL_BETA),',
+                "]",
+            ]
+        )
+    run_lines.extend(
+        [
+            "",
+            'print(" ".join(cmd), flush=True)',
+            "process = subprocess.Popen(",
+            "    cmd,",
+            "    stdout=subprocess.PIPE,",
+            "    stderr=subprocess.STDOUT,",
+            "    text=True,",
+            "    bufsize=1,",
+            ")",
+            "captured = []",
+            "assert process.stdout is not None",
+            "for line in process.stdout:",
+            '    print(line, end="", flush=True)',
+            "    captured.append(line.rstrip())",
+            "returncode = process.wait()",
+            "if returncode:",
+            '    print("---- Last 200 log lines ----")',
+            '    print("\\n".join(captured[-200:]))',
+            "    raise subprocess.CalledProcessError(returncode, cmd)",
+            "",
+            "RUN_DIR = Path(OUT_ROOT) / RUN_NAME",
+            'assert (RUN_DIR / "config.json").exists(), RUN_DIR',
+            'print("RUN_DIR =", RUN_DIR.resolve())',
+        ]
     )
 
     return [
@@ -207,89 +300,9 @@ def cells(version: str, spec: dict[str, str]) -> list[dict]:
             "tests",
         ),
         markdown("## 3. Runtime settings", "settings-heading"),
-        code(
-            f"""
-            VERSION = "{version}"
-            PRESET = "main"                  # use "debug" for an end-to-end check
-            STAGE = "all"                    # train, attention, state, plots, or all
-            SEED = 1234
-            DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-            OUT_ROOT = f"runs/synthetic_counting_{{VERSION}}"
-            RUN_NAME = f"{{VERSION}}_{{PRESET}}_completion_seed{{SEED}}"
-            SKIP_COMPLETED = True
-            {dedent(v17_settings).strip()}
-            CHECKPOINT_SYNC_ROOT = (
-                DRIVE_RESULTS_ROOT / f"{{VERSION}}_live_checkpoints" if DRIVE_READY else None
-            )
-
-            from synthetic_counting_v11.config import preset_config
-            PLANNED_CONFIG = preset_config(
-                VERSION,
-                PRESET,
-                seed=SEED,
-                device=DEVICE,
-                {v17_overrides}
-            )
-            assert (PLANNED_CONFIG.n_layer, PLANNED_CONFIG.n_head) == (4, 4)
-            assert (PLANNED_CONFIG.n_embd, PLANNED_CONFIG.n_inner) == (256, 1024)
-            assert PLANNED_CONFIG.loss_scope == "completion"
-            print({{
-                "version": VERSION,
-                "preset": PRESET,
-                "device": DEVICE,
-                "model_variants": PLANNED_CONFIG.model_variants,
-                "number_of_models": len(PLANNED_CONFIG.model_variants),
-                "task_type": PLANNED_CONFIG.task_type,
-                "noise_source": PLANNED_CONFIG.noise_source,
-                "count_sampling": PLANNED_CONFIG.count_sampling,
-                "training_objective": PLANNED_CONFIG.to_dict()["training_objective"],
-            }})
-            """,
-            "runtime-settings",
-        ),
+        code("\n".join(settings_lines), "runtime-settings"),
         markdown(f"## 4. Run {version}", "run-heading"),
-        code(
-            f"""
-            cmd = [
-                sys.executable, "-u", "-m", "{module}",
-                "--preset", PRESET,
-                "--stage", STAGE,
-                "--device", DEVICE,
-                "--seed", str(SEED),
-                "--out-root", OUT_ROOT,
-                "--run-name", RUN_NAME,
-            ]
-            if SKIP_COMPLETED:
-                cmd.append("--skip-completed")
-            if CHECKPOINT_SYNC_ROOT is not None:
-                cmd += ["--checkpoint-sync-root", str(CHECKPOINT_SYNC_ROOT)]
-            {dedent(v17_cmd).strip()}
-
-            print(" ".join(cmd), flush=True)
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            captured = []
-            assert process.stdout is not None
-            for line in process.stdout:
-                print(line, end="", flush=True)
-                captured.append(line.rstrip())
-            returncode = process.wait()
-            if returncode:
-                print("---- Last 200 log lines ----")
-                print("\\n".join(captured[-200:]))
-                raise subprocess.CalledProcessError(returncode, cmd)
-
-            RUN_DIR = Path(OUT_ROOT) / RUN_NAME
-            assert (RUN_DIR / "config.json").exists(), RUN_DIR
-            print("RUN_DIR =", RUN_DIR.resolve())
-            """,
-            "run-pipeline",
-        ),
+        code("\n".join(run_lines), "run-pipeline"),
         markdown(
             """
             ## 5. Inspect settings and learning dynamics

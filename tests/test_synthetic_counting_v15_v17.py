@@ -141,3 +141,6 @@ def test_v15_v17_notebooks_are_colab_ready_and_mount_drive_first():
         first = "".join(code_cells[0].get("source", []))
         assert "drive.mount" in first
         assert f"synthetic_counting_v{version}.run_v{version}" in path.read_text(encoding="utf-8")
+        for cell in code_cells:
+            source = "".join(cell.get("source", []))
+            compile(source, f"{path.name}:{cell.get('id', 'code-cell')}", "exec")
