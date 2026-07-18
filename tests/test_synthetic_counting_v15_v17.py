@@ -17,6 +17,7 @@ from synthetic_counting_v11.data import (
     render,
 )
 from synthetic_counting_v11.model import build_model
+from synthetic_counting_v11.training import _cpu_byte_rng_state, _restore_rng_states
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +49,24 @@ def test_v16_config_round_trip_is_stable_for_checkpoint_resume():
 
     assert serialized == cfg.to_dict()
     assert serialized["target_characters"] == list(cfg.target_characters)
+
+
+def test_checkpoint_rng_restore_normalizes_mapped_rng_tensors():
+    python_rng = random.Random(7)
+    payload = {
+        "python_rng_state": python_rng.getstate(),
+        # Simulate a state whose dtype/device no longer satisfies set_rng_state.
+        "torch_rng_state": torch.get_rng_state().to(dtype=torch.int16),
+        "cuda_rng_state_all": None,
+    }
+    restored_rng = random.Random(999)
+
+    normalized = _cpu_byte_rng_state(payload["torch_rng_state"], name="torch_rng_state")
+    assert normalized.device.type == "cpu"
+    assert normalized.dtype == torch.uint8
+
+    _restore_rng_states(payload, restored_rng)
+    assert restored_rng.getstate() == python_rng.getstate()
 
 
 def test_v15_v17_label_boundaries_match_v10_completion_only_training():

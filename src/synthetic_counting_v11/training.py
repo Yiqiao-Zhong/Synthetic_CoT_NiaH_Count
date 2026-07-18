@@ -100,6 +100,29 @@ def _latest_checkpoint(root: Path) -> tuple[int, Path] | None:
     return max(candidates, default=None, key=lambda item: item[0])
 
 
+def _cpu_byte_rng_state(state: torch.Tensor, *, name: str) -> torch.Tensor:
+    """Normalize RNG state loaded with a CUDA map location for PyTorch setters."""
+
+    if not isinstance(state, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor, got {type(state).__name__}")
+    return state.detach().to(device="cpu", dtype=torch.uint8).contiguous()
+
+
+def _restore_rng_states(payload: dict[str, Any], rng: random.Random) -> None:
+    rng.setstate(payload["python_rng_state"])
+    torch.set_rng_state(
+        _cpu_byte_rng_state(payload["torch_rng_state"], name="torch_rng_state")
+    )
+    cuda_states = payload.get("cuda_rng_state_all")
+    if torch.cuda.is_available() and cuda_states is not None:
+        torch.cuda.set_rng_state_all(
+            [
+                _cpu_byte_rng_state(state, name=f"cuda_rng_state_all[{index}]")
+                for index, state in enumerate(cuda_states)
+            ]
+        )
+
+
 def _save_checkpoint(
     model: TinyPositionCausalLM,
     optimizer: AdamW,
@@ -354,10 +377,7 @@ def train_variant(
         payload = torch.load(path, map_location=cfg.device, weights_only=False)
         model.load_state_dict(payload["model_state_dict"])
         optimizer.load_state_dict(payload["optimizer_state_dict"])
-        rng.setstate(payload["python_rng_state"])
-        torch.set_rng_state(payload["torch_rng_state"])
-        if torch.cuda.is_available() and payload.get("cuda_rng_state_all") is not None:
-            torch.cuda.set_rng_state_all(payload["cuda_rng_state_all"])
+        _restore_rng_states(payload, rng)
         print(f"[resume] {position_encoding}/{mode} from step {start_step}", flush=True)
 
     train_path = run_dir / "tables" / "train_metrics.csv"
