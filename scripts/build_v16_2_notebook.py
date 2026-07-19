@@ -190,7 +190,7 @@ def build() -> Path:
         ),
         code(
             """
-            RUN_TESTS = True
+            RUN_TESTS = False  # optional developer preflight; not required for training
             if RUN_TESTS:
                 test_process = subprocess.run(
                     [sys.executable, "-m", "pytest", "-q", "tests/test_synthetic_counting_v16_2.py"],
@@ -200,6 +200,8 @@ def build() -> Path:
                 )
                 print(test_process.stdout, end="")
                 test_process.check_returncode()
+            else:
+                print("Optional repository tests skipped; pipeline validation remains enabled.")
             """,
             "tests",
         ),
@@ -219,7 +221,7 @@ def build() -> Path:
             RUN_RPE_NONTHINKING = True
             RUN_RPE_THINKING = True
             MAX_TRAIN_STEPS = 10_000         # optimizer steps for each enabled model
-            EVAL_EXAMPLES_PER_COUNT = 100    # 100 per count x counts 1..10 = 1,000 examples per fixed suite
+            EVAL_EXAMPLES_PER_COUNT = 100    # examples for each count; suite size = this value x COUNT_MAX_THRESHOLD
             NEEDLE_POOL_SIZE = 100
             NEEDLE_POOL_FREQUENCY_THRESHOLD = 0.04
             OUT_ROOT = "runs/synthetic_counting_v16_2"

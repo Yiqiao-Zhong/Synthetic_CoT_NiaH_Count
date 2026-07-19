@@ -370,15 +370,18 @@ def test_v16_2_notebook_compiles_and_legacy_v16_runner_is_isolated(tmp_path):
     assert "test_process.check_returncode()" in source
     assert "TASK_OCCURRENCE_RATIO =" in source
     assert '"--task-occurrence-ratio", str(TASK_OCCURRENCE_RATIO)' in source
-    assert "FINAL_COUNT_LOSS_WEIGHT = 1.0" in source
-    assert "COT_TRACE_LOSS_WEIGHT = 1.0" in source
-    assert "RUN_ROPE_NONTHINKING = True" in source
-    assert "RUN_ROPE_THINKING = True" in source
-    assert "RUN_RPE_NONTHINKING = True" in source
-    assert "RUN_RPE_THINKING = True" in source
-    assert "MAX_TRAIN_STEPS = 10_000" in source
-    assert "EVAL_EXAMPLES_PER_COUNT = 100" in source
-    assert "100 per count x counts 1..10 = 1,000 examples per fixed suite" in source
+    for editable_setting in (
+        "FINAL_COUNT_LOSS_WEIGHT",
+        "COT_TRACE_LOSS_WEIGHT",
+        "RUN_ROPE_NONTHINKING",
+        "RUN_ROPE_THINKING",
+        "RUN_RPE_NONTHINKING",
+        "RUN_RPE_THINKING",
+        "MAX_TRAIN_STEPS",
+        "EVAL_EXAMPLES_PER_COUNT",
+    ):
+        assert f"{editable_setting} =" in source
+    assert "examples for each count; suite size = this value x COUNT_MAX_THRESHOLD" in source
     assert '"--final-count-loss-weight", str(FINAL_COUNT_LOSS_WEIGHT)' in source
     assert '"--cot-trace-loss-weight", str(COT_TRACE_LOSS_WEIGHT)' in source
     assert '"--train-steps", str(MAX_TRAIN_STEPS)' in source
@@ -396,6 +399,21 @@ def test_v16_2_notebook_compiles_and_legacy_v16_runner_is_isolated(tmp_path):
     builder.OUTPUT = tmp_path / notebook_path.name
     generated_path = builder.build()
     generated = json.loads(generated_path.read_text(encoding="utf-8"))
+    generated_source = "\n".join(
+        "".join(cell["source"])
+        for cell in generated["cells"]
+        if cell["cell_type"] == "code"
+    )
+    # The builder retains stable repository defaults, while users may edit the
+    # generated notebook's runtime-settings cell for individual experiments.
+    assert "FINAL_COUNT_LOSS_WEIGHT = 1.0" in generated_source
+    assert "COT_TRACE_LOSS_WEIGHT = 1.0" in generated_source
+    assert "RUN_ROPE_NONTHINKING = True" in generated_source
+    assert "RUN_ROPE_THINKING = True" in generated_source
+    assert "RUN_RPE_NONTHINKING = True" in generated_source
+    assert "RUN_RPE_THINKING = True" in generated_source
+    assert "MAX_TRAIN_STEPS = 10_000" in generated_source
+    assert "EVAL_EXAMPLES_PER_COUNT = 100" in generated_source
     assert generated["metadata"] == notebook["metadata"]
     assert [cell["id"] for cell in generated["cells"]] == [
         cell["id"] for cell in notebook["cells"]

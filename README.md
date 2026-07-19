@@ -216,7 +216,9 @@ The Colab entry point is `notebooks/Trace_Count_v16_2_Colab.ipynb`; regenerate i
 `python scripts/build_v16_2_notebook.py`. The complete protocol is in
 `docs/pipelines/pipeline_v16_2_character_sets.md`. The generated notebook currently
 defaults to `TASK_OCCURRENCE_RATIO = 0.05`; the `1.0` command above is an explicit
-all-counting-task example rather than the notebook default.
+all-counting-task example rather than the notebook default. Its repository-test cell is
+disabled by default (`RUN_TESTS = False`): it is an optional developer preflight and is
+not required for data preparation, training, evaluation, or diagnostics.
 
 #### v16_2 Colab environment and compatibility
 
