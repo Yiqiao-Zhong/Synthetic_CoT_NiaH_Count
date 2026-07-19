@@ -47,17 +47,21 @@ def build() -> Path:
             """
             from pathlib import Path
 
-            DRIVE_RESULTS_ROOT = Path(
+            # Keep the uploaded source and result paths derived from one editable root.
+            DRIVE_REPO_ROOT = Path(
                 "/content/drive/MyDrive/Colab Notebooks/NIAH_synthetic/"
-                "Synthetic_CoT_NiaH_Count-main/colab_results"
+                "Synthetic_CoT_NiaH_Count-main"
             )
+            DRIVE_RESULTS_ROOT = DRIVE_REPO_ROOT / "colab_results"
             DRIVE_READY = False
             if Path("/content").exists():
                 from google.colab import drive
                 if not Path("/content/drive/MyDrive").exists():
                     drive.mount("/content/drive")
-                DRIVE_RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
                 DRIVE_READY = True
+                print("Drive mounted; source expected at", DRIVE_REPO_ROOT)
+            else:
+                print("Local runtime: Drive mount skipped")
             """,
             "drive-login",
             ["google-drive-login"],
@@ -71,16 +75,13 @@ def build() -> Path:
             import sys
             from pathlib import Path
 
-            # Change this to the exact Drive folder containing pyproject.toml.
-            DRIVE_REPO_ROOT = Path(
-                "/content/drive/MyDrive/Colab Notebooks/NIAH_synthetic/"
-                "Synthetic_CoT_NiaH_Count-main"
-            )
-
+            assert DRIVE_READY, "Run the Google Drive mount cell before environment setup"
             assert DRIVE_REPO_ROOT.exists(), DRIVE_REPO_ROOT
             assert (DRIVE_REPO_ROOT / "pyproject.toml").exists(), (
                 f"pyproject.toml not found under {DRIVE_REPO_ROOT}"
             )
+            assert DRIVE_RESULTS_ROOT == DRIVE_REPO_ROOT / "colab_results"
+            DRIVE_RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
 
             # Copy source to the Colab VM: training against Drive is substantially slower.
             LOCAL_REPO_ROOT = Path("/content/Synthetic_CoT_NiaH_Count-main")
@@ -92,6 +93,10 @@ def build() -> Path:
                     ".git",
                     ".venv*",
                     "__pycache__",
+                    ".pytest_cache",
+                    ".ruff_cache",
+                    ".mypy_cache",
+                    "*.egg-info",
                     "runs",
                     "artifacts",
                     "colab_results",
@@ -100,6 +105,26 @@ def build() -> Path:
 
             repo = LOCAL_REPO_ROOT
             os.chdir(repo)
+
+            # Validate Colab's preinstalled binary stack without modifying it. If this
+            # fails, discard the runtime rather than mixing binary package generations.
+            scientific_probe = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import matplotlib,numpy,pandas,seaborn,torch,tqdm",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if scientific_probe.returncode:
+                print(scientific_probe.stdout)
+                print(scientific_probe.stderr)
+                raise RuntimeError(
+                    "Colab scientific-package imports are inconsistent. Use Runtime > "
+                    "Disconnect and delete runtime, reconnect, and rerun from the first cell."
+                )
+
             # Preserve Colab's binary-compatible NumPy/pandas/scientific stack.
             subprocess.run(
                 [sys.executable, "-m", "pip", "install", "-q", "--no-deps", "-e", "."],
@@ -112,10 +137,29 @@ def build() -> Path:
             if src_root not in sys.path:
                 sys.path.insert(0, src_root)
 
+            import synthetic_counting_v16_2
             import numpy as np
             import pandas as pd
             import torch
             from IPython.display import Image, Markdown, display
+
+            package_path = Path(synthetic_counting_v16_2.__file__).resolve()
+            assert package_path.is_relative_to(Path(src_root)), (
+                f"Notebook kernel imported stale package from {package_path}"
+            )
+            subprocess_package_path = Path(
+                subprocess.check_output(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import synthetic_counting_v16_2 as p; print(p.__file__)",
+                    ],
+                    text=True,
+                ).strip()
+            ).resolve()
+            assert subprocess_package_path.is_relative_to(Path(src_root)), (
+                f"Subprocess imported stale package from {subprocess_package_path}"
+            )
 
             corpus_path = (
                 repo
@@ -131,7 +175,10 @@ def build() -> Path:
                 "drive_repo": str(DRIVE_REPO_ROOT),
                 "working_repo": str(repo),
                 "src_root": src_root,
+                "kernel_package": str(package_path),
+                "subprocess_package": str(subprocess_package_path),
                 "corpus": str(corpus_path),
+                "python": sys.version.split()[0],
                 "numpy": np.__version__,
                 "pandas": pd.__version__,
                 "torch": torch.__version__,
@@ -145,10 +192,14 @@ def build() -> Path:
             """
             RUN_TESTS = True
             if RUN_TESTS:
-                subprocess.run(
+                test_process = subprocess.run(
                     [sys.executable, "-m", "pytest", "-q", "tests/test_synthetic_counting_v16_2.py"],
-                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
                 )
+                print(test_process.stdout, end="")
+                test_process.check_returncode()
             """,
             "tests",
         ),

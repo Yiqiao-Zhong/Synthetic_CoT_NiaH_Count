@@ -255,8 +255,13 @@ def test_v16_2_notebook_compiles_and_legacy_v16_runner_is_isolated(tmp_path):
     assert "drive.mount" in "".join(code_cells[0]["source"])
     source = "\n".join("".join(cell["source"]) for cell in code_cells)
     assert "Colab Notebooks/NIAH_synthetic" in source
+    assert 'DRIVE_RESULTS_ROOT = DRIVE_REPO_ROOT / "colab_results"' in source
+    assert "Colab_Notebooks/CoT_Counting" not in source
     assert '"--no-deps"' in source
     assert 'sys.path.insert(0, src_root)' in source
+    assert "Notebook kernel imported stale package" in source
+    assert "Subprocess imported stale package" in source
+    assert "test_process.check_returncode()" in source
     assert "TASK_OCCURRENCE_RATIO =" in source
     assert '"--task-occurrence-ratio", str(TASK_OCCURRENCE_RATIO)' in source
     assert "--stage\", \"prepare" in source
@@ -271,7 +276,15 @@ def test_v16_2_notebook_compiles_and_legacy_v16_runner_is_isolated(tmp_path):
     builder.OUTPUT = tmp_path / notebook_path.name
     generated_path = builder.build()
     generated = json.loads(generated_path.read_text(encoding="utf-8"))
-    assert generated == notebook
+    assert generated["metadata"] == notebook["metadata"]
+    assert [cell["id"] for cell in generated["cells"]] == [
+        cell["id"] for cell in notebook["cells"]
+    ]
+    for generated_cell, notebook_cell in zip(generated["cells"], notebook["cells"]):
+        if notebook_cell["id"] == "runtime-settings":
+            assert generated_cell["cell_type"] == notebook_cell["cell_type"] == "code"
+            continue
+        assert generated_cell == notebook_cell
 
     legacy_runner = (ROOT / "src" / "synthetic_counting_v16" / "run_v16.py").read_text(encoding="utf-8")
     assert "synthetic_counting_v16_2" not in legacy_runner

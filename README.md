@@ -195,7 +195,9 @@ python -m synthetic_counting_v16_2.run_v16_2 \
 
 The Colab entry point is `notebooks/Trace_Count_v16_2_Colab.ipynb`; regenerate it with
 `python scripts/build_v16_2_notebook.py`. The complete protocol is in
-`docs/pipelines/pipeline_v16_2_character_sets.md`.
+`docs/pipelines/pipeline_v16_2_character_sets.md`. The generated notebook currently
+defaults to `TASK_OCCURRENCE_RATIO = 0.05`; the `1.0` command above is an explicit
+all-counting-task example rather than the notebook default.
 
 #### v16_2 Colab environment and compatibility
 
@@ -209,7 +211,13 @@ metadata and `requirements.txt` accept `numpy>=1.26,<3.0`, so supported local
 environments may use either NumPy 1.26 or NumPy 2.x. Because the notebook kernel is
 already running when the editable install creates its `.pth` file, setup also prepends
 the copied repository's `src/` directory to `sys.path`; subprocesses continue to use
-the editable installation normally.
+the editable installation normally. The source and result directories are derived from
+one `DRIVE_REPO_ROOT`, and setup verifies that both the live notebook kernel and a new
+Python subprocess import `synthetic_counting_v16_2` from the copied `/content` source.
+It also probes the preinstalled scientific stack before installation and stops with a
+fresh-runtime instruction rather than attempting an in-place binary-package repair.
+If the uploaded Drive folder moves, edit only `DRIVE_REPO_ROOT` in the first code cell;
+the result directory is derived from it.
 
 This is an installation/environment compatibility change only. It does not alter v16
 or v16_2 model architectures, data formats, training objectives, random seeds, run
