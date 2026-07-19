@@ -36,6 +36,7 @@ packages = [
     "src/synthetic_counting_v14",
     "src/synthetic_counting_v15",
     "src/synthetic_counting_v16",
+    "src/synthetic_counting_v16_2",
     "src/synthetic_counting_v17",
 ]
 

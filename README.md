@@ -31,6 +31,7 @@ Importable code follows a standard `src/` layout. Public module names are unchan
 | `synthetic_counting_v14` | v14 APE wrapper: Shakespeare character haystacks |
 | `synthetic_counting_v15` | v15 RoPE/RPE Shakespeare haystacks with inserted needles and prompt + completion all-sequence loss |
 | `synthetic_counting_v16` | v16 RoPE/RPE native Shakespeare target-letter counting |
+| `synthetic_counting_v16_2` | Isolated v16_2 three-character-set Shakespeare counting with raw/task mixtures and guarded holdouts |
 | `synthetic_counting_v17` | v17 RoPE decreasing long-tail synthetic training distribution |
 
 Commands such as `python -m synthetic_niah_v4.run_v4` therefore remain valid after
@@ -168,6 +169,33 @@ Regenerate these three notebooks with:
 ```bash
 python scripts/build_v15_v17_notebooks.py
 ```
+
+### v16_2: character-set counting and raw-language mixtures
+
+v16_2 is additive and leaves v16 unchanged. It prepares 100 unique sets of three
+pairwise-distinct corpus characters by default, with each set's summed training-region
+frequency at most 4%. It then counts the union of native occurrences of the three
+characters in untouched Tiny Shakespeare windows. `task_occurrence_ratio` controls the
+example-level probability of using counting formatting; ratio zero uses exact raw
+Shakespeare windows, while ratio one uses only formatted counting examples.
+
+The stored `count_max_threshold` is the single accepted-count/output-vocabulary maximum.
+`cfg.count_max` exists only as a read-only compatibility alias; inconsistent serialized
+alias values are rejected. Evaluation uses guarded corpus regions and fixed raw, task,
+and ratio-matched suites. The primary train-versus-held-out curves average cross-entropy
+equally over input sequences, while token-weighted loss is saved as a secondary metric.
+The untouched test region is used only at the final checkpoint.
+
+```bash
+python -m synthetic_counting_v16_2.run_v16_2 --preset debug --stage all --device cpu
+python -m synthetic_counting_v16_2.run_v16_2 \
+  --preset main --stage all --device cuda \
+  --task-occurrence-ratio 1.0 --count-max-threshold 10 --skip-completed
+```
+
+The Colab entry point is `notebooks/Trace_Count_v16_2_Colab.ipynb`; regenerate it with
+`python scripts/build_v16_2_notebook.py`. The complete protocol is in
+`docs/pipelines/pipeline_v16_2_character_sets.md`.
 
 To rebuild the v3 notebook after editing its generator:
 
