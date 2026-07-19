@@ -214,6 +214,7 @@ def build() -> Path:
             DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
             TASK_OCCURRENCE_RATIO = 0.05     # 0 = raw Shakespeare; 1 = all counting tasks
             COUNT_MAX_THRESHOLD = 10
+            WEIGHT_DECAY = 0.01              # AdamW decay on all trainable parameters; 0.0 disables it
             FINAL_COUNT_LOSS_WEIGHT = 1.0    # >1 upweights the final numeric answer target
             COT_TRACE_LOSS_WEIGHT = 1.0      # >1 upweights CoT trace indices and marker characters
             RUN_ROPE_NONTHINKING = True
@@ -251,6 +252,7 @@ def build() -> Path:
                 device=DEVICE,
                 task_occurrence_ratio=TASK_OCCURRENCE_RATIO,
                 count_max_threshold=COUNT_MAX_THRESHOLD,
+                weight_decay=WEIGHT_DECAY,
                 final_count_loss_weight=FINAL_COUNT_LOSS_WEIGHT,
                 cot_trace_loss_weight=COT_TRACE_LOSS_WEIGHT,
                 enabled_model_variants=ENABLED_MODEL_VARIANTS,
@@ -265,6 +267,7 @@ def build() -> Path:
                 "config": PLANNED_CONFIG.to_dict(),
                 "enabled_model_variants": ENABLED_MODEL_VARIANTS,
                 "number_of_models": len(ENABLED_MODEL_VARIANTS),
+                "weight_decay": WEIGHT_DECAY,
                 "max_steps_per_model": MAX_TRAIN_STEPS,
                 "total_planned_optimizer_steps": len(ENABLED_MODEL_VARIANTS) * MAX_TRAIN_STEPS,
                 "eval_examples_per_suite": EVAL_EXAMPLES_PER_SUITE,
@@ -283,6 +286,7 @@ def build() -> Path:
                 "--seed", str(SEED),
                 "--task-occurrence-ratio", str(TASK_OCCURRENCE_RATIO),
                 "--count-max-threshold", str(COUNT_MAX_THRESHOLD),
+                "--weight-decay", str(WEIGHT_DECAY),
                 "--final-count-loss-weight", str(FINAL_COUNT_LOSS_WEIGHT),
                 "--cot-trace-loss-weight", str(COT_TRACE_LOSS_WEIGHT),
                 "--train-steps", str(MAX_TRAIN_STEPS),

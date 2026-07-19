@@ -53,6 +53,7 @@ def test_config_alias_ratio_validation_and_run_identity():
         "main",
         task_occurrence_ratio=0.25,
         count_max_threshold=10,
+        weight_decay=0.05,
         final_count_loss_weight=2.0,
         cot_trace_loss_weight=3.0,
         train_steps=123,
@@ -63,6 +64,7 @@ def test_config_alias_ratio_validation_and_run_identity():
     assert cfg.model_variants == (("rope", "thinking"), ("rpe", "nonthinking"))
     assert "taskr0p25" in default_run_name(cfg)
     assert "pool100x3" in default_run_name(cfg)
+    assert "wd0p05" in default_run_name(cfg)
     assert "fcw2_cotw3_steps123_evaln70" in default_run_name(cfg)
     assert "rope-t-rpe-nt" in default_run_name(cfg)
     serialized = cfg.to_dict()
@@ -77,6 +79,11 @@ def test_config_alias_ratio_validation_and_run_identity():
         for value in (0.0, -1.0, math.inf, math.nan):
             with pytest.raises(ValueError, match=name):
                 preset_config("debug", **{name: value})
+    for value in (-1.0, -math.inf, math.inf, math.nan):
+        with pytest.raises(ValueError, match="weight_decay"):
+            preset_config("debug", weight_decay=value)
+    assert preset_config("debug", weight_decay=0.0).weight_decay == 0.0
+    assert default_run_name(replace(cfg, weight_decay=0.0)) != default_run_name(cfg)
 
 
 def test_legacy_config_defaults_and_variant_validation():
@@ -85,6 +92,7 @@ def test_legacy_config_defaults_and_variant_validation():
     legacy.pop("enabled_model_variants")
     legacy.pop("final_count_loss_weight")
     legacy.pop("cot_trace_loss_weight")
+    legacy.pop("weight_decay")
     loaded = config_from_dict(legacy)
     assert loaded.enabled_model_variants == (
         "rope/nonthinking",
@@ -93,6 +101,7 @@ def test_legacy_config_defaults_and_variant_validation():
         "rpe/thinking",
     )
     assert loaded.final_count_loss_weight == loaded.cot_trace_loss_weight == 1.0
+    assert loaded.weight_decay == 0.01
     with pytest.raises(ValueError, match="at least one"):
         preset_config("debug", enabled_model_variants=())
     with pytest.raises(ValueError, match="duplicates"):
@@ -106,6 +115,7 @@ def test_cli_exposes_weights_variants_steps_and_evaluation_size():
         [
             "--final-count-loss-weight", "4",
             "--cot-trace-loss-weight", "2",
+            "--weight-decay", "0.05",
             "--model-variant", "rope/thinking",
             "--model-variant", "rpe/nonthinking",
             "--train-steps", "17",
@@ -114,6 +124,7 @@ def test_cli_exposes_weights_variants_steps_and_evaluation_size():
     )
     assert args.final_count_loss_weight == 4
     assert args.cot_trace_loss_weight == 2
+    assert args.weight_decay == 0.05
     assert args.model_variant == ["rope/thinking", "rpe/nonthinking"]
     assert args.train_steps == 17
     assert args.eval_examples_per_count == 3
@@ -373,6 +384,7 @@ def test_v16_2_notebook_compiles_and_legacy_v16_runner_is_isolated(tmp_path):
     for editable_setting in (
         "FINAL_COUNT_LOSS_WEIGHT",
         "COT_TRACE_LOSS_WEIGHT",
+        "WEIGHT_DECAY",
         "RUN_ROPE_NONTHINKING",
         "RUN_ROPE_THINKING",
         "RUN_RPE_NONTHINKING",
@@ -384,6 +396,9 @@ def test_v16_2_notebook_compiles_and_legacy_v16_runner_is_isolated(tmp_path):
     assert "examples for each count; suite size = this value x COUNT_MAX_THRESHOLD" in source
     assert '"--final-count-loss-weight", str(FINAL_COUNT_LOSS_WEIGHT)' in source
     assert '"--cot-trace-loss-weight", str(COT_TRACE_LOSS_WEIGHT)' in source
+    assert '"--weight-decay", str(WEIGHT_DECAY)' in source
+    assert "weight_decay=WEIGHT_DECAY" in source
+    assert '"weight_decay": WEIGHT_DECAY' in source
     assert '"--train-steps", str(MAX_TRAIN_STEPS)' in source
     assert '"--eval-examples-per-count", str(EVAL_EXAMPLES_PER_COUNT)' in source
     assert 'base_cmd += ["--model-variant", variant]' in source
@@ -408,6 +423,7 @@ def test_v16_2_notebook_compiles_and_legacy_v16_runner_is_isolated(tmp_path):
     # generated notebook's runtime-settings cell for individual experiments.
     assert "FINAL_COUNT_LOSS_WEIGHT = 1.0" in generated_source
     assert "COT_TRACE_LOSS_WEIGHT = 1.0" in generated_source
+    assert "WEIGHT_DECAY = 0.01" in generated_source
     assert "RUN_ROPE_NONTHINKING = True" in generated_source
     assert "RUN_ROPE_THINKING = True" in generated_source
     assert "RUN_RPE_NONTHINKING = True" in generated_source

@@ -1430,3 +1430,138 @@ safe, and unit-weight behavior matches the current v16_2 baseline.
 7. Update README and the v16_2 pipeline document with the new objective and controls.
 8. Run the staged debug acceptance sequence, inspect the resulting config/tables/run
    names, and only then choose non-unit weights for a main experiment.
+
+# revision plan 3: expose v16_2 weight decay in the notebook
+
+## 1. Scope and compatibility contract
+
+Expose the existing v16_2 `weight_decay` optimizer setting through the Colab notebook
+without changing its default or its mathematical behavior. The default must remain
+`0.01`, matching the current `V16_2Config` and all completed v16_2 runs. This revision is
+configuration plumbing only: it must not add dropout, alter AdamW parameter groups,
+exclude biases or LayerNorm parameters from decay, change the learning-rate schedule, or
+modify checkpoint contents beyond the already serialized config value.
+
+The current optimizer construction passes `model.parameters()` directly to AdamW, so
+the configured decay applies to every trainable parameter. Document that fact rather
+than implying the notebook setting uses the more elaborate matrix-only decay convention
+found in some language-model implementations. Any future parameter-group redesign should
+be proposed and tested separately because it would change the meaning of the same
+numeric value.
+
+## 2. Add the easy-to-edit notebook control
+
+Add the following setting to the v16_2 notebook's **Easy-to-edit settings** cell, beside
+the other optimizer/objective controls:
+
+```python
+WEIGHT_DECAY = 0.01  # AdamW decay applied to all trainable parameters; set 0.0 to disable
+```
+
+Pass it to the planned config:
+
+```python
+PLANNED_CONFIG = preset_config(
+    ...,
+    weight_decay=WEIGHT_DECAY,
+)
+```
+
+and to the subprocess command:
+
+```python
+"--weight-decay", str(WEIGHT_DECAY),
+```
+
+The planned-run summary should display the effective value explicitly so a user can
+confirm it before preparation or training begins. Do not change any of the user's other
+current easy-to-edit choices when adding this line.
+
+Implement the notebook change first in `scripts/build_v16_2_notebook.py`, which defines
+the stable generated-notebook default, and add the same control and wiring to
+`notebooks/Trace_Count_v16_2_Colab.ipynb`. Because the checked-in notebook's experiment
+values may intentionally differ from the builder defaults, do not regenerate it in a way
+that silently resets the user's model switches, task ratio, step count, evaluation size,
+or loss weights. Notebook-generation tests should continue permitting user edits inside
+the runtime-settings cell.
+
+## 3. Add CLI forwarding and validation
+
+Add a v16_2 CLI argument:
+
+```text
+--weight-decay FLOAT
+```
+
+with help text stating that it is the AdamW decoupled weight-decay coefficient and that
+`0` disables decay. Forward a supplied value through the existing override dictionary to
+`preset_config`; when omitted, retain the config default of `0.01`.
+
+The core config field already exists and is already stored by `to_dict`, included in
+`config.json`, and embedded in checkpoint config metadata. Add explicit validation that
+`weight_decay` is finite and nonnegative. Permit exactly `0.0`; reject negative, NaN, and
+infinite values before creating or reusing a run directory. Do not impose an arbitrary
+upper limit at the config layer, although documentation should warn that large values can
+substantially change optimization.
+
+## 4. Make optimizer changes part of run identity
+
+Add a weight-decay tag to the default v16_2 run name, for example:
+
+```text
+wd0p01
+```
+
+using the existing stable float-tag formatting. This prevents runs with `0`, `0.01`, or
+`0.1` decay from sharing a default directory when `RUN_NAME=None`. The saved-config
+equality check must still reject a manually reused custom run name if its stored decay
+differs.
+
+Changing the default run-name format affects only the names of newly created v16_2 run
+directories. It must not prevent loading an older config or checkpoint whose config
+already contains `weight_decay=0.01`, and it must not rename or mutate existing results.
+Legacy v16_2 configs that genuinely omit the field should load with the dataclass default
+`0.01`, consistent with the historical optimizer setting.
+
+## 5. Documentation
+
+Update `README.md` and `docs/pipelines/pipeline_v16_2_character_sets.md` to state:
+
+- the notebook exposes `WEIGHT_DECAY` and defaults it to `0.01`;
+- `0.0` disables AdamW decay;
+- the current implementation applies decay to all trainable parameters;
+- weight decay regularizes parameter magnitude but does not provide dropout or early
+  stopping and did not prevent the observed held-out language-loss deterioration after
+  roughly 1,000 steps;
+- checkpoint selection using autoregressive task validation and held-out loss remains
+  necessary even when decay is enabled.
+
+Keep the documentation descriptive. Do not recommend a new default coefficient until a
+controlled sweep compares both language generalization and autoregressive counting.
+
+## 6. Tests and acceptance criteria
+
+Extend `tests/test_synthetic_counting_v16_2.py` with checks that:
+
+1. CLI parsing accepts `--weight-decay 0`, `--weight-decay 0.01`, and another positive
+   finite value and forwards the exact float into the config.
+2. Negative, NaN, and infinite values fail config validation before pipeline artifacts
+   are created.
+3. `weight_decay` round-trips through `to_dict` and `config_from_dict`; a legacy config
+   missing the field receives `0.01`.
+4. Different decay values produce different default run names, while identical values
+   reproduce the same name.
+5. The builder-generated notebook contains `WEIGHT_DECAY = 0.01`, passes it to both
+   `PLANNED_CONFIG` and `base_cmd`, and reports the effective value.
+6. The checked-in notebook contains the editable control and command wiring but tests do
+   not require the user's current experiment value to equal the builder default.
+7. A CPU debug run records the selected decay in `config.json` and in checkpoint config
+   metadata, and optimizer construction uses that value.
+8. Unit-weight loss behavior, enabled-model selection, resumption, and untouched v16
+   tests remain unchanged.
+
+After editing, run the focused v16_2 tests, legacy v16/v11-v14 regression tests, notebook
+code-cell compilation, Ruff, and `git diff --check`. Perform one short CPU debug smoke run
+with `WEIGHT_DECAY=0.0` and one with `0.01`; verify distinct run directories and otherwise
+matching seeded data/model configuration. Update README and pipeline documentation before
+handing the changes back for commit.

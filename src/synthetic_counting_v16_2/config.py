@@ -181,6 +181,8 @@ class V16_2Config:
             raise ValueError("v16_2 requires all-sequence next-token loss")
         if self.precision not in {"float32", "bf16"}:
             raise ValueError("precision must be float32 or bf16")
+        if not math.isfinite(float(self.weight_decay)) or self.weight_decay < 0:
+            raise ValueError("weight_decay must be finite and nonnegative")
         for name in ("final_count_loss_weight", "cot_trace_loss_weight"):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0:
@@ -297,6 +299,7 @@ def config_from_dict(values: dict[str, Any]) -> V16_2Config:
         )
     data.setdefault("final_count_loss_weight", 1.0)
     data.setdefault("cot_trace_loss_weight", 1.0)
+    data.setdefault("weight_decay", 0.01)
     cfg = V16_2Config(**data)
     cfg.validate()
     return cfg
@@ -308,7 +311,8 @@ def default_run_name(cfg: V16_2Config) -> str:
     return (
         f"v16_2_{cfg.preset}_L{cfg.seq_len}_pool{cfg.needle_pool_size}x{cfg.needle_set_size}_"
         f"pf{_float_tag(cfg.needle_pool_frequency_threshold)}_count1-{cfg.count_max_threshold}_"
-        f"taskr{_float_tag(cfg.task_occurrence_ratio)}_fcw{_float_tag(cfg.final_count_loss_weight)}_"
+        f"taskr{_float_tag(cfg.task_occurrence_ratio)}_wd{_float_tag(cfg.weight_decay)}_"
+        f"fcw{_float_tag(cfg.final_count_loss_weight)}_"
         f"cotw{_float_tag(cfg.cot_trace_loss_weight)}_steps{cfg.train_steps}_evaln{eval_size}_"
         f"{variants.replace('/', '-')}_all_sequence_seed{cfg.seed}"
     )

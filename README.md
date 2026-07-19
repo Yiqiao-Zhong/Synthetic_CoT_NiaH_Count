@@ -196,17 +196,27 @@ cross-entropies and component losses remain unweighted for cross-run comparison.
 
 Runs may enable any non-empty subset of `rope/nonthinking`, `rope/thinking`,
 `rpe/nonthinking`, and `rpe/thinking`. The Colab notebook exposes four independent model
-switches, `MAX_TRAIN_STEPS`, both loss weights, and `EVAL_EXAMPLES_PER_COUNT`. The latter
-defaults to 100, giving 1,000 examples in each balanced fixed suite for counts 1 through
-10. Each 500-step checkpoint currently evaluates six loss suites plus one held-out
-behavioral suite, so the default is approximately 7,000 teacher-forced sequences per
-enabled model; autoregressive examples remain controlled separately.
+switches, `MAX_TRAIN_STEPS`, both loss weights, `WEIGHT_DECAY`, and
+`EVAL_EXAMPLES_PER_COUNT`. `WEIGHT_DECAY` defaults to `0.01`; `0.0` disables AdamW
+decay. The current optimizer applies the coefficient to every trainable parameter,
+including embeddings, biases, and LayerNorm parameters. The evaluation setting defaults
+to 100, giving 1,000 examples in each balanced fixed suite for counts 1 through 10. Each
+500-step checkpoint currently evaluates six loss suites plus one held-out behavioral
+suite, so the default is approximately 7,000 teacher-forced sequences per enabled model;
+autoregressive examples remain controlled separately.
+
+Weight decay regularizes parameter magnitude but does not add dropout or early stopping.
+In the observed v16_2 runs, `0.01` did not prevent held-out language loss from worsening
+after roughly 1,000 steps, so checkpoint selection should still consider both held-out
+loss and autoregressive task validation. No alternative decay coefficient is recommended
+as a new default without a controlled sweep.
 
 ```bash
 python -m synthetic_counting_v16_2.run_v16_2 --preset debug --stage all --device cpu
 python -m synthetic_counting_v16_2.run_v16_2 \
   --preset main --stage all --device cuda \
   --task-occurrence-ratio 1.0 --count-max-threshold 10 \
+  --weight-decay 0.01 \
   --final-count-loss-weight 1.0 --cot-trace-loss-weight 1.0 \
   --model-variant rope/thinking --model-variant rpe/thinking \
   --train-steps 10000 --eval-examples-per-count 100 --skip-completed
@@ -245,7 +255,8 @@ v16_2 model architectures, data formats, random seeds, manifests, or checkpoint 
 and existing v16 checkpoints remain loadable. The v16_2 loss weights and model-selection
 controls documented above are separate, explicit experiment settings with
 backward-compatible defaults; they are saved in config/checkpoint metadata and encoded
-in new default run names.
+in new default run names. Newly named v16_2 runs also include the effective weight decay;
+older result directories and checkpoints are not renamed or modified.
 The repository-wide NumPy range now permits NumPy 2 for newly resolved v16 environments,
 however, so a new v16 run under NumPy 2 is not promised to be bit-for-bit identical to
 an older run under NumPy 1.26. For strict historical v16 reproduction, retain a matched

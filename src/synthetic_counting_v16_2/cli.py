@@ -17,6 +17,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--train-steps", type=int, default=None)
     parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=None,
+        help="AdamW decoupled weight-decay coefficient; 0 disables decay",
+    )
+    parser.add_argument(
         "--eval-examples-per-count",
         type=int,
         default=None,
@@ -88,6 +94,7 @@ def main(argv: list[str] | None = None) -> None:
         "device",
         "seed",
         "train_steps",
+        "weight_decay",
         "eval_examples_per_count",
         "final_count_loss_weight",
         "cot_trace_loss_weight",

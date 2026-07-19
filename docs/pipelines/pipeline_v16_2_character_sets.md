@@ -64,6 +64,21 @@ objective. Fixed-suite cross-entropies, perplexities, and component losses remai
 unweighted for comparability; training tables separately identify the weighted objective
 and the weighted shares assigned to final-count and trace targets.
 
+## Optimizer regularization
+
+Training uses AdamW with configurable `weight_decay`, defaulting to `0.01`. The generated
+notebook exposes this as `WEIGHT_DECAY`; setting it to `0.0` disables decay. The current
+optimizer passes all model parameters in one group, so the coefficient applies to every
+trainable parameter, including embeddings, biases, and LayerNorm parameters. Excluding
+biases or normalization parameters would change the optimizer definition and is outside
+this revision.
+
+Weight decay does not add dropout or early stopping. The existing `0.01` setting did not
+prevent held-out language loss from deteriorating after approximately 1,000 steps in the
+reported v16_2 runs. Checkpoint selection must therefore continue considering held-out
+loss together with autoregressive task accuracy. A different default decay should be
+chosen only after a controlled sweep.
+
 ## Evaluation and loss curves
 
 Three fixed suites—raw, task, and ratio-matched mixture—are built from both the training
@@ -98,6 +113,7 @@ python -m synthetic_counting_v16_2.run_v16_2 \
   --preset main --stage all --device cuda \
   --task-occurrence-ratio 1.0 \
   --count-max-threshold 10 \
+  --weight-decay 0.01 \
   --final-count-loss-weight 1.0 \
   --cot-trace-loss-weight 1.0 \
   --model-variant rope/thinking \
@@ -107,11 +123,11 @@ python -m synthetic_counting_v16_2.run_v16_2 \
   --skip-completed
 ```
 
-The generated Colab notebook exposes both loss weights, four independent model switches,
-the maximum steps per enabled model, and evaluation examples per count. At least one
-model switch must be enabled. Legacy v16_2 configs without the new weight/selection
-fields load with unit weights and their former position-encoding x mode Cartesian
-product.
+The generated Colab notebook exposes both loss weights, `WEIGHT_DECAY`, four independent
+model switches, the maximum steps per enabled model, and evaluation examples per count.
+At least one model switch must be enabled. Legacy v16_2 configs without the newer fields
+load with unit task weights, weight decay `0.01`, and their former position-encoding x
+mode Cartesian product.
 
 Stages are `prepare -> train -> attention -> state -> plots`. A train or analysis stage
 refuses to start when the split, pool, or fixed-suite manifests are missing or when any
