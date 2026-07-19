@@ -152,7 +152,7 @@ def build() -> Path:
             PRESET = "main"                 # use "debug" for an end-to-end check
             SEED = 1234
             DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-            TASK_OCCURRENCE_RATIO = 1.0      # 0 = raw Shakespeare; 1 = all counting tasks
+            TASK_OCCURRENCE_RATIO = 0.05     # 0 = raw Shakespeare; 1 = all counting tasks
             COUNT_MAX_THRESHOLD = 10
             NEEDLE_POOL_SIZE = 100
             NEEDLE_POOL_FREQUENCY_THRESHOLD = 0.04
