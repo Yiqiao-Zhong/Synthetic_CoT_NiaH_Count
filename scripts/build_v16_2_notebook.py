@@ -106,6 +106,12 @@ def build() -> Path:
                 check=True,
             )
 
+            # Editable-install .pth files are processed only when Python starts. Make the
+            # copied src-layout package importable in this already-running notebook kernel.
+            src_root = str(repo / "src")
+            if src_root not in sys.path:
+                sys.path.insert(0, src_root)
+
             import numpy as np
             import pandas as pd
             import torch
@@ -124,6 +130,7 @@ def build() -> Path:
             print({
                 "drive_repo": str(DRIVE_REPO_ROOT),
                 "working_repo": str(repo),
+                "src_root": src_root,
                 "corpus": str(corpus_path),
                 "numpy": np.__version__,
                 "pandas": pd.__version__,

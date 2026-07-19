@@ -256,6 +256,7 @@ def test_v16_2_notebook_compiles_and_legacy_v16_runner_is_isolated(tmp_path):
     source = "\n".join("".join(cell["source"]) for cell in code_cells)
     assert "Colab Notebooks/NIAH_synthetic" in source
     assert '"--no-deps"' in source
+    assert 'sys.path.insert(0, src_root)' in source
     assert "TASK_OCCURRENCE_RATIO =" in source
     assert '"--task-occurrence-ratio", str(TASK_OCCURRENCE_RATIO)' in source
     assert "--stage\", \"prepare" in source

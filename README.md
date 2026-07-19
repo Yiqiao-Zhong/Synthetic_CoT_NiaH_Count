@@ -206,7 +206,10 @@ This intentionally preserves Colab's preinstalled, mutually binary-compatible Nu
 pandas, PyTorch, matplotlib, and scikit-learn stack. In particular, it avoids
 downgrading NumPy underneath a pandas wheel that was compiled for NumPy 2. The project
 metadata and `requirements.txt` accept `numpy>=1.26,<3.0`, so supported local
-environments may use either NumPy 1.26 or NumPy 2.x.
+environments may use either NumPy 1.26 or NumPy 2.x. Because the notebook kernel is
+already running when the editable install creates its `.pth` file, setup also prepends
+the copied repository's `src/` directory to `sys.path`; subprocesses continue to use
+the editable installation normally.
 
 This is an installation/environment compatibility change only. It does not alter v16
 or v16_2 model architectures, data formats, training objectives, random seeds, run
