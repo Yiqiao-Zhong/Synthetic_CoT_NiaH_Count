@@ -48,8 +48,8 @@ def build() -> Path:
             from pathlib import Path
 
             DRIVE_RESULTS_ROOT = Path(
-                "/content/drive/MyDrive/Colab_Notebooks/CoT_Counting/"
-                "Synthetic_CoT_NiaH_Count/colab_results"
+                "/content/drive/MyDrive/Colab Notebooks/NIAH_synthetic/"
+                "Synthetic_CoT_NiaH_Count-main/colab_results"
             )
             DRIVE_READY = False
             if Path("/content").exists():
@@ -66,26 +66,71 @@ def build() -> Path:
         code(
             """
             import os
+            import shutil
             import subprocess
             import sys
             from pathlib import Path
 
-            REPO_URL = "https://github.com/Twist-Shan/Synthetic_CoT_NiaH_Count.git"
-            preferred = Path("/content/Synthetic_CoT_NiaH_Count")
-            candidates = [Path.cwd(), *Path.cwd().parents, preferred]
-            repo = next((path.resolve() for path in candidates if (path / "pyproject.toml").exists()), None)
-            if repo is None:
-                subprocess.run(["git", "clone", REPO_URL, str(preferred)], check=True)
-                repo = preferred
-            elif Path("/content").exists() and (repo / ".git").exists():
-                subprocess.run(["git", "-C", str(repo), "pull", "--ff-only"], check=False)
-            os.chdir(repo)
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", "."], check=True)
+            # Change this to the exact Drive folder containing pyproject.toml.
+            DRIVE_REPO_ROOT = Path(
+                "/content/drive/MyDrive/Colab Notebooks/NIAH_synthetic/"
+                "Synthetic_CoT_NiaH_Count-main"
+            )
 
+            assert DRIVE_REPO_ROOT.exists(), DRIVE_REPO_ROOT
+            assert (DRIVE_REPO_ROOT / "pyproject.toml").exists(), (
+                f"pyproject.toml not found under {DRIVE_REPO_ROOT}"
+            )
+
+            # Copy source to the Colab VM: training against Drive is substantially slower.
+            LOCAL_REPO_ROOT = Path("/content/Synthetic_CoT_NiaH_Count-main")
+            shutil.copytree(
+                DRIVE_REPO_ROOT,
+                LOCAL_REPO_ROOT,
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns(
+                    ".git",
+                    ".venv*",
+                    "__pycache__",
+                    "runs",
+                    "artifacts",
+                    "colab_results",
+                ),
+            )
+
+            repo = LOCAL_REPO_ROOT
+            os.chdir(repo)
+            # Preserve Colab's binary-compatible NumPy/pandas/scientific stack.
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-q", "--no-deps", "-e", "."],
+                check=True,
+            )
+
+            import numpy as np
             import pandas as pd
             import torch
             from IPython.display import Image, Markdown, display
-            print({"repo": str(repo), "torch": torch.__version__, "cuda": torch.cuda.is_available()})
+
+            corpus_path = (
+                repo
+                / "src"
+                / "synthetic_counting_v11"
+                / "resources"
+                / "tiny_shakespeare"
+                / "input.txt"
+            )
+            assert corpus_path.exists(), f"Tiny Shakespeare is missing: {corpus_path}"
+
+            print({
+                "drive_repo": str(DRIVE_REPO_ROOT),
+                "working_repo": str(repo),
+                "corpus": str(corpus_path),
+                "numpy": np.__version__,
+                "pandas": pd.__version__,
+                "torch": torch.__version__,
+                "cuda": torch.cuda.is_available(),
+                "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+            })
             """,
             "environment-setup",
         ),

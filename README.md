@@ -197,6 +197,27 @@ The Colab entry point is `notebooks/Trace_Count_v16_2_Colab.ipynb`; regenerate i
 `python scripts/build_v16_2_notebook.py`. The complete protocol is in
 `docs/pipelines/pipeline_v16_2_character_sets.md`.
 
+#### v16_2 Colab environment and compatibility
+
+The v16_2 Colab notebook treats the uploaded Google Drive repository as immutable
+source: it copies the source tree to `/content`, excludes Git metadata, environments,
+and generated runs/results, and performs an editable install there with `--no-deps`.
+This intentionally preserves Colab's preinstalled, mutually binary-compatible NumPy,
+pandas, PyTorch, matplotlib, and scikit-learn stack. In particular, it avoids
+downgrading NumPy underneath a pandas wheel that was compiled for NumPy 2. The project
+metadata and `requirements.txt` accept `numpy>=1.26,<3.0`, so supported local
+environments may use either NumPy 1.26 or NumPy 2.x.
+
+This is an installation/environment compatibility change only. It does not alter v16
+or v16_2 model architectures, data formats, training objectives, random seeds, run
+names, manifests, or checkpoint schemas, and existing v16 checkpoints remain loadable.
+The repository-wide NumPy range now permits NumPy 2 for newly resolved v16 environments,
+however, so a new v16 run under NumPy 2 is not promised to be bit-for-bit identical to
+an older run under NumPy 1.26. For strict historical v16 reproduction, retain a matched
+NumPy 1.26/pandas environment; the v16 CLI and notebook installation flow itself is
+otherwise unchanged. Because core packages may already have been replaced in an active
+Colab VM, start v16_2 from a fresh runtime after changing package installation settings.
+
 To rebuild the v3 notebook after editing its generator:
 
 ```bash

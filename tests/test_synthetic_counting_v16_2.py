@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 import random
@@ -247,15 +248,28 @@ def test_plot_supports_each_mode_individually_and_jointly(tmp_path):
         assert (figures / "learning_loss_suites_train_vs_heldout.png").stat().st_size > 0
 
 
-def test_v16_2_notebook_compiles_and_legacy_v16_runner_is_isolated():
+def test_v16_2_notebook_compiles_and_legacy_v16_runner_is_isolated(tmp_path):
     notebook_path = ROOT / "notebooks" / "Trace_Count_v16_2_Colab.ipynb"
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     code_cells = [cell for cell in notebook["cells"] if cell["cell_type"] == "code"]
     assert "drive.mount" in "".join(code_cells[0]["source"])
     source = "\n".join("".join(cell["source"]) for cell in code_cells)
+    assert "Colab Notebooks/NIAH_synthetic" in source
+    assert '"--no-deps"' in source
     assert "TASK_OCCURRENCE_RATIO = 1.0" in source
     assert "--stage\", \"prepare" in source
     for cell in code_cells:
         compile("".join(cell["source"]), str(notebook_path), "exec")
+
+    builder_path = ROOT / "scripts" / "build_v16_2_notebook.py"
+    spec = importlib.util.spec_from_file_location("build_v16_2_notebook", builder_path)
+    assert spec is not None and spec.loader is not None
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    builder.OUTPUT = tmp_path / notebook_path.name
+    generated_path = builder.build()
+    generated = json.loads(generated_path.read_text(encoding="utf-8"))
+    assert generated == notebook
+
     legacy_runner = (ROOT / "src" / "synthetic_counting_v16" / "run_v16.py").read_text(encoding="utf-8")
     assert "synthetic_counting_v16_2" not in legacy_runner
