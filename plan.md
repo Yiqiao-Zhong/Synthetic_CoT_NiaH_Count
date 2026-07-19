@@ -1161,3 +1161,272 @@ Add a dedicated v16_2 test module covering:
     code, CLI help, the pipeline document, and README.
 13. Only after the debug artifact passes all checks, launch main ratio sweeps and save the
     immutable pool alongside every result bundle.
+
+# revision plan 2: minor optimization of workflow
+
+## Scope and compatibility requirements
+
+Make these changes only in `synthetic_counting_v16_2` and its v16_2 CLI, notebook
+builder, generated notebook, tests, and documentation. Do not change the v16 objective,
+notebook, checkpoint schema, or behavior. The revision has two purposes:
+
+1. allow the final-count and thinking-trace targets to contribute more strongly than the
+   long raw/task-prompt portions of an all-sequence training example; and
+2. let a Colab user choose any subset of the four RoPE/RPE x non-thinking/thinking models
+   and set the training-step limit without editing package code; and
+3. expose the size of the fixed periodic evaluation suites so evaluation cost can be
+   reduced explicitly without weakening count balance by accident.
+
+Use backward-compatible package defaults. A v16_2 config that does not contain the new
+loss-weight or model-selection fields must load as the current behavior: both position
+encodings, both modes, 10,000 training steps, and unit weight on every active token.
+Existing checkpoints must remain readable. New settings must be part of `config.json`
+and checkpoint config metadata so a run cannot silently resume under a different
+objective or model selection.
+
+## 1. Add two task-relevant loss weights
+
+Add the following stored fields to `V16_2Config`:
+
+```python
+final_count_loss_weight: float = 1.0
+cot_trace_loss_weight: float = 1.0
+```
+
+`final_count_loss_weight` applies to the single gold number token at
+`spans.count_pos` in both non-thinking and thinking task examples.
+`cot_trace_loss_weight` applies only to the thinking trace body: all positions in
+`spans.trace_index_positions` and `spans.trace_marker_positions`. It does not implicitly
+weight `<Think>`, `</Think>`, `<Ans>`, `<EOS>`, the task prefix, or the Shakespeare
+prompt. Raw-language examples have weight 1 everywhere. The two target sets are
+disjoint, so weights do not multiply or stack.
+
+Require both values to be finite and strictly positive. Unit weights must reproduce the
+old unweighted objective, within deterministic floating-point tolerance. Keep `1.0` as
+the package/config default for backward compatibility; expose comments in the notebook
+showing that values greater than one upweight those targets. Do not silently choose a
+large experimental default without a controlled sweep.
+
+Implement a target-aligned weight tensor with the same unshifted shape as `labels`.
+Initialize active targets to 1, overwrite final-count and trace positions from the saved
+spans, leave padding at zero/ignored, and shift the tensor exactly as labels are shifted.
+Extend the token-loss helper to calculate
+
+```text
+weighted_loss = sum_i(weight_i * cross_entropy_i) / sum_i(weight_i)
+```
+
+over active targets. Normalizing by the sum of weights, rather than by the number of
+tokens, keeps the overall optimizer scale stable when weights change. Continue returning
+the ordinary per-token cross-entropies and active mask so component diagnostics remain
+interpretable.
+
+Use the weighted loss for `backward()` during training. Preserve the existing unweighted
+`token_weighted_cross_entropy`, `example_mean_cross_entropy`, perplexities, and component
+losses in fixed train/validation/test suites so old and new runs remain directly
+comparable. Add explicit training diagnostics such as `train_weighted_objective_loss`,
+`batch_active_weight_sum`, and realized weighted shares for final-count and trace targets;
+do not relabel the weighted objective as ordinary cross-entropy. If a weighted validation
+objective is saved, give it a separate column and never overwrite the existing loss
+columns.
+
+Propagate and persist both fields through all relevant surfaces:
+
+- `src/synthetic_counting_v16_2/config.py`: dataclass fields, validation, `to_dict`,
+  legacy-aware `config_from_dict`, and run-name tags;
+- `src/synthetic_counting_v16_2/cli.py`: `--final-count-loss-weight` and
+  `--cot-trace-loss-weight`, including help text and override forwarding;
+- `src/synthetic_counting_v16_2/data.py` and/or `training.py`: target-aligned weight
+  construction, shifted weighted reduction, and training diagnostics;
+- `scripts/build_v16_2_notebook.py`: the source of truth for notebook settings and CLI
+  construction;
+- regenerated `notebooks/Trace_Count_v16_2_Colab.ipynb`;
+- `README.md` and `docs/pipelines/pipeline_v16_2_character_sets.md`: mathematical
+  definition, defaults, affected token groups, and compatibility note.
+
+Include both weights in the default run name, for example `fcw1_cotw1`, so two objectives
+cannot reuse the same directory when `RUN_NAME=None`. The existing config equality check
+must continue rejecting a manually reused directory whose saved weights differ.
+
+In the notebook's **Easy-to-edit settings** cell, add:
+
+```python
+FINAL_COUNT_LOSS_WEIGHT = 1.0  # >1 upweights the final numeric answer target
+COT_TRACE_LOSS_WEIGHT = 1.0    # >1 upweights thinking trace indices and markers
+```
+
+Pass both values to `preset_config(...)` and the subprocess CLI. Print the effective
+values before preparation begins.
+
+## 2. Add independent switches for the four model variants
+
+Expose four clear booleans in the same notebook settings cell:
+
+```python
+RUN_ROPE_NONTHINKING = True
+RUN_ROPE_THINKING = True
+RUN_RPE_NONTHINKING = True
+RUN_RPE_THINKING = True
+```
+
+Derive one canonical ordered selection from these booleans:
+
+```text
+rope/nonthinking, rope/thinking, rpe/nonthinking, rpe/thinking
+```
+
+Add a stored config field such as `enabled_model_variants`, with the four canonical
+strings above as its default. Keep `cfg.model_variants` as the tuple-of-tuples interface
+used by training and analysis, but derive it from the stored selection. Validate that the
+selection is non-empty, contains no duplicates, and contains only supported
+position-encoding/mode pairs. For legacy v16_2 configs without this field, derive the old
+Cartesian product from `position_encodings` and both modes.
+
+Add a repeatable CLI option such as
+`--model-variant rope/nonthinking --model-variant rpe/thinking`. The notebook builder
+should append one argument per enabled boolean. Persist the effective ordered selection
+in `config.json`, checkpoint config metadata, and the run name. Continue retaining or
+deriving `position_encodings` as needed for legacy loading, but do not let it contradict
+the explicit enabled variants.
+
+Audit every loop and plot that currently assumes all four models. Training, final test,
+permutation evaluation, attention collection, state probing, summary tables, and plots
+must iterate only over `cfg.model_variants`. A one-model run must not attempt to load
+three missing checkpoints. Plot legends and line styles must be discovered from the
+available rows, as they already are for several v16_2 plots.
+
+## 3. Expose the existing training-step control in the notebook
+
+The package already has `train_steps=10_000` and the CLI already supports
+`--train-steps`; no new underlying optimization parameter is needed. Add this explicit
+notebook setting:
+
+```python
+MAX_TRAIN_STEPS = 10_000
+```
+
+Pass it as `train_steps=MAX_TRAIN_STEPS` to `preset_config(...)` and as
+`--train-steps MAX_TRAIN_STEPS` to the subprocess. Include a `steps10000` tag in the
+default run name so short/debug and full runs cannot collide. Retain the current positive
+integer validation. The existing loop already evaluates and saves a final checkpoint at
+`train_steps` even when the value is not a multiple of `eval_every` or
+`checkpoint_every`; add a regression test for that boundary.
+
+Before launching the pipeline, print a compact planned-run summary containing the
+enabled variants, number of models, maximum steps per model, total planned optimizer
+steps, task ratio, and both loss weights. Fail in the settings cell if all four model
+switches are false rather than starting an empty run.
+
+## 4. Expose periodic evaluation-suite size in the notebook
+
+The current main config already stores `eval_examples_per_count=100`. With
+`count_max_threshold=10`, this produces 1,000 examples in each fixed raw, task, and
+mixture suite. At every 500-step evaluation, each model evaluates all three train suites,
+all three held-out suites, and the 1,000-example held-out teacher-forced behavioral set.
+Therefore the current periodic workload is approximately 7,000 teacher-forced sequences
+per model per evaluation checkpoint, not 1,000 sequences total. At every 1,000 steps,
+the separate autoregressive subset adds `ar_examples_per_count * count_max_threshold`
+generated examples.
+
+Expose the existing balanced-suite control in the **Easy-to-edit settings** cell:
+
+```python
+EVAL_EXAMPLES_PER_COUNT = 100  # 100 x counts 1..10 = 1,000 examples per fixed suite
+```
+
+Prefer the per-count setting over a bare total because task evaluation must remain
+exactly balanced across every accepted count. In the planned-run summary, calculate and
+print:
+
+```python
+EVAL_EXAMPLES_PER_SUITE = EVAL_EXAMPLES_PER_COUNT * COUNT_MAX_THRESHOLD
+PERIODIC_TF_EXAMPLES_PER_MODEL = 7 * EVAL_EXAMPLES_PER_SUITE
+```
+
+The second value is an explanatory workload estimate for the present six loss suites
+plus one behavioral task evaluation; it is not a new config field. Keep the evaluation
+cadence at `eval_every=500` in this minor revision. Also state explicitly that this
+setting does not change `ar_examples_per_count=10`, which controls generation evaluation
+at the separate 1,000-step cadence.
+
+No new core config field is required because `eval_examples_per_count` already exists and
+is serialized in `config.json` and checkpoint metadata. Add the missing CLI option
+`--eval-examples-per-count`, forward it through `preset_config`, and pass it from
+`scripts/build_v16_2_notebook.py` into both `PLANNED_CONFIG` and `base_cmd`. Regenerate
+`notebooks/Trace_Count_v16_2_Colab.ipynb` from the builder. Validate it as a positive
+integer before data preparation.
+
+This existing config controls the sizes of all fixed train, validation, and final-test
+raw/task/mixture manifests, as well as the periodic teacher-forced task set. Document
+that scope rather than implying that it affects only one validation table. Include an
+`evaln1000` tag, based on the derived per-suite total, in the default run name because
+changing this value changes persisted data manifests and evaluation precision. The run
+directory config-equality and manifest-fingerprint checks must continue preventing reuse
+of fixed suites created at a different size.
+
+Reducing this setting trades statistical precision for speed. For example, with counts
+1–10, `EVAL_EXAMPLES_PER_COUNT=20` yields 200 examples per suite and roughly 1,400
+teacher-forced sequences per model at each 500-step checkpoint. Do not permit a total
+that drops or unevenly samples count classes; every suite must still contain the same
+number of task examples for each count.
+
+## 5. Tests and acceptance criteria
+
+Extend `tests/test_synthetic_counting_v16_2.py` with the following checks:
+
+1. A hand-computed toy batch verifies shifted alignment and weighted normalization for
+   final-count, trace-index, trace-marker, ordinary, and padded targets.
+2. `final_count_loss_weight` affects both modes; `cot_trace_loss_weight` affects only the
+   thinking trace body and leaves non-thinking/raw targets unchanged.
+3. Unit weights reproduce the previous scalar loss and gradients within deterministic
+   tolerance.
+4. Invalid, non-finite, zero, and negative weights fail before a run directory is used.
+5. Both weights round-trip through `to_dict`/`config_from_dict`, CLI parsing,
+   `config.json`, checkpoint metadata, and notebook construction. A legacy config missing
+   them loads with unit weights.
+6. Each individual model switch and representative mixed subsets produce exactly the
+   requested checkpoints/tables; attention, state, test, permutation, summary, and plots
+   do not look for disabled variants.
+7. An empty model selection, duplicate CLI variants, and unsupported variants fail with
+   informative messages. Legacy configs still select all formerly implied variants.
+8. `MAX_TRAIN_STEPS` reaches the config and CLI, stops at the exact requested step, and
+   produces the final evaluation/checkpoint for a non-cadence-aligned value.
+9. `EVAL_EXAMPLES_PER_COUNT` round-trips through config, CLI, notebook, and persisted
+   manifests; values zero or below fail before preparation.
+10. With a small value, every raw/task/mixture train, validation, and test suite has the
+    derived total size; every task suite remains exactly balanced by count; the periodic
+    detail table contains that same derived number of examples per model/checkpoint.
+11. Changing evaluation size changes the default run name and suite-manifest fingerprint,
+    while rerunning the same seeded size reproduces the same fixed examples.
+12. Default run names differ when loss weights, enabled variants, training steps, or
+    evaluation-suite size differ.
+13. The generated notebook contains all eight easy controls (two weights, four model
+    switches, maximum steps, and periodic examples per count), passes them to both
+    `PLANNED_CONFIG` and `base_cmd`, prints the derived per-suite/workload totals, and
+    remains executable from a fresh Colab runtime.
+14. Existing v16 tests and untouched v16 behavior continue to pass.
+
+Run the fast unit/config/notebook tests first, then a CPU debug pipeline with one enabled
+variant, then a two-variant mixed selection, and finally the existing all-four debug
+pipeline with unit weights. Do not launch a new main run until those artifacts confirm
+that disabled variants are absent, weighted shares are recorded, resumption remains
+safe, and unit-weight behavior matches the current v16_2 baseline.
+
+## 6. Implementation order
+
+1. Add and validate the two loss-weight fields plus legacy config loading and run-name
+   tags.
+2. Implement target-aligned weight construction and the normalized weighted training
+   reduction while preserving unweighted evaluation metrics.
+3. Add the canonical enabled-variant config/CLI representation and make every pipeline
+   stage subset-safe.
+4. Add the CLI plumbing and run-name tag for the existing
+   `eval_examples_per_count` setting.
+5. Expose `MAX_TRAIN_STEPS`, `EVAL_EXAMPLES_PER_COUNT`, the four switches, and both weights in
+   `scripts/build_v16_2_notebook.py`; regenerate the notebook rather than editing only the
+   generated `.ipynb`.
+6. Add unit, CLI, subset-pipeline, evaluation-size, notebook-generation, and
+   legacy-compatibility tests.
+7. Update README and the v16_2 pipeline document with the new objective and controls.
+8. Run the staged debug acceptance sequence, inspect the resulting config/tables/run
+   names, and only then choose non-unit weights for a main experiment.

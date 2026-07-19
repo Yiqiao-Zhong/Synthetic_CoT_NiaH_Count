@@ -212,6 +212,14 @@ def build() -> Path:
             DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
             TASK_OCCURRENCE_RATIO = 0.05     # 0 = raw Shakespeare; 1 = all counting tasks
             COUNT_MAX_THRESHOLD = 10
+            FINAL_COUNT_LOSS_WEIGHT = 1.0    # >1 upweights the final numeric answer target
+            COT_TRACE_LOSS_WEIGHT = 1.0      # >1 upweights CoT trace indices and marker characters
+            RUN_ROPE_NONTHINKING = True
+            RUN_ROPE_THINKING = True
+            RUN_RPE_NONTHINKING = True
+            RUN_RPE_THINKING = True
+            MAX_TRAIN_STEPS = 10_000         # optimizer steps for each enabled model
+            EVAL_EXAMPLES_PER_COUNT = 100    # 100 per count x counts 1..10 = 1,000 examples per fixed suite
             NEEDLE_POOL_SIZE = 100
             NEEDLE_POOL_FREQUENCY_THRESHOLD = 0.04
             OUT_ROOT = "runs/synthetic_counting_v16_2"
@@ -221,6 +229,19 @@ def build() -> Path:
                 DRIVE_RESULTS_ROOT / "v16_2_live_checkpoints" if DRIVE_READY else None
             )
 
+            ENABLED_MODEL_VARIANTS = tuple(
+                variant
+                for enabled, variant in (
+                    (RUN_ROPE_NONTHINKING, "rope/nonthinking"),
+                    (RUN_ROPE_THINKING, "rope/thinking"),
+                    (RUN_RPE_NONTHINKING, "rpe/nonthinking"),
+                    (RUN_RPE_THINKING, "rpe/thinking"),
+                )
+                if enabled
+            )
+            if not ENABLED_MODEL_VARIANTS:
+                raise ValueError("Enable at least one of the four model variants")
+
             from synthetic_counting_v16_2.config import preset_config
             PLANNED_CONFIG = preset_config(
                 PRESET,
@@ -228,10 +249,25 @@ def build() -> Path:
                 device=DEVICE,
                 task_occurrence_ratio=TASK_OCCURRENCE_RATIO,
                 count_max_threshold=COUNT_MAX_THRESHOLD,
+                final_count_loss_weight=FINAL_COUNT_LOSS_WEIGHT,
+                cot_trace_loss_weight=COT_TRACE_LOSS_WEIGHT,
+                enabled_model_variants=ENABLED_MODEL_VARIANTS,
+                train_steps=MAX_TRAIN_STEPS,
+                eval_examples_per_count=EVAL_EXAMPLES_PER_COUNT,
                 needle_pool_size=NEEDLE_POOL_SIZE,
                 needle_pool_frequency_threshold=NEEDLE_POOL_FREQUENCY_THRESHOLD,
             )
-            print(PLANNED_CONFIG.to_dict())
+            EVAL_EXAMPLES_PER_SUITE = EVAL_EXAMPLES_PER_COUNT * COUNT_MAX_THRESHOLD
+            PERIODIC_TF_EXAMPLES_PER_MODEL = 7 * EVAL_EXAMPLES_PER_SUITE
+            print({
+                "config": PLANNED_CONFIG.to_dict(),
+                "enabled_model_variants": ENABLED_MODEL_VARIANTS,
+                "number_of_models": len(ENABLED_MODEL_VARIANTS),
+                "max_steps_per_model": MAX_TRAIN_STEPS,
+                "total_planned_optimizer_steps": len(ENABLED_MODEL_VARIANTS) * MAX_TRAIN_STEPS,
+                "eval_examples_per_suite": EVAL_EXAMPLES_PER_SUITE,
+                "periodic_teacher_forced_examples_per_model": PERIODIC_TF_EXAMPLES_PER_MODEL,
+            })
             """,
             "runtime-settings",
         ),
@@ -245,10 +281,16 @@ def build() -> Path:
                 "--seed", str(SEED),
                 "--task-occurrence-ratio", str(TASK_OCCURRENCE_RATIO),
                 "--count-max-threshold", str(COUNT_MAX_THRESHOLD),
+                "--final-count-loss-weight", str(FINAL_COUNT_LOSS_WEIGHT),
+                "--cot-trace-loss-weight", str(COT_TRACE_LOSS_WEIGHT),
+                "--train-steps", str(MAX_TRAIN_STEPS),
+                "--eval-examples-per-count", str(EVAL_EXAMPLES_PER_COUNT),
                 "--needle-pool-size", str(NEEDLE_POOL_SIZE),
                 "--needle-pool-frequency-threshold", str(NEEDLE_POOL_FREQUENCY_THRESHOLD),
                 "--out-root", OUT_ROOT,
             ]
+            for variant in ENABLED_MODEL_VARIANTS:
+                base_cmd += ["--model-variant", variant]
             if RUN_NAME is not None:
                 base_cmd += ["--run-name", RUN_NAME]
             if CHECKPOINT_SYNC_ROOT is not None:

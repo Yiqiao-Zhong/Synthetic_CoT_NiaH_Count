@@ -13,7 +13,8 @@ import pandas as pd
 import pytest
 import torch
 
-from synthetic_counting_v16_2.config import V16_2Config, config_from_dict, default_run_name, preset_config
+from synthetic_counting_v16_2.cli import build_parser
+from synthetic_counting_v16_2.config import config_from_dict, default_run_name, preset_config
 from synthetic_counting_v16_2.data import (
     V16_2Vocab,
     balanced_v16_2_examples,
@@ -22,6 +23,7 @@ from synthetic_counting_v16_2.data import (
     build_test_suite_manifests,
     character_token,
     collate_v16_2,
+    collate_v16_2_loss_weights,
     load_corpus_text,
     make_training_example,
     make_v16_2_example,
@@ -47,10 +49,22 @@ def prepared():
 
 
 def test_config_alias_ratio_validation_and_run_identity():
-    cfg = preset_config("main", task_occurrence_ratio=0.25, count_max_threshold=10)
+    cfg = preset_config(
+        "main",
+        task_occurrence_ratio=0.25,
+        count_max_threshold=10,
+        final_count_loss_weight=2.0,
+        cot_trace_loss_weight=3.0,
+        train_steps=123,
+        eval_examples_per_count=7,
+        enabled_model_variants=("rope/thinking", "rpe/nonthinking"),
+    )
     assert cfg.count_max == cfg.count_max_threshold == 10
+    assert cfg.model_variants == (("rope", "thinking"), ("rpe", "nonthinking"))
     assert "taskr0p25" in default_run_name(cfg)
     assert "pool100x3" in default_run_name(cfg)
+    assert "fcw2_cotw3_steps123_evaln70" in default_run_name(cfg)
+    assert "rope-t-rpe-nt" in default_run_name(cfg)
     serialized = cfg.to_dict()
     assert config_from_dict(serialized) == cfg
     serialized["count_max"] = 9
@@ -59,6 +73,50 @@ def test_config_alias_ratio_validation_and_run_identity():
     for ratio in (-0.01, 1.01):
         with pytest.raises(ValueError, match="task_occurrence_ratio"):
             preset_config("debug", task_occurrence_ratio=ratio)
+    for name in ("final_count_loss_weight", "cot_trace_loss_weight"):
+        for value in (0.0, -1.0, math.inf, math.nan):
+            with pytest.raises(ValueError, match=name):
+                preset_config("debug", **{name: value})
+
+
+def test_legacy_config_defaults_and_variant_validation():
+    cfg = preset_config("debug", device="cpu")
+    legacy = cfg.to_dict()
+    legacy.pop("enabled_model_variants")
+    legacy.pop("final_count_loss_weight")
+    legacy.pop("cot_trace_loss_weight")
+    loaded = config_from_dict(legacy)
+    assert loaded.enabled_model_variants == (
+        "rope/nonthinking",
+        "rope/thinking",
+        "rpe/nonthinking",
+        "rpe/thinking",
+    )
+    assert loaded.final_count_loss_weight == loaded.cot_trace_loss_weight == 1.0
+    with pytest.raises(ValueError, match="at least one"):
+        preset_config("debug", enabled_model_variants=())
+    with pytest.raises(ValueError, match="duplicates"):
+        preset_config(
+            "debug", enabled_model_variants=("rope/thinking", "rope/thinking")
+        )
+
+
+def test_cli_exposes_weights_variants_steps_and_evaluation_size():
+    args = build_parser().parse_args(
+        [
+            "--final-count-loss-weight", "4",
+            "--cot-trace-loss-weight", "2",
+            "--model-variant", "rope/thinking",
+            "--model-variant", "rpe/nonthinking",
+            "--train-steps", "17",
+            "--eval-examples-per-count", "3",
+        ]
+    )
+    assert args.final_count_loss_weight == 4
+    assert args.cot_trace_loss_weight == 2
+    assert args.model_variant == ["rope/thinking", "rpe/nonthinking"]
+    assert args.train_steps == 17
+    assert args.eval_examples_per_count == 3
 
 
 def test_guarded_corpus_regions_are_disjoint(prepared):
@@ -106,6 +164,52 @@ def test_task_example_preserves_window_and_renders_three_character_prefix(prepar
     assert trace_markers == list(example.needle_markers)
     assert nonthinking.labels == nonthinking.input_ids
     assert thinking.labels == thinking.input_ids
+
+
+def test_task_relevant_loss_weights_are_shift_aligned(prepared):
+    base, text, split, vocab, pool = prepared
+    cfg = replace(base, final_count_loss_weight=7.0, cot_trace_loss_weight=3.0)
+    example = make_v16_2_example(
+        cfg, vocab, text, split, pool, random.Random(41), region_name="train"
+    )
+    nonthinking = render_v16_2(example, vocab, "nonthinking")
+    thinking = render_v16_2(example, vocab, "thinking")
+    weights = collate_v16_2_loss_weights([nonthinking, thinking], cfg, "cpu")
+    assert weights[0, nonthinking.spans.count_pos] == 7
+    assert weights[0].eq(3).sum() == 0
+    assert weights[1, thinking.spans.count_pos] == 7
+    for position in (
+        *thinking.spans.trace_index_positions,
+        *thinking.spans.trace_marker_positions,
+    ):
+        assert weights[1, position] == 3
+    for position in (
+        thinking.spans.think_pos,
+        thinking.spans.think_close_pos,
+        thinking.spans.ans_pos,
+        thinking.spans.eos_pos,
+    ):
+        assert weights[1, position] == 1
+
+    ids, labels, _ = collate_v16_2([nonthinking, thinking], vocab, "cpu")
+    torch.manual_seed(9)
+    logits = torch.randn(
+        len(ids), ids.shape[1], len(vocab.id_to_token), requires_grad=True
+    )
+    weighted, losses, active = shifted_v16_2_token_losses(logits, labels, weights)
+    shifted_weights = weights[:, 1:] * active
+    expected = (losses * shifted_weights).sum() / shifted_weights.sum()
+    assert float(weighted.detach()) == pytest.approx(float(expected.detach()))
+
+    unit = torch.where(weights > 0, torch.ones_like(weights), weights)
+    old_loss, _, _ = shifted_v16_2_token_losses(logits, labels)
+    unit_loss, _, _ = shifted_v16_2_token_losses(logits, labels, unit)
+    assert float(unit_loss.detach()) == pytest.approx(float(old_loss.detach()))
+    weighted.backward()
+    assert torch.isfinite(logits.grad).all()
+
+    with pytest.raises(ValueError, match="same shape"):
+        shifted_v16_2_token_losses(logits.detach(), labels, weights[:, :-1])
 
 
 def test_ratio_zero_and_one_boundaries(prepared):
@@ -220,7 +324,9 @@ def test_suite_loss_is_equal_mean_over_input_sequences_and_batch_invariant(prepa
 
 
 def test_plot_supports_each_mode_individually_and_jointly(tmp_path):
-    cfg = replace(preset_config("debug", device="cpu"), position_encodings=("rope",))
+    cfg = preset_config(
+        "debug", device="cpu", enabled_model_variants=("rope/nonthinking", "rope/thinking")
+    )
     rows = []
     for mode in ("nonthinking", "thinking"):
         for source in ("train", "heldout"):
@@ -264,6 +370,20 @@ def test_v16_2_notebook_compiles_and_legacy_v16_runner_is_isolated(tmp_path):
     assert "test_process.check_returncode()" in source
     assert "TASK_OCCURRENCE_RATIO =" in source
     assert '"--task-occurrence-ratio", str(TASK_OCCURRENCE_RATIO)' in source
+    assert "FINAL_COUNT_LOSS_WEIGHT = 1.0" in source
+    assert "COT_TRACE_LOSS_WEIGHT = 1.0" in source
+    assert "RUN_ROPE_NONTHINKING = True" in source
+    assert "RUN_ROPE_THINKING = True" in source
+    assert "RUN_RPE_NONTHINKING = True" in source
+    assert "RUN_RPE_THINKING = True" in source
+    assert "MAX_TRAIN_STEPS = 10_000" in source
+    assert "EVAL_EXAMPLES_PER_COUNT = 100" in source
+    assert "100 per count x counts 1..10 = 1,000 examples per fixed suite" in source
+    assert '"--final-count-loss-weight", str(FINAL_COUNT_LOSS_WEIGHT)' in source
+    assert '"--cot-trace-loss-weight", str(COT_TRACE_LOSS_WEIGHT)' in source
+    assert '"--train-steps", str(MAX_TRAIN_STEPS)' in source
+    assert '"--eval-examples-per-count", str(EVAL_EXAMPLES_PER_COUNT)' in source
+    assert 'base_cmd += ["--model-variant", variant]' in source
     assert "--stage\", \"prepare" in source
     for cell in code_cells:
         compile("".join(cell["source"]), str(notebook_path), "exec")

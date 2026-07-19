@@ -8,7 +8,7 @@ from typing import Iterable
 import pandas as pd
 
 from .analysis import run_v16_2_attention_analysis, run_v16_2_state_analysis
-from .config import V16_2Config, prepare_run_dir
+from .config import V16_2Config, config_from_dict, prepare_run_dir
 from .data import (
     CorpusSplit,
     V16_2Example,
@@ -192,7 +192,8 @@ def run_v16_2_pipeline(
         sync_tree(sync_run_dir, run_dir)
     config_path = run_dir / "config.json"
     if config_path.exists():
-        if json.loads(config_path.read_text(encoding="utf-8")) != cfg.to_dict():
+        saved_cfg = config_from_dict(json.loads(config_path.read_text(encoding="utf-8")))
+        if saved_cfg != cfg:
             raise ValueError("run directory contains a different v16_2 config; use a new run name")
     else:
         _write_json(cfg.to_dict(), config_path)

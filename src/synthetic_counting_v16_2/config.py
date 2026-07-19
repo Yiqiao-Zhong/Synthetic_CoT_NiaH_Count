@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,12 @@ import torch
 
 
 SUPPORTED_POSITION_ENCODINGS = ("rope", "rpe")
+SUPPORTED_MODES = ("nonthinking", "thinking")
+ALL_MODEL_VARIANTS = tuple(
+    f"{position}/{mode}"
+    for position in SUPPORTED_POSITION_ENCODINGS
+    for mode in SUPPORTED_MODES
+)
 
 
 def _float_tag(value: float) -> str:
@@ -34,6 +41,7 @@ class V16_2Config:
     candidate_filter_max_attempts: int = 100_000
     shuffle_needle_set_order: bool = True
     position_encodings: tuple[str, ...] = ("rope", "rpe")
+    enabled_model_variants: tuple[str, ...] = ALL_MODEL_VARIANTS
 
     train_steps: int = 10_000
     batch_size: int = 128
@@ -50,6 +58,8 @@ class V16_2Config:
     checkpoint_every: int = 1_000
     eval_examples_per_count: int = 100
     ar_examples_per_count: int = 10
+    final_count_loss_weight: float = 1.0
+    cot_trace_loss_weight: float = 1.0
 
     n_layer: int = 4
     n_head: int = 4
@@ -89,12 +99,15 @@ class V16_2Config:
         return 1.0 - float(self.corpus_train_fraction) - float(self.corpus_validation_fraction)
 
     @property
-    def modes(self) -> tuple[str, str]:
-        return ("nonthinking", "thinking")
+    def modes(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(mode for _, mode in self.model_variants))
 
     @property
     def model_variants(self) -> tuple[tuple[str, str], ...]:
-        return tuple((position, mode) for position in self.position_encodings for mode in self.modes)
+        return tuple(
+            (value.split("/", 1)[0], value.split("/", 1)[1])
+            for value in self.enabled_model_variants
+        )
 
     @property
     def max_render_len(self) -> int:
@@ -145,12 +158,33 @@ class V16_2Config:
         invalid = sorted(set(self.position_encodings) - set(SUPPORTED_POSITION_ENCODINGS))
         if invalid:
             raise ValueError(f"unsupported position encodings: {invalid}")
+        if not self.enabled_model_variants:
+            raise ValueError("enabled_model_variants must contain at least one model")
+        if len(set(self.enabled_model_variants)) != len(self.enabled_model_variants):
+            raise ValueError("enabled_model_variants must not contain duplicates")
+        invalid_variants = sorted(set(self.enabled_model_variants) - set(ALL_MODEL_VARIANTS))
+        if invalid_variants:
+            raise ValueError(f"unsupported model variants: {invalid_variants}")
+        active_positions = tuple(
+            position
+            for position in SUPPORTED_POSITION_ENCODINGS
+            if any(value.startswith(f"{position}/") for value in self.enabled_model_variants)
+        )
+        if self.position_encodings != active_positions:
+            raise ValueError(
+                "position_encodings must equal the position encodings used by "
+                "enabled_model_variants"
+            )
         if self.noise_source != "shakespeare_char" or self.task_type != "target_character_set":
             raise ValueError("v16_2 requires the Shakespeare target-character-set task")
         if self.loss_scope != "all_sequence":
             raise ValueError("v16_2 requires all-sequence next-token loss")
         if self.precision not in {"float32", "bf16"}:
             raise ValueError("precision must be float32 or bf16")
+        for name in ("final_count_loss_weight", "cot_trace_loss_weight"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and strictly positive")
         if not (0 <= self.adam_beta1 < 1 and 0 <= self.adam_beta2 < 1):
             raise ValueError("Adam betas must be in [0, 1)")
         for name in (
@@ -169,12 +203,14 @@ class V16_2Config:
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
         result["position_encodings"] = list(self.position_encodings)
+        result["enabled_model_variants"] = list(self.enabled_model_variants)
         result["count_max"] = self.count_max
         result["count_max_alias"] = "read-only alias of count_max_threshold"
         result["effective_needle_pool_seed"] = self.effective_needle_pool_seed
         result["corpus_test_fraction"] = self.corpus_test_fraction
         result["training_objective"] = (
-            "teacher-forced next-token cross-entropy over every non-padding token"
+            "teacher-forced weighted next-token cross-entropy over every non-padding token; "
+            "final-count and CoT-trace targets use their configured weights"
         )
         result["task_occurrence_ratio_definition"] = (
             "example-level probability of formatting a training corpus window as a counting task"
@@ -211,8 +247,26 @@ def preset_config(preset: str = "debug", **overrides: Any) -> V16_2Config:
     unknown = sorted(set(overrides) - set(cfg.__dataclass_fields__))
     if unknown:
         raise TypeError(f"unknown V16_2Config overrides: {unknown}")
-    if "position_encodings" in overrides:
+    if "enabled_model_variants" in overrides:
+        overrides["enabled_model_variants"] = tuple(overrides["enabled_model_variants"])
+        if "position_encodings" in overrides:
+            overrides["position_encodings"] = tuple(overrides["position_encodings"])
+        if "position_encodings" not in overrides:
+            overrides["position_encodings"] = tuple(
+                position
+                for position in SUPPORTED_POSITION_ENCODINGS
+                if any(
+                    value.startswith(f"{position}/")
+                    for value in overrides["enabled_model_variants"]
+                )
+            )
+    elif "position_encodings" in overrides:
         overrides["position_encodings"] = tuple(overrides["position_encodings"])
+        overrides["enabled_model_variants"] = tuple(
+            f"{position}/{mode}"
+            for position in overrides["position_encodings"]
+            for mode in SUPPORTED_MODES
+        )
     cfg = replace(cfg, **overrides)
     cfg.validate()
     return cfg
@@ -233,17 +287,30 @@ def config_from_dict(values: dict[str, Any]) -> V16_2Config:
     ):
         data.pop(derived, None)
     data["position_encodings"] = tuple(data["position_encodings"])
+    if "enabled_model_variants" in data:
+        data["enabled_model_variants"] = tuple(data["enabled_model_variants"])
+    else:
+        data["enabled_model_variants"] = tuple(
+            f"{position}/{mode}"
+            for position in data["position_encodings"]
+            for mode in SUPPORTED_MODES
+        )
+    data.setdefault("final_count_loss_weight", 1.0)
+    data.setdefault("cot_trace_loss_weight", 1.0)
     cfg = V16_2Config(**data)
     cfg.validate()
     return cfg
 
 
 def default_run_name(cfg: V16_2Config) -> str:
-    positions = "-".join(cfg.position_encodings)
+    variants = "-".join(value.replace("nonthinking", "nt").replace("thinking", "t") for value in cfg.enabled_model_variants)
+    eval_size = cfg.eval_examples_per_count * cfg.count_max_threshold
     return (
         f"v16_2_{cfg.preset}_L{cfg.seq_len}_pool{cfg.needle_pool_size}x{cfg.needle_set_size}_"
         f"pf{_float_tag(cfg.needle_pool_frequency_threshold)}_count1-{cfg.count_max_threshold}_"
-        f"taskr{_float_tag(cfg.task_occurrence_ratio)}_{positions}_all_sequence_seed{cfg.seed}"
+        f"taskr{_float_tag(cfg.task_occurrence_ratio)}_fcw{_float_tag(cfg.final_count_loss_weight)}_"
+        f"cotw{_float_tag(cfg.cot_trace_loss_weight)}_steps{cfg.train_steps}_evaln{eval_size}_"
+        f"{variants.replace('/', '-')}_all_sequence_seed{cfg.seed}"
     )
 
 

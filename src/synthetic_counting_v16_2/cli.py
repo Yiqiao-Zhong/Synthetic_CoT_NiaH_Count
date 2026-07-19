@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from .config import preset_config
+from .config import ALL_MODEL_VARIANTS, preset_config
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -16,6 +16,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--train-steps", type=int, default=None)
+    parser.add_argument(
+        "--eval-examples-per-count",
+        type=int,
+        default=None,
+        help="fixed evaluation examples for each accepted count (100 means 1000 per suite for counts 1..10)",
+    )
+    parser.add_argument(
+        "--final-count-loss-weight",
+        type=float,
+        default=None,
+        help="training-loss weight for the final numeric count target",
+    )
+    parser.add_argument(
+        "--cot-trace-loss-weight",
+        type=float,
+        default=None,
+        help="training-loss weight for thinking trace index and marker targets",
+    )
+    parser.add_argument(
+        "--model-variant",
+        action="append",
+        choices=ALL_MODEL_VARIANTS,
+        default=None,
+        help="model variant to run; repeat for any subset of the four variants",
+    )
     parser.add_argument("--seq-len", type=int, default=None)
     parser.add_argument(
         "--count-max-threshold",
@@ -63,6 +88,9 @@ def main(argv: list[str] | None = None) -> None:
         "device",
         "seed",
         "train_steps",
+        "eval_examples_per_count",
+        "final_count_loss_weight",
+        "cot_trace_loss_weight",
         "seq_len",
         "count_max_threshold",
         "task_occurrence_ratio",
@@ -76,6 +104,8 @@ def main(argv: list[str] | None = None) -> None:
         "shuffle_needle_set_order",
     )
     overrides = {name: getattr(args, name) for name in names if getattr(args, name) is not None}
+    if args.model_variant is not None:
+        overrides["enabled_model_variants"] = tuple(args.model_variant)
     cfg = preset_config(args.preset, **overrides)
     from .pipeline import run_v16_2_pipeline
 

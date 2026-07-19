@@ -23,6 +23,7 @@ from .data import (
     V16_2Rendered,
     V16_2Vocab,
     collate_v16_2,
+    collate_v16_2_loss_weights,
     component_target_positions,
     load_corpus_text,
     make_training_example,
@@ -732,9 +733,12 @@ def train_v16_2_variant(
         model.train()
         examples, rendered = _training_batch(cfg, vocab, text, split, pool, mode, rng)
         ids, labels, attention_mask = collate_v16_2(rendered, vocab, cfg.device)
+        loss_weights = collate_v16_2_loss_weights(rendered, cfg, cfg.device)
         with _autocast_context(cfg):
             output = model(input_ids=ids, attention_mask=attention_mask)
-            loss, token_losses, active = shifted_v16_2_token_losses(output.logits, labels)
+            loss, token_losses, active = shifted_v16_2_token_losses(
+                output.logits, labels, loss_weights
+            )
         active_by_example = active.sum(dim=1).detach().cpu().numpy()
         _update_sampling_state(sampling_state, examples, active_by_example)
         optimizer.zero_grad(set_to_none=True)
@@ -749,11 +753,39 @@ def train_v16_2_variant(
             is_task = np.asarray([example.example_kind == "counting_task" for example in examples])
             task_tokens = int(active_by_example[is_task].sum())
             component_values = _component_example_means(token_losses, rendered)
+            active_weights = loss_weights[:, 1:] * active
+            active_weight_sum = float(active_weights.sum().detach().cpu())
+            unweighted_loss = float(
+                ((token_losses * active).sum() / active.sum().clamp_min(1)).detach().cpu()
+            )
+            final_count_weight_sum = float(
+                sum(
+                    loss_weights[row_index, item.spans.count_pos].detach().cpu()
+                    for row_index, item in enumerate(rendered)
+                    if item.spans is not None
+                )
+            )
+            trace_weight_sum = float(
+                sum(
+                    loss_weights[row_index, position].detach().cpu()
+                    for row_index, item in enumerate(rendered)
+                    if item.spans is not None
+                    for position in (
+                        *item.spans.trace_index_positions,
+                        *item.spans.trace_marker_positions,
+                    )
+                )
+            )
             row: dict[str, Any] = {
                 "step": step,
                 "position_encoding": position_encoding,
                 "mode": mode,
                 "train_total_loss": float(loss.detach().cpu()),
+                "train_weighted_objective_loss": float(loss.detach().cpu()),
+                "train_unweighted_token_loss": unweighted_loss,
+                "batch_active_weight_sum": active_weight_sum,
+                "batch_final_count_weight_share": final_count_weight_sum / max(1.0, active_weight_sum),
+                "batch_cot_trace_weight_share": trace_weight_sum / max(1.0, active_weight_sum),
                 "learning_rate": rate,
                 "gradient_norm": gradient_norm,
                 "configured_task_example_ratio": cfg.task_occurrence_ratio,

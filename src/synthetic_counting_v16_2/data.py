@@ -8,7 +8,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -560,8 +559,34 @@ def collate_v16_2(
     return ids.to(device), labels.to(device), mask.to(device)
 
 
+def collate_v16_2_loss_weights(
+    rendered: list[V16_2Rendered],
+    cfg: V16_2Config,
+    device: str | torch.device,
+) -> torch.Tensor:
+    """Return unshifted target weights aligned with each rendered label position."""
+
+    if not rendered:
+        raise ValueError("cannot build loss weights for an empty list")
+    max_len = max(len(item.labels) for item in rendered)
+    weights = torch.zeros((len(rendered), max_len), dtype=torch.float32)
+    for row, item in enumerate(rendered):
+        weights[row, : len(item.labels)] = 1.0
+        if item.spans is None:
+            continue
+        weights[row, item.spans.count_pos] = float(cfg.final_count_loss_weight)
+        for position in (
+            *item.spans.trace_index_positions,
+            *item.spans.trace_marker_positions,
+        ):
+            weights[row, position] = float(cfg.cot_trace_loss_weight)
+    return weights.to(device)
+
+
 def shifted_v16_2_token_losses(
-    logits: torch.Tensor, labels: torch.Tensor
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    loss_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     shifted_logits = logits[:, :-1].contiguous()
     shifted_labels = labels[:, 1:].contiguous()
@@ -572,7 +597,14 @@ def shifted_v16_2_token_losses(
         ignore_index=IGNORE_INDEX,
     ).view_as(shifted_labels)
     active = shifted_labels.ne(IGNORE_INDEX)
-    total = (losses * active).sum() / active.sum().clamp_min(1)
+    if loss_weights is None:
+        shifted_weights = active.to(losses.dtype)
+    else:
+        if loss_weights.shape != labels.shape:
+            raise ValueError("loss_weights must have the same shape as labels")
+        shifted_weights = loss_weights[:, 1:].to(device=losses.device, dtype=losses.dtype)
+        shifted_weights = shifted_weights * active
+    total = (losses * shifted_weights).sum() / shifted_weights.sum().clamp_min(1)
     return total, losses, active
 
 

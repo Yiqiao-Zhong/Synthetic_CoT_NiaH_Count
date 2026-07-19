@@ -186,11 +186,30 @@ and ratio-matched suites. The primary train-versus-held-out curves average cross
 equally over input sequences, while token-weighted loss is saved as a secondary metric.
 The untouched test region is used only at the final checkpoint.
 
+v16_2 supports task-relevant training-loss weights without changing the rendered data.
+`final_count_loss_weight` weights the final numeric answer target in both output modes;
+`cot_trace_loss_weight` weights only thinking trace index and marker targets. `<Think>`,
+`</Think>`, `<Ans>`, `<EOS>`, task-prefix, prompt, and raw-language targets retain unit
+weight. The weighted objective is normalized by the sum of active weights. Both defaults
+are `1.0`, which preserves the previous unweighted objective, while fixed-suite
+cross-entropies and component losses remain unweighted for cross-run comparison.
+
+Runs may enable any non-empty subset of `rope/nonthinking`, `rope/thinking`,
+`rpe/nonthinking`, and `rpe/thinking`. The Colab notebook exposes four independent model
+switches, `MAX_TRAIN_STEPS`, both loss weights, and `EVAL_EXAMPLES_PER_COUNT`. The latter
+defaults to 100, giving 1,000 examples in each balanced fixed suite for counts 1 through
+10. Each 500-step checkpoint currently evaluates six loss suites plus one held-out
+behavioral suite, so the default is approximately 7,000 teacher-forced sequences per
+enabled model; autoregressive examples remain controlled separately.
+
 ```bash
 python -m synthetic_counting_v16_2.run_v16_2 --preset debug --stage all --device cpu
 python -m synthetic_counting_v16_2.run_v16_2 \
   --preset main --stage all --device cuda \
-  --task-occurrence-ratio 1.0 --count-max-threshold 10 --skip-completed
+  --task-occurrence-ratio 1.0 --count-max-threshold 10 \
+  --final-count-loss-weight 1.0 --cot-trace-loss-weight 1.0 \
+  --model-variant rope/thinking --model-variant rpe/thinking \
+  --train-steps 10000 --eval-examples-per-count 100 --skip-completed
 ```
 
 The Colab entry point is `notebooks/Trace_Count_v16_2_Colab.ipynb`; regenerate it with
@@ -219,9 +238,12 @@ fresh-runtime instruction rather than attempting an in-place binary-package repa
 If the uploaded Drive folder moves, edit only `DRIVE_REPO_ROOT` in the first code cell;
 the result directory is derived from it.
 
-This is an installation/environment compatibility change only. It does not alter v16
-or v16_2 model architectures, data formats, training objectives, random seeds, run
-names, manifests, or checkpoint schemas, and existing v16 checkpoints remain loadable.
+The installation/environment compatibility measures themselves do not alter v16 or
+v16_2 model architectures, data formats, random seeds, manifests, or checkpoint schemas,
+and existing v16 checkpoints remain loadable. The v16_2 loss weights and model-selection
+controls documented above are separate, explicit experiment settings with
+backward-compatible defaults; they are saved in config/checkpoint metadata and encoded
+in new default run names.
 The repository-wide NumPy range now permits NumPy 2 for newly resolved v16 environments,
 however, so a new v16 run under NumPy 2 is not promised to be bit-for-bit identical to
 an older run under NumPy 1.26. For strict historical v16 reproduction, retain a matched
