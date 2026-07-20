@@ -52,6 +52,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="training-loss weight for thinking trace index and marker targets",
     )
+    rpe_distance = parser.add_mutually_exclusive_group()
+    rpe_distance.add_argument(
+        "--rpe-max-update",
+        dest="rpe_max_update",
+        action="store_true",
+        default=None,
+        help="set RPE max_relative_distance to max_render_len - 1",
+    )
+    rpe_distance.add_argument(
+        "--no-rpe-max-update",
+        dest="rpe_max_update",
+        action="store_false",
+        help="retain the legacy fixed max_relative_distance",
+    )
     parser.add_argument(
         "--model-variant",
         action="append",
@@ -112,6 +126,7 @@ def main(argv: list[str] | None = None) -> None:
         "eval_examples_per_count",
         "final_count_loss_weight",
         "cot_trace_loss_weight",
+        "rpe_max_update",
         "seq_len",
         "count_max_threshold",
         "task_occurrence_ratio",

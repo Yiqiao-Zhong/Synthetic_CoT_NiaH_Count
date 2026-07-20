@@ -220,6 +220,7 @@ def build() -> Path:
             WEIGHT_DECAY = 0.01              # AdamW decay on all trainable parameters; 0.0 disables it
             FINAL_COUNT_LOSS_WEIGHT = 1.0    # >1 upweights the final numeric answer target
             COT_TRACE_LOSS_WEIGHT = 1.0      # >1 upweights CoT trace indices and marker characters
+            RPE_max_update = True            # True uses max_render_len - 1; False keeps legacy max_relative_distance=256
             RUN_ROPE_NONTHINKING = True
             RUN_ROPE_THINKING = True
             RUN_RPE_NONTHINKING = True
@@ -260,6 +261,7 @@ def build() -> Path:
                 weight_decay=WEIGHT_DECAY,
                 final_count_loss_weight=FINAL_COUNT_LOSS_WEIGHT,
                 cot_trace_loss_weight=COT_TRACE_LOSS_WEIGHT,
+                rpe_max_update=RPE_max_update,
                 enabled_model_variants=ENABLED_MODEL_VARIANTS,
                 train_steps=MAX_TRAIN_STEPS,
                 max_steps_for_language_pred=MAX_STEPS_FOR_LANGUAGE_PRED,
@@ -283,6 +285,8 @@ def build() -> Path:
                 "enabled_model_variants": ENABLED_MODEL_VARIANTS,
                 "number_of_models": len(ENABLED_MODEL_VARIANTS),
                 "weight_decay": WEIGHT_DECAY,
+                "rpe_max_update": RPE_max_update,
+                "max_relative_distance": PLANNED_CONFIG.max_relative_distance,
                 "language_prediction_steps": LANGUAGE_PREDICTION_STEPS,
                 "task_output_only_steps": TASK_OUTPUT_ONLY_STEPS,
                 "task_output_starts": {"nonthinking": "<Ans>", "thinking": "<Think>"},
@@ -318,6 +322,7 @@ def build() -> Path:
                 "--needle-pool-frequency-threshold", str(NEEDLE_POOL_FREQUENCY_THRESHOLD),
                 "--out-root", OUT_ROOT,
             ]
+            base_cmd.append("--rpe-max-update" if RPE_max_update else "--no-rpe-max-update")
             for variant in ENABLED_MODEL_VARIANTS:
                 base_cmd += ["--model-variant", variant]
             if RUN_NAME is not None:

@@ -110,6 +110,25 @@ def test_config_alias_ratio_validation_and_run_identity():
             preset_config("main", checkpoint_every=value)
 
 
+def test_rpe_max_update_derives_distance_and_changes_run_identity():
+    legacy = preset_config(
+        "main", count_max_threshold=30, rpe_max_update=False,
+        enabled_model_variants=("rpe/nonthinking",),
+    )
+    updated = preset_config(
+        "main", count_max_threshold=30, rpe_max_update=True,
+        enabled_model_variants=("rpe/nonthinking",),
+    )
+    assert legacy.max_relative_distance == 256
+    assert updated.max_render_len == 327
+    assert updated.max_relative_distance == updated.max_render_len - 1 == 326
+    assert "rped326" not in default_run_name(legacy)
+    assert "rped326" in default_run_name(updated)
+    assert config_from_dict(updated.to_dict()) == updated
+    with pytest.raises(ValueError, match="rpe_max_update"):
+        preset_config("main", rpe_max_update=1)
+
+
 def test_legacy_config_defaults_and_variant_validation():
     cfg = preset_config("debug", device="cpu")
     legacy = cfg.to_dict()
@@ -119,6 +138,7 @@ def test_legacy_config_defaults_and_variant_validation():
     legacy.pop("weight_decay")
     legacy.pop("max_steps_for_language_pred")
     legacy.pop("checkpoint_every")
+    legacy.pop("rpe_max_update")
     loaded = config_from_dict(legacy)
     assert loaded.enabled_model_variants == (
         "rope/nonthinking",
@@ -130,6 +150,7 @@ def test_legacy_config_defaults_and_variant_validation():
     assert loaded.weight_decay == 0.01
     assert loaded.checkpoint_every == 1_000
     assert loaded.max_steps_for_language_pred == loaded.train_steps
+    assert loaded.rpe_max_update is False
     assert loaded.loss_scope == "all_sequence"
     with pytest.raises(ValueError, match="at least one"):
         preset_config("debug", enabled_model_variants=())
@@ -145,6 +166,7 @@ def test_cli_exposes_weights_variants_steps_and_evaluation_size():
             "--final-count-loss-weight", "4",
             "--cot-trace-loss-weight", "2",
             "--weight-decay", "0.05",
+            "--rpe-max-update",
             "--max-steps-for-language-pred", "12",
             "--model-variant", "rope/thinking",
             "--model-variant", "rpe/nonthinking",
@@ -156,6 +178,7 @@ def test_cli_exposes_weights_variants_steps_and_evaluation_size():
     assert args.final_count_loss_weight == 4
     assert args.cot_trace_loss_weight == 2
     assert args.weight_decay == 0.05
+    assert args.rpe_max_update is True
     assert args.max_steps_for_language_pred == 12
     assert args.model_variant == ["rope/thinking", "rpe/nonthinking"]
     assert args.train_steps == 17
@@ -535,6 +558,7 @@ def test_v16_2_notebook_compiles_and_legacy_v16_runner_is_isolated(tmp_path):
         "FINAL_COUNT_LOSS_WEIGHT",
         "COT_TRACE_LOSS_WEIGHT",
         "WEIGHT_DECAY",
+        "RPE_max_update",
         "RUN_ROPE_NONTHINKING",
         "RUN_ROPE_THINKING",
         "RUN_RPE_NONTHINKING",
@@ -549,6 +573,9 @@ def test_v16_2_notebook_compiles_and_legacy_v16_runner_is_isolated(tmp_path):
     assert '"--final-count-loss-weight", str(FINAL_COUNT_LOSS_WEIGHT)' in source
     assert '"--cot-trace-loss-weight", str(COT_TRACE_LOSS_WEIGHT)' in source
     assert '"--weight-decay", str(WEIGHT_DECAY)' in source
+    assert 'rpe_max_update=RPE_max_update' in source
+    assert '"--rpe-max-update" if RPE_max_update else "--no-rpe-max-update"' in source
+    assert '"max_relative_distance": PLANNED_CONFIG.max_relative_distance' in source
     assert "weight_decay=WEIGHT_DECAY" in source
     assert '"weight_decay": WEIGHT_DECAY' in source
     assert '"--train-steps", str(MAX_TRAIN_STEPS)' in source
@@ -580,6 +607,7 @@ def test_v16_2_notebook_compiles_and_legacy_v16_runner_is_isolated(tmp_path):
     assert "FINAL_COUNT_LOSS_WEIGHT = 1.0" in generated_source
     assert "COT_TRACE_LOSS_WEIGHT = 1.0" in generated_source
     assert "WEIGHT_DECAY = 0.01" in generated_source
+    assert "RPE_max_update = True" in generated_source
     assert "RUN_ROPE_NONTHINKING = True" in generated_source
     assert "RUN_ROPE_THINKING = True" in generated_source
     assert "RUN_RPE_NONTHINKING = True" in generated_source

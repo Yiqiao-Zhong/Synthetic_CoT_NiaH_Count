@@ -68,6 +68,7 @@ class V16_2Config:
     n_inner: int = 1024
     n_positions: int = 384
     max_relative_distance: int = 256
+    rpe_max_update: bool = False
     rope_base: float = 10_000.0
 
     attention_examples_per_count: int = 20
@@ -153,6 +154,14 @@ class V16_2Config:
         if self.max_render_len > self.n_positions:
             raise ValueError(
                 f"max rendered length {self.max_render_len} exceeds n_positions={self.n_positions}"
+            )
+        if type(self.rpe_max_update) is not bool:
+            raise ValueError("rpe_max_update must be a boolean")
+        if type(self.max_relative_distance) is not int or self.max_relative_distance <= 0:
+            raise ValueError("max_relative_distance must be a positive integer")
+        if self.rpe_max_update and self.max_relative_distance != self.max_render_len - 1:
+            raise ValueError(
+                "rpe_max_update requires max_relative_distance == max_render_len - 1"
             )
         if not self.position_encodings:
             raise ValueError("at least one position encoding is required")
@@ -297,6 +306,8 @@ def preset_config(preset: str = "debug", **overrides: Any) -> V16_2Config:
             for mode in SUPPORTED_MODES
         )
     cfg = replace(cfg, **overrides)
+    if cfg.rpe_max_update:
+        cfg = replace(cfg, max_relative_distance=cfg.max_render_len - 1)
     cfg.validate()
     return cfg
 
@@ -330,12 +341,17 @@ def config_from_dict(values: dict[str, Any]) -> V16_2Config:
     data.setdefault("final_count_loss_weight", 1.0)
     data.setdefault("cot_trace_loss_weight", 1.0)
     data.setdefault("weight_decay", 0.01)
+    # Historical v16_2 configs used the fixed 256-distance RPE table. Keep
+    # that architecture unless the new switch was explicitly serialized.
+    data.setdefault("rpe_max_update", False)
     # Before revision 5, the main cadence was 1,000 steps. Preserve that value
     # when loading a rare hand-written legacy config that omitted the field.
     data.setdefault("checkpoint_every", 1_000)
     if legacy_loss_schedule:
         data["max_steps_for_language_pred"] = int(data["train_steps"])
     cfg = V16_2Config(**data)
+    if cfg.rpe_max_update:
+        cfg = replace(cfg, max_relative_distance=cfg.max_render_len - 1)
     cfg.validate()
     return cfg
 
@@ -343,6 +359,7 @@ def config_from_dict(values: dict[str, Any]) -> V16_2Config:
 def default_run_name(cfg: V16_2Config) -> str:
     variants = "-".join(value.replace("nonthinking", "nt").replace("thinking", "t") for value in cfg.enabled_model_variants)
     eval_size = cfg.eval_examples_per_count * cfg.count_max_threshold
+    rpe_distance_tag = f"_rped{cfg.max_relative_distance}" if cfg.rpe_max_update else ""
     schedule_tag = (
         "allseq-taskout"
         if cfg.max_steps_for_language_pred < cfg.train_steps
@@ -350,7 +367,7 @@ def default_run_name(cfg: V16_2Config) -> str:
     )
     return (
         f"v16_2_{cfg.preset}_L{cfg.seq_len}_pool{cfg.needle_pool_size}x{cfg.needle_set_size}_"
-        f"pf{_float_tag(cfg.needle_pool_frequency_threshold)}_count1-{cfg.count_max_threshold}_"
+        f"pf{_float_tag(cfg.needle_pool_frequency_threshold)}_count1-{cfg.count_max_threshold}{rpe_distance_tag}_"
         f"taskr{_float_tag(cfg.task_occurrence_ratio)}_wd{_float_tag(cfg.weight_decay)}_"
         f"fcw{_float_tag(cfg.final_count_loss_weight)}_"
         f"cotw{_float_tag(cfg.cot_trace_loss_weight)}_langsteps{cfg.max_steps_for_language_pred}_"

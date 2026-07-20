@@ -210,13 +210,28 @@ competition does not by itself eliminate autoregressive trace exposure bias.
 Runs may enable any non-empty subset of `rope/nonthinking`, `rope/thinking`,
 `rpe/nonthinking`, and `rpe/thinking`. The Colab notebook exposes four independent model
 switches, `MAX_TRAIN_STEPS`, `MAX_STEPS_FOR_LANGUAGE_PRED`, both loss weights,
-`WEIGHT_DECAY`, and `EVAL_EXAMPLES_PER_COUNT`. `WEIGHT_DECAY` defaults to `0.01`; `0.0`
+`WEIGHT_DECAY`, `RPE_max_update`, and `EVAL_EXAMPLES_PER_COUNT`. `WEIGHT_DECAY` defaults to `0.01`; `0.0`
 disables AdamW decay. The current optimizer applies the coefficient to every trainable
 parameter, including embeddings, biases, and LayerNorm parameters. The evaluation setting
 defaults to 100, giving 1,000 examples in each balanced fixed suite for counts 1 through
 10. Each 500-step checkpoint currently evaluates six loss suites plus one held-out
 behavioral suite, so the default is approximately 7,000 teacher-forced sequences per
 enabled model; autoregressive examples remain controlled separately.
+
+`RPE_max_update` controls the exact-distance range of the learned relative-position
+bias. The checked Colab notebook and notebook builder set it to `True`, which derives
+`max_relative_distance = max_render_len - 1` after all sequence-length and count-range
+overrides have been applied. Thus a maximum rendered length of 327 uses an exact maximum
+causal distance of 326 instead of clipping distances 256 through 326 into the legacy
+distance-256 bucket. Set the switch to `False` to retain the historical fixed value of
+256. The switch does not change RoPE computation, and enlarging the RPE bias table has
+negligible compute cost.
+
+An enabled update adds `rpedN` to the default run name and is saved in config/checkpoint
+metadata. This prevents automatic reuse of a legacy-distance run directory. The RPE bias
+parameter shape changes, so a checkpoint created with distance 256 cannot be resumed by
+a distance-326 model. Historical serialized configs that lack `rpe_max_update` load it as
+`False`, preserving their original architecture and run-name convention.
 
 Weight decay regularizes parameter magnitude but does not add dropout or early stopping.
 In the observed v16_2 runs, `0.01` did not prevent held-out language loss from worsening
@@ -231,6 +246,7 @@ python -m synthetic_counting_v16_2.run_v16_2 \
   --task-occurrence-ratio 1.0 --count-max-threshold 10 \
   --weight-decay 0.01 \
   --final-count-loss-weight 1.0 --cot-trace-loss-weight 1.0 \
+  --rpe-max-update \
   --model-variant rope/thinking --model-variant rpe/thinking \
   --train-steps 10000 --max-steps-for-language-pred 1500 \
   --checkpoint-every 500 --eval-examples-per-count 100 --skip-completed
