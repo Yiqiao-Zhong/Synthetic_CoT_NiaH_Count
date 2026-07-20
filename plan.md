@@ -1802,3 +1802,620 @@ to confirm the exact mask transition, save/resume at the boundary, and verify th
 autoregressive evaluation and full-sequence evaluation still execute. Run a second short
 thinking smoke test to confirm `<Think>`, trace, `</Think>`, `<Ans>`, count, and EOS remain
 active after the boundary while the task prefix and Shakespeare prompt are excluded.
+
+# revision plan 5: various attention / hidden states metrics
+
+## 1. Goal, scope, and compatibility boundary
+
+Add a v16_2-specific post-training checkpoint-dynamics analysis that explains when the
+internal counting mechanisms emerge, how they change around the language-loss boundary,
+and why thinking and nonthinking behave differently. Adapt the useful design of
+`scripts/analyze_cot_learning_stages.py`—fixed examples, sequential checkpoint loading,
+fixed-final-head versus best-current-head tracking, checkpoint attention tables,
+hidden-state geometry tables, and dynamics figures—but do not directly reuse its
+v11-v14 config, data, model, table, or run-discovery assumptions.
+
+The implementation must remain isolated under v16_2. It must not change v11-v14 or v16
+checkpoint formats, analyses, notebooks, or plots. Preserve the current v16_2 final-only
+`attention` and `state` stages and their existing tables for backward compatibility. The
+new analysis is additive and operates on saved numeric checkpoints after training has
+completed. It must support any valid subset of RoPE/RPE and thinking/nonthinking models
+recorded in `enabled_model_variants` without looking for disabled variants.
+
+Attention weights and probe decodability are descriptive rather than causal. Every table
+and figure must distinguish:
+
+- teacher-forced thinking diagnostics, which see the gold trace before `<Ans>`;
+- generated-trace diagnostics, which condition on the model's own greedy trace;
+- nonthinking diagnostics, whose `<Ans>` context contains only the prefix and prompt;
+- layer 0 input embeddings from post-transformer residual layers 1 through 4.
+
+Do not describe a high attention score or probe accuracy as proof that the model uses the
+feature. Provide causal head ablation or activation patching only as a separately labeled
+optional extension; the core revision should first produce reproducible descriptive
+dynamics and behavior-linked evidence.
+
+## 2. Save checkpoints every 500 steps, including initialization
+
+Change the new v16_2 default checkpoint cadence from 1,000 to 500 optimizer steps while
+leaving `eval_every` and `ar_eval_every` unchanged unless explicitly configured. Expose
+the cadence through config, CLI, serialization, checkpoint metadata, the planned-run
+summary, and the notebook:
+
+```python
+CHECKPOINT_EVERY_STEPS = 500  # retain internal-state snapshots every 500 optimizer steps
+```
+
+Add or expose `--checkpoint-every 500` and pass it to `preset_config` and the training
+subprocess. Require a positive integer. Save `step_000000/checkpoint.pt` immediately
+after paired initialization and before the first optimizer update, then save numeric
+checkpoints at every configured cadence and at the exact final step even when it is not
+cadence-aligned. Continue writing the `final/checkpoint.pt` artifact expected by the
+existing final-only stages. The dynamics checkpoint iterator must deduplicate the numeric
+final checkpoint and `final/` alias by optimizer step.
+
+For the current 5,000-step design, the intended sequence is:
+
+```text
+0, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000
+```
+
+Step 1,500 is the final all-sequence update and therefore the critical boundary snapshot;
+step 2,000 is the first saved model after 500 task-output-only updates. Plot a vertical
+line at `max_steps_for_language_pred` in every checkpoint-dynamics figure and shade or
+label the two objective phases. If the boundary is not cadence-aligned, save an additional
+numeric checkpoint exactly at the boundary so the pre-transition state is never missing.
+
+Saving twice as often approximately doubles intermediate-checkpoint storage relative to
+the previous 1,000-step cadence. The notebook summary must print the expected checkpoint
+steps, number of files per enabled model, and a storage warning before training. Do not
+delete or compact checkpoints automatically; the user controls Drive retention.
+
+## 3. New v16_2 dynamics module and checkpoint loader
+
+Add a package module such as
+`src/synthetic_counting_v16_2/checkpoint_dynamics.py` and a thin runnable entry point such
+as `scripts/analyze_v16_2_checkpoint_dynamics.py`. The package module should own metric
+definitions and table schemas; the script should only parse arguments, locate one run,
+and invoke the analysis. Do not embed the scientific implementation solely in the
+notebook.
+
+### 3.1 Explicit reuse and orchestration strategy
+
+Implement a **v16_2-specific orchestration layer**, not a new copy of the complete
+scientific stack and not a direct invocation of the hard-coded v11-v14 script. The three
+boundaries must remain explicit:
+
+1. `scripts/analyze_cot_learning_stages.py` remains an unchanged reference implementation
+   for v11-v14. Reuse its proven design and port small pure numerical/plotting helpers
+   where appropriate, but do not import its v11 config, run discovery, renderer, model,
+   or table assumptions into v16_2.
+2. Existing v16_2 collectors remain the source of truth for v16_2 sequence semantics.
+   Call `collect_v16_2_attention(...)` directly with each loaded checkpoint model. Refactor
+   the existing hidden-state collection, nearest-centroid, and ridge helpers into reusable
+   v16_2 functions without changing the current final-only `attention` and `state` wrapper
+   outputs.
+3. The new `checkpoint_dynamics.py` layer owns only cross-checkpoint orchestration and new
+   dynamics-specific metrics: checkpoint inventory and loading, fixed-suite reuse,
+   variant/step loops, gold/generated/counterfactual contexts, aggregation, caching,
+   manifests, behavior joins, and calls into dynamics plotting functions.
+
+The intended call structure is:
+
+```text
+notebook analysis cell / thin CLI script
+    -> v16_2 checkpoint-dynamics orchestrator
+        -> validated arbitrary-checkpoint loader
+        -> existing/refactored v16_2 attention and state collectors
+        -> new dynamics-only metric reducers
+        -> saved checkpoint_* tables
+        -> table-only dynamics plotting functions
+```
+
+This boundary is also the debugging contract. A failure must be attributable to one of
+four named phases printed in the console and recorded in the manifest:
+
+```text
+inventory -> load/validate -> collect -> aggregate/plot
+```
+
+Every error should include the model variant, checkpoint step, phase, and relevant input
+path. The orchestrator must support a single `--model-variant`, a single
+`--checkpoint-step`, and individual metric-family switches so a failing checkpoint can
+be reproduced without rerunning all models or metrics. Do not hide collector exceptions
+inside a broad skip; mark that partition failed and preserve already completed
+partitions.
+
+Expected direct reuse is therefore substantial: v16_2 rendering/collation, attention
+category extraction, semantic state sites, hidden-state forwards, centroid/ridge probes,
+model construction, and artifact fingerprint checks should not be reimplemented. New
+code should concentrate on the checkpoint loop and the additional metrics that do not
+yet exist—nonthinking coverage, generated/counterfactual states, cross-site transfer,
+CKA, head stability, behavior linkage, resumable tables, and dynamics plots.
+
+Add an arbitrary-checkpoint loader alongside the final-checkpoint loader. It must:
+
+1. discover and numerically sort `step_*/checkpoint.pt` files for each enabled variant;
+2. validate saved config, vocabulary, pool, and corpus-split fingerprints before a model
+   forward;
+3. verify that the payload's position encoding, mode, and step match its directory;
+4. load one model at a time, use `eval()` and `torch.no_grad()`, then release it and clear
+   CUDA cache before loading the next checkpoint;
+5. refuse mixed or incomplete checkpoint families with a concise inventory of the
+   missing/mismatched steps;
+6. permit a requested subset of checkpoint steps for debugging;
+7. deduplicate the numeric final checkpoint and `final/` alias;
+8. never restore or mutate optimizer/RNG state during analysis.
+
+Use fixed persisted v16_2 task examples rather than resampling at each checkpoint. Reuse
+the stored balanced train and held-out task manifests and the same per-count ordering used
+by final attention/state analysis. Store a diagnostic-suite fingerprint in every dynamics
+manifest. All variants and checkpoints must see byte-identical rendered prompts within a
+mode; thinking and nonthinking may differ only by their defined output rendering.
+
+Write results under the existing run directory with unambiguous `checkpoint_` prefixes,
+and write atomically. Maintain
+`analysis/checkpoint_dynamics_manifest.json` with config/suite fingerprints, requested
+metrics, discovered checkpoint inventory, per-variant/per-step status, and timestamps.
+An interrupted analysis should resume from completed checkpoint/metric partitions rather
+than recomputing the entire run. A `--force` option may invalidate only dynamics outputs;
+it must never delete checkpoints, training tables, or final-only analysis artifacts.
+
+## 4. Attention metrics across checkpoints
+
+Use the same query positions and token categories as the current v16_2 analysis, while
+adding metrics that are appropriate to each mode and retaining example-level rows for
+behavior linkage.
+
+### 4.1 Thinking kth-occurrence retrieval
+
+At every trace-index query `<k>`, where the current position predicts the marker for the
+kth occurrence, record for every layer and head:
+
+- raw attention mass on the correct kth prompt occurrence;
+- total attention mass on all prompt needle occurrences;
+- correct top-1 within the true needle positions;
+- diagonal dominance, defined as correct-k mass divided by total needle mass;
+- normalized entropy over needle positions;
+- attention mass on the task prefix, prompt non-needles, previous trace indices, and
+  previous trace markers;
+- count-dependent chance top-1 `1 / count` and observed-minus-chance/top-1-over-chance;
+- stratification by true count and ordinal `k`.
+
+This analysis should show when a stable kth-to-kth retrieval circuit emerges. For each
+metric, plot both (a) the fixed head selected by a predeclared final-checkpoint rule and
+(b) the best head at each checkpoint. Select the fixed final head on one designated
+selection subset and report it on a disjoint held-out analysis subset so head selection
+does not inflate the displayed curve.
+
+### 4.2 Final-answer information routing
+
+At the `<Ans>` query, partition attention into BOS, task prefix, matching prompt
+characters, nonmatching prompt characters, trace indices, trace markers, and remaining
+control/output tokens. Track these categories by checkpoint, layer, head, and mode.
+
+For thinking, measure the transition from prompt-directed computation to trace readout.
+For nonthinking, measure how target-set prefix heads and prompt-scanning heads divide the
+work when no trace exists. Include the combined trace-readout mass
+`trace_indices_mass + trace_markers_mass` and the ratio of trace-readout mass to direct
+prompt-needle mass, with a safe definition when the denominator is near zero.
+
+### 4.3 Nonthinking needle coverage and selectivity
+
+Because nonthinking must aggregate all matches rather than retrieve one ordinal, add:
+
+- needle attention enrichment relative to uniform attention within the 256-token prompt;
+- top-n retrieval recall, using `n = true count` highest-attended prompt positions;
+- precision among those top-n positions;
+- total matching-character attention mass;
+- normalized entropy/coverage across all matching positions;
+- count-stratified versions of every metric.
+
+Use enrichment and top-n recall rather than applying thinking's kth-occurrence top-1
+metric to nonthinking. Plot whether matching-character detection emerges before, after,
+or without reliable final counting.
+
+### 4.4 Head specialization and stability
+
+At every checkpoint, rank heads for candidate roles: task-prefix routing, broad needle
+detection, kth-occurrence retrieval, previous-trace tracking, and final trace readout.
+Record final-head rank over time, best-current-head identity, rank correlation across
+adjacent checkpoints, and attention-map similarity on the fixed examples. This must make
+head switching visible rather than producing a deceptively smooth best-of-16 curve.
+
+### 4.5 Attention-behavior coupling
+
+On a smaller fixed generated subset, run greedy autoregressive evaluation at every saved
+checkpoint and join it to the matching example-level teacher-forced attention rows.
+Report correlations or grouped differences between attention metrics and final accuracy,
+absolute error, correct trace length, exact trace, and trace-marker recall. Control or
+stratify by true count because retrieval is inherently easier at small counts. Label
+these associations exploratory and non-causal.
+
+Persist at least:
+
+```text
+tables/checkpoint_attention_detail.csv
+tables/checkpoint_attention_summary.csv
+tables/checkpoint_attention_by_count.csv
+tables/checkpoint_attention_by_k.csv
+tables/checkpoint_head_stability.csv
+tables/checkpoint_attention_behavior_link.csv
+```
+
+## 5. Hidden-state metrics across checkpoints
+
+Reuse the current balanced train/held-out split for fitting and evaluating probes. Fit a
+new probe independently at each checkpoint and layer unless a metric explicitly tests
+cross-checkpoint or cross-site transfer. Standardize from the probe-training states only;
+never use held-out states to choose normalization, ridge coefficients, PCA axes, heads, or
+thresholds.
+
+### 5.1 Final-answer count decodability
+
+At the `<Ans>` position for both modes, record nearest-centroid exact-count accuracy,
+ridge MAE, ridge R-squared, and per-count prediction bias for embedding layer 0 and every
+transformer layer. Create checkpoint-by-layer heatmaps and layer trajectories. For
+thinking, report two contexts separately:
+
+- `gold_trace`: the existing teacher-forced rendering;
+- `generated_trace`: the model's own greedily generated trace, re-forwarded to collect a
+  comparable final-answer residual when a valid `<Ans>` is reached.
+
+Do not combine these two contexts in one accuracy number. Their gap is a direct measure
+of trace exposure bias and error propagation.
+
+### 5.2 Trace-progress state
+
+At trace-index and trace-marker positions, decode ordinal progress `k` using the same
+nearest-centroid and ridge metrics. Also measure whether the marker state preserves `k`
+until the next trace index. Treat perfect layer-0 trace-index decoding as a lexical-token
+baseline because the input token is literally `<k>`; emphasize trace-marker and later
+residual layers when interpreting learned progress state.
+
+Stratify by `k` and true count to determine whether a counter is learned first for early
+trace steps and later extends to longer traces.
+
+### 5.3 Shared counter direction across sites
+
+At each checkpoint and layer, fit a standardized ridge direction on trace-marker states
+labeled by progress `k` and apply it, without refitting, to final-answer states labeled by
+count `n`. Run the reverse transfer as well. Record cross-site MAE, R-squared, slope,
+intercept, and direction cosine. Successful transfer would indicate reuse of a common
+counter axis rather than two independently decodable representations.
+
+Keep train/evaluation examples disjoint and fit any affine calibration only on the probe
+training split. Include same-site train/test probes as upper controls and shuffled-label
+transfer as a negative control.
+
+### 5.4 Counterfactual trace-length versus prompt-count states
+
+For thinking counts 2 through the configured maximum, construct a paired, deterministic
+counterfactual by deleting only the final `<k> marker` pair from the gold trace while
+leaving the task prefix and prompt unchanged. The resulting supplied trace length is
+`m = n - 1`; close the trace normally and retain `<Ans>` so the answer state is well
+defined. At each checkpoint and layer, probe or read out both true prompt count `n` and
+supplied trace length `m`, and save the unrestricted count-token logits.
+
+Compare whether the hidden state and model answer follow the prompt or the shortened
+trace. This provides a precise, reproducible version of the prompt-count-versus-trace
+question without inventing an extra marker or a nonexistent count-zero token. Keep these
+counterfactuals out of training and label them as interventions rather than natural
+examples.
+
+### 5.5 Ordered geometry and representation stability
+
+For every site, checkpoint, and layer, compute per-label centroids followed by:
+
+- PC1 correlation-squared with count/progress;
+- adjacent-centroid direction consistency;
+- PC1 and PC1-to-PC6 explained variance;
+- effective dimensionality;
+- adjacent-count distances and monotonic ordering violations.
+
+Use these metrics to distinguish a one-dimensional ordered counter from ten unrelated
+but decodable count clusters. In addition, compute linear CKA on the same centered
+example-state matrices between adjacent checkpoints, plus cosine similarity of fitted
+count/progress directions. These stability metrics should identify representational
+reorganization around the step-1,500 objective transition even when probe accuracy stays
+flat.
+
+Persist at least:
+
+```text
+tables/checkpoint_state_probe_summary.csv
+tables/checkpoint_state_by_count.csv
+tables/checkpoint_state_geometry.csv
+tables/checkpoint_state_cross_site.csv
+tables/checkpoint_state_counterfactual_trace.csv
+tables/checkpoint_state_similarity.csv
+```
+
+## 6. Dynamics visualizations
+
+Add v16_2-specific plotting functions that consume the saved checkpoint tables and do
+not reload models. Every plot must support one model, an arbitrary model subset, missing
+optional generated diagnostics, and non-5,000-step runs. Discover steps from the tables,
+draw the exact language-loss boundary from config, and label layers as embedding `L0`
+followed by transformer `L1-L4`.
+
+Produce at least:
+
+1. `checkpoint_attention_retrieval_emergence.png`: fixed-final retrieval heads and
+   best-current heads, showing correct mass, top-1, diagonal dominance, and chance.
+2. `checkpoint_answer_routing.png`: checkpoint-by-layer/head routing from `<Ans>` to
+   prefix, prompt needles, trace indices, and trace markers, faceted by mode.
+3. `checkpoint_nonthinking_needle_coverage.png`: enrichment, top-n recall, entropy, and
+   autoregressive accuracy on aligned axes.
+4. `checkpoint_head_role_stability.png`: role rankings and head identities across steps.
+5. `checkpoint_final_count_probe_heatmap.png`: checkpoint-by-layer nearest-centroid
+   accuracy and ridge R-squared for thinking/nonthinking and gold/generated contexts.
+6. `checkpoint_trace_progress_probe_heatmap.png`: trace-index/marker progress decoding.
+7. `checkpoint_cross_site_counter_transfer.png`: trace-to-answer and answer-to-trace
+   transfer by checkpoint and layer.
+8. `checkpoint_counterfactual_trace_readout.png`: probability/output preference for
+   prompt count `n` versus shortened trace length `n-1`.
+9. `checkpoint_state_geometry_emergence.png`: PC1 alignment, adjacent consistency, and
+   effective dimension.
+10. `checkpoint_representation_stability.png`: adjacent-checkpoint CKA and direction
+    cosine, with the loss-phase boundary marked.
+11. `checkpoint_mechanism_overview.png`: a compact summary combining behavioral AR
+    accuracy, the strongest fixed retrieval head, final-answer trace readout, and final
+    count-state decoding.
+
+Avoid plotting only the strongest head at each checkpoint. Show fixed-head and
+best-current-head curves together, include count-dependent chance baselines where
+applicable, and retain tables behind every plotted aggregate. Use consistent colors for
+thinking/nonthinking and consistent line styles for RoPE/RPE across figures.
+
+## 7. New v16_2 notebook analysis block
+
+Add a new code block to `scripts/build_v16_2_notebook.py` and the checked-in
+`notebooks/Trace_Count_v16_2_Colab.ipynb` after training completes and before final result
+display/copy. The notebook block must invoke the repository script rather than duplicating
+analysis code. Include clearly editable controls such as:
+
+```python
+RUN_CHECKPOINT_DYNAMICS = True
+DYNAMICS_EXAMPLES_PER_COUNT = 20       # teacher-forced attention/probe suite
+DYNAMICS_AR_EXAMPLES_PER_COUNT = 10    # slower generated-trace/behavior-linked subset
+DYNAMICS_DEVICE = DEVICE
+FORCE_CHECKPOINT_DYNAMICS = False
+```
+
+The block should:
+
+1. resolve the completed local run or its synchronized Google Drive copy;
+2. print the discovered variants and ordered checkpoint steps before loading a model;
+3. verify that the step-1,500/boundary checkpoint and final checkpoint exist;
+4. run `scripts/analyze_v16_2_checkpoint_dynamics.py` with streamed stdout/stderr;
+5. resume cached partitions by default and require an explicit force flag to recompute;
+6. display the mechanism-overview figure followed by the main attention and state
+   dynamics figures;
+7. print links/paths to the detailed CSV tables and dynamics manifest;
+8. fail clearly when checkpoints were deleted rather than silently plotting final-only
+   tables;
+9. avoid running pytest or retraining any model;
+10. ensure all new outputs are included in the final Drive synchronization/copy.
+
+When `RUN_CHECKPOINT_DYNAMICS=False`, print one concise skipped message and allow the
+notebook to continue. The analysis block must be safely rerunnable in a fresh Colab
+session after mounting Drive, without requiring the training cell to run again. Document
+the expected extra runtime and make it clear that generated-trace collection is the
+slowest optional component.
+
+## 8. Structured runtime logging for debugging
+
+Instrument the complete v16_2 workflow with monotonic wall-clock timing so slowdowns can
+be assigned to training, evaluation, checkpoint I/O, model loading, individual dynamics
+metric families, plotting, or Drive synchronization. Timing must be observational only:
+it must not change RNG state, model outputs, checkpoint cadence, or resumption behavior.
+
+Use `time.perf_counter()` for elapsed durations and UTC timestamps for human-readable
+start/end records. Emit paired live console messages in a stable format:
+
+```text
+[timing:start] scope=checkpoint_dynamics variant=rope/thinking step=1500 block=attention
+[timing:done]  scope=checkpoint_dynamics variant=rope/thinking step=1500 block=attention seconds=12.34 status=complete
+```
+
+Persist atomic rows in a common table such as `tables/runtime_events.csv` with at least:
+
+```text
+event_id, scope, block, position_encoding, mode, step,
+started_at_utc, finished_at_utc, duration_seconds, status,
+num_examples, num_batches, device, resumed_or_cached, error_type
+```
+
+Use blank nullable fields when an event is not model- or step-specific. Give every event
+a deterministic ID so notebook reruns and resumed analyses update/deduplicate the same
+logical event rather than double-counting it. Failed events must retain their elapsed
+time and error type; a cached partition should be logged as cached with near-zero active
+compute rather than being presented as a newly executed measurement.
+
+During training, log:
+
+- initialization and step-0 checkpoint writing per variant;
+- optimizer-only training time between evaluation points, excluding evaluation and
+  checkpoint I/O;
+- periodic fixed-suite teacher-forced evaluation at each `eval_every` step;
+- periodic autoregressive evaluation at each `ar_eval_every` step;
+- checkpoint serialization and Drive checkpoint synchronization at every saved step;
+- final test, prefix-permutation evaluation, and per-variant total training time;
+- complete `prepare`, `train`, final-only `attention`, final-only `state`, and `plots`
+  stage times.
+
+The distinction between optimizer time and evaluation time is required: total wall time
+alone cannot diagnose whether a run is slow because of training or because a larger
+evaluation suite runs every 500 steps.
+
+For checkpoint dynamics, log every variant/checkpoint combination separately for:
+
+- checkpoint file read and model construction/state loading;
+- teacher-forced attention collection;
+- nonthinking coverage and head-stability reduction;
+- gold-trace hidden-state collection and probes;
+- generated-trace autoregressive generation and state collection;
+- counterfactual trace construction/forward passes;
+- cross-site transfer, geometry, and CKA reductions;
+- partition/table writes;
+- cross-checkpoint aggregation and each figure or figure family;
+- per-checkpoint, per-variant, per-metric-family, and complete dynamics totals.
+
+Where CUDA is used, synchronize immediately before starting and stopping a timed GPU
+forward block so durations do not merely measure asynchronous kernel launch. Do not
+synchronize inside every batch. Optionally record peak allocated CUDA memory for the
+block after resetting peak statistics, but keep CPU execution valid when this field is
+absent.
+
+The notebook should time and print its main blocks—environment setup, preparation,
+training subprocess, checkpoint dynamics, result display, local-to-Drive copy, and final
+verification—and display a compact runtime summary grouped by scope/block/variant. Add a
+stacked or grouped figure such as `figures/runtime_breakdown.png` showing optimizer,
+teacher-forced evaluation, autoregressive evaluation, checkpoint I/O, attention
+dynamics, state dynamics, generated/counterfactual analysis, and plotting. Preserve the
+raw timing table behind the figure and document that Colab/Drive I/O timings depend on
+the current runtime and network conditions.
+
+## 9. README and protocol documentation
+
+Update `README.md` and `docs/pipelines/pipeline_v16_2_character_sets.md` after coding.
+Document:
+
+- the 500-step checkpoint default, step-0 snapshot, exact-boundary snapshot, storage
+  implications, and notebook control;
+- how to run or rerun checkpoint dynamics from the notebook and command line;
+- every attention metric, its query position, denominator, chance baseline, and whether
+  it applies to thinking, nonthinking, or both;
+- every hidden-state site, layer convention, probe train/evaluation split, standardization,
+  geometry metric, and cross-site-transfer definition;
+- the difference between gold-trace, generated-trace, and counterfactual-trace states;
+- the teacher-forcing, positional leakage, multiple-head selection, correlational
+  attention, and decodability-not-causality limitations;
+- output table and figure names, so a user can archive derived metrics and later delete
+  checkpoints;
+- the runtime-event schema, console timing messages, optimizer-versus-evaluation timing
+  distinction, runtime-breakdown figure, and CUDA synchronization convention;
+- backward compatibility: historical v16_2 runs retain their saved 1,000-step cadence
+  and can be analyzed only at checkpoints they actually contain.
+
+Include a short example command pointing to one run directory, a `--skip-generated`
+fast path, and a note that all checkpoint models are loaded sequentially rather than
+simultaneously. Do not imply that the existing final-only attention/state tables contain
+training dynamics.
+
+## 10. Tests and acceptance criteria
+
+Extend `tests/test_synthetic_counting_v16_2.py` and add focused dynamics tests if keeping
+the file manageable requires a new test module. Verify:
+
+1. `checkpoint_every=500` round-trips through config, CLI, run metadata, checkpoint
+   metadata, notebook settings, and the planned-run summary; invalid values fail early.
+2. A tiny run saves step 0, cadence steps, an exact nonaligned language-loss boundary,
+   an exact nonaligned final step, and the final alias without duplicate analysis rows.
+3. Arbitrary-checkpoint loading rejects config/vocab/pool/split, step, mode, and position
+   mismatches before collecting metrics.
+4. Fixed diagnostic manifests reproduce identical examples and fingerprints across all
+   enabled variants and checkpoints.
+5. Hand-computed attention tensors verify correct-k mass, top-1, diagonal dominance,
+   chance normalization, category masses, needle enrichment, top-n recall, and entropy.
+6. Toy hidden states verify nearest-centroid, ridge MAE/R-squared, PCA geometry,
+   adjacent-direction consistency, cross-site transfer, direction cosine, and linear CKA.
+7. The counterfactual renderer removes exactly the final trace pair, leaves prefix and
+   prompt tokens unchanged, sets supplied trace length to `n-1`, and never enters training
+   data.
+8. Gold/generated/counterfactual contexts remain separate in schemas and figures; a
+   malformed or unterminated generated trace receives an explicit status rather than an
+   invented answer state.
+9. One-model, two-model, and all-four debug artifacts produce only requested rows and
+   plots and never load disabled checkpoints.
+10. Interrupted analysis resumes completed variant/step partitions; `--force` changes
+    only checkpoint-dynamics outputs.
+11. Plotting succeeds with one checkpoint, missing generated diagnostics, arbitrary
+    training length, and either mode alone, with correct phase-boundary labeling.
+12. The builder-generated and checked-in notebook contain the new checkpoint cadence and
+    post-training analysis block, pass all arguments, compile every code cell, and do not
+    run tests or training inside the analysis block.
+13. Runtime instrumentation emits deterministic, deduplicated complete/failed/cached
+    rows for training intervals, periodic TF/AR evaluations, checkpoint I/O, every
+    dynamics metric family, plots, and Drive synchronization; mocked timing tests verify
+    aggregation without asserting machine-specific durations.
+14. README and pipeline documentation name every emitted table/figure and accurately
+    state the interpretation limits.
+15. Existing final-only v16_2 outputs, historical config loading, and untouched v16 and
+    v11-v14 tests continue to pass.
+
+Run focused metric/unit tests first, then notebook compilation, Ruff, and
+`git diff --check`. Finish with a deterministic CPU debug run using two modes, four
+training steps, checkpoint cadence `2`, and language boundary `2`. Confirm checkpoints at
+0, 2, and 4; run the dynamics analyzer; inspect every table schema and figure; interrupt
+and resume once; and verify that final-only attention/state stages still produce their
+historical outputs. Before a new main Colab run, perform a short CUDA smoke analysis that
+loads checkpoints sequentially and successfully syncs all derived CSVs, figures, and the
+dynamics manifest to Google Drive.
+
+## 11. Implementation order
+
+1. Add the 500-step cadence control, step-0 and exact-boundary checkpoint saving, CLI and
+   notebook wiring, plus checkpoint-inventory tests.
+2. Add the validated arbitrary-checkpoint loader, fixed diagnostic manifests, dynamics
+   manifest, atomic partition writes, and resume behavior.
+3. Add the shared runtime-event recorder and instrument training intervals, periodic
+   evaluation, checkpoint I/O, dynamics partitions, plotting, notebook blocks, and Drive
+   synchronization.
+4. Implement attention detail metrics, summaries, head-role/stability tracking, and
+   behavior linkage for both modes.
+5. Implement gold/generated final-state probes, trace-progress probes, ordered geometry,
+   cross-site transfer, counterfactual trace analysis, and representation similarity.
+6. Implement table-only plotting functions, the complete dynamics figure set, and the
+   runtime-breakdown figure.
+7. Add the new notebook analysis block and preserve the user's existing easy-to-edit
+   experiment settings while updating the builder and checked-in notebook.
+8. Add unit, schema, subset, resume, timing, notebook, plotting, and legacy regression
+   tests.
+9. Run CPU and CUDA smoke analyses, inspect Drive synchronization, and confirm that no
+   analysis path retrains or mutates a checkpoint.
+10. Update README and the v16_2 pipeline document with metric definitions, commands,
+   artifacts, runtime/storage expectations, and interpretation limits.
+
+## 12. Confirmed clarification questions and user decisions
+
+The following implementation choices were explicitly confirmed before coding:
+
+1. **Question:** Should all metric families be implemented in one revision, while
+   remaining independently switchable for incremental debugging?
+
+   **User answer:** Yes. Implement the complete revision, with separate switches for core
+   attention, core hidden states, generated-trace diagnostics, counterfactual diagnostics,
+   and representation-stability/CKA metrics.
+
+2. **Question:** Should checkpoint dynamics, generated-trace dynamics, and
+   counterfactual dynamics run by default in the new notebook analysis block?
+
+   **User answer:** Yes. Use enabled defaults while retaining independent controls to
+   disable any expensive family.
+
+3. **Question:** Should the diagnostic defaults be 20 attention examples per count, 10
+   autoregressive/generated examples per count, 40 state-probe training examples per
+   count, and 15 state-probe evaluation examples per count, with the 20 attention
+   examples split into 10 head-selection and 10 held-out reporting examples?
+
+   **User answer:** Yes. Use those recommended sample sizes and the disjoint 10/10 head
+   selection/reporting split.
+
+4. **Question:** Should the workflow save an initialization checkpoint and retain the
+   complete sequence `0, 500, 1000, 1500, ..., 5000` for the present design?
+
+   **User answer:** Yes. Save step 0, every 500 steps, the exact objective boundary, and
+   the final step.
+
+5. **Question:** Should the counterfactual trace intervention remove only the final
+   `<n> marker` pair for examples with `n >= 2`, leaving prefix and prompt unchanged, so
+   the analysis contrasts true prompt count `n` with supplied trace length `n-1`?
+
+   **User answer:** Yes. Use the deterministic shortened-trace intervention as proposed.
+
+6. **Additional user requirement:** Log running time for every main workflow block and
+   evaluation point to make debugging and performance diagnosis easier. Implement both
+   live start/done messages and persisted structured timing events as specified in
+   Section 8.

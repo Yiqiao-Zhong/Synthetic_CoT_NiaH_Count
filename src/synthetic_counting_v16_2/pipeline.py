@@ -31,6 +31,7 @@ from .needle_pool import (
 )
 from .plots import make_all_v16_2_plots
 from .training import sync_tree, train_v16_2_models
+from .timing import timed_event
 
 
 STAGES = ("prepare", "train", "attention", "state", "plots")
@@ -189,7 +190,10 @@ def run_v16_2_pipeline(
     run_dir = prepare_run_dir(out_root, cfg, run_name)
     sync_run_dir = Path(checkpoint_sync_root) / run_dir.name if checkpoint_sync_root else None
     if sync_run_dir is not None and sync_run_dir.exists():
-        sync_tree(sync_run_dir, run_dir)
+        with timed_event(
+            run_dir, scope="pipeline", block="drive_restore", device=cfg.device
+        ):
+            sync_tree(sync_run_dir, run_dir)
     config_path = run_dir / "config.json"
     if config_path.exists():
         saved_cfg = config_from_dict(json.loads(config_path.read_text(encoding="utf-8")))
@@ -211,44 +215,62 @@ def run_v16_2_pipeline(
         print(f"[v16_2] stage={current}", flush=True)
         _update_manifest(run_dir, cfg, current, "running")
         try:
-            if current == "prepare":
-                prepared = prepare_v16_2_data(cfg, vocab, text, run_dir)
-            else:
-                if prepared is None:
-                    prepared = load_prepared_v16_2_data(cfg, vocab, text, run_dir)
-                split, pool, curve_suites, test_suites = prepared
-                if current == "train":
-                    train_v16_2_models(
-                        cfg,
-                        vocab,
-                        text,
-                        split,
-                        pool,
-                        curve_suites,
-                        test_suites,
-                        run_dir,
-                        sync_run_dir=sync_run_dir,
-                        skip_completed=skip_completed,
-                    )
-                elif current == "attention":
-                    run_v16_2_attention_analysis(cfg, vocab, run_dir, curve_suites["heldout"]["task"])
-                elif current == "state":
-                    run_v16_2_state_analysis(
-                        cfg,
-                        vocab,
-                        run_dir,
-                        curve_suites["train"]["task"],
-                        curve_suites["heldout"]["task"],
-                    )
-                elif current == "plots":
-                    make_all_v16_2_plots(cfg, run_dir)
+            with timed_event(
+                run_dir,
+                scope="pipeline",
+                block=current,
+                device=cfg.device,
+            ):
+                if current == "prepare":
+                    prepared = prepare_v16_2_data(cfg, vocab, text, run_dir)
+                else:
+                    if prepared is None:
+                        prepared = load_prepared_v16_2_data(cfg, vocab, text, run_dir)
+                    split, pool, curve_suites, test_suites = prepared
+                    if current == "train":
+                        train_v16_2_models(
+                            cfg,
+                            vocab,
+                            text,
+                            split,
+                            pool,
+                            curve_suites,
+                            test_suites,
+                            run_dir,
+                            sync_run_dir=sync_run_dir,
+                            skip_completed=skip_completed,
+                        )
+                    elif current == "attention":
+                        run_v16_2_attention_analysis(cfg, vocab, run_dir, curve_suites["heldout"]["task"])
+                    elif current == "state":
+                        run_v16_2_state_analysis(
+                            cfg,
+                            vocab,
+                            run_dir,
+                            curve_suites["train"]["task"],
+                            curve_suites["heldout"]["task"],
+                        )
+                    elif current == "plots":
+                        make_all_v16_2_plots(cfg, run_dir)
         except Exception:
             _update_manifest(run_dir, cfg, current, "failed")
             if sync_run_dir is not None:
-                sync_tree(run_dir, sync_run_dir)
+                with timed_event(
+                    run_dir,
+                    scope="pipeline",
+                    block=f"drive_failure_sync_{current}",
+                    device=cfg.device,
+                ):
+                    sync_tree(run_dir, sync_run_dir)
             raise
         _update_manifest(run_dir, cfg, current, "complete")
         if sync_run_dir is not None:
-            sync_tree(run_dir, sync_run_dir)
+            with timed_event(
+                run_dir,
+                scope="pipeline",
+                block=f"drive_sync_{current}",
+                device=cfg.device,
+            ):
+                sync_tree(run_dir, sync_run_dir)
     print(f"FINAL_RUN_DIR={run_dir.resolve()}", flush=True)
     return run_dir

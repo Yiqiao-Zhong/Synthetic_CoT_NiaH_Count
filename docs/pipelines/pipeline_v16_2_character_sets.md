@@ -138,6 +138,7 @@ python -m synthetic_counting_v16_2.run_v16_2 \
   --model-variant rpe/thinking \
   --train-steps 10000 \
   --max-steps-for-language-pred 1500 \
+  --checkpoint-every 500 \
   --eval-examples-per-count 100 \
   --skip-completed
 ```
@@ -153,3 +154,118 @@ the former position-encoding x mode Cartesian product.
 Stages are `prepare -> train -> attention -> state -> plots`. A train or analysis stage
 refuses to start when the split, pool, or fixed-suite manifests are missing or when any
 fingerprint differs from the configuration/checkpoint.
+
+## Revision-5 checkpoint protocol
+
+The main preset now uses `checkpoint_every=500`. Training writes an initialization
+snapshot at step 0, cadence snapshots, an exact objective-boundary snapshot even when
+`max_steps_for_language_pred` is not divisible by the cadence, an exact final numeric
+snapshot, and the legacy `final` alias. The notebook exposes the cadence as
+`CHECKPOINT_EVERY_STEPS`; new default run names include `ckptN`, preventing a 500-step
+run from reusing a historical directory with an otherwise identical configuration.
+Numeric snapshots are the source of training-dynamics analysis;
+the `final` alias is not counted twice. Historical configurations still deserialize with
+their stored cadence (typically 1,000), so their available timeline is necessarily
+sparser. Keeping all snapshots increases local and Drive storage roughly in proportion
+to checkpoint count.
+
+Run the v16_2-specific, resumable orchestration layer after training:
+
+```bash
+python scripts/analyze_v16_2_checkpoint_dynamics.py RUN_DIR --device cuda
+python scripts/analyze_v16_2_checkpoint_dynamics.py RUN_DIR --device cuda --skip-generated
+```
+
+The analyzer validates configuration, vocabulary, pool, split, variant, and checkpoint
+step before metric collection. It processes only enabled model variants, loads
+checkpoints sequentially, writes an atomic partition under
+`analysis/checkpoint_dynamics/parts/`, and resumes completed partitions unless `--force`
+is passed. Independent `--skip-attention`, `--skip-states`, `--skip-generated`,
+`--skip-counterfactual`, and `--skip-similarity` controls make failures easier to isolate.
+The notebook defaults are 20 attention examples/count (10 head selection plus 10 disjoint
+reporting), 10 autoregressive examples/count, 40 train examples/count for probe fitting,
+and 15 held-out examples/count for state evaluation.
+
+### Attention definitions
+
+At `<Ans>`, both modes report total prompt mass, matching-needle mass, non-needle prompt
+mass, needle attention as a fraction of prompt mass, and enrichment relative to the
+uniform prompt baseline `n / prompt_length`. Top-n recall and precision use the n largest
+prompt-attention positions; needle entropy is normalized by `log(n)`. Thinking additionally
+reports mass routed to trace indices/markers at `<Ans>`.
+
+At every thinking trace-index query k, the analyzer reports attention mass on the true kth
+prompt needle, whether that needle is top-1 among all n true needles, the `1/n` chance
+baseline, top-1-minus-chance, and diagonal dominance (correct-k mass divided by total
+needle mass). Ordered trace metrics do not apply to nonthinking. Fixed role heads are
+selected only from the 10 selection examples at the final checkpoint and tracked on the
+10 held-out reporting examples at every step. Tables retain all layers/heads so a plotted
+aggregate can be reconstructed.
+
+### Hidden-state definitions
+
+Layer 0 is the token/position embedding output; layers 1 through `n_layer` are block
+outputs. Gold teacher-forced sites are `<Ans>` in both modes and every trace index/marker
+in thinking. Nearest-centroid and standardized ridge probes fit only on fixed
+training-region task examples and evaluate only on fixed validation-region examples.
+Trace labels are progress k; final-answer labels are true counts n.
+
+Geometry includes centroid PC1/count R-squared, adjacent-direction cosine consistency,
+PC1 and PC1–PC6 variance, effective dimension, adjacent-centroid distance, and monotonic
+order violations. Thinking cross-site transfer applies the trace-progress ridge direction
+to answer states and the answer-count direction to trace states, reporting MAE, R-squared,
+slope/intercept, and direction cosine. Linear CKA uses the same aligned held-out examples
+to compare each site/layer with its previous and final checkpoint.
+
+Generated-prefix states are collected only when generation reaches `<Ans>`; malformed
+generation receives an explicit status and no invented state. The counterfactual is
+thinking-only and, for true count `n>=2`, removes exactly the final `<n> marker` trace pair
+while preserving the task prefix, prompt, close/answer tokens, and true final target. It
+reports changes in gold probability, gold-versus-`n-1` logit margin, and the gold-trained
+ridge count projection relative to the complete trace.
+
+Interpretation is deliberately limited. Attention is correlational, probe decoding is
+not evidence of causal use, teacher forcing can mask generated-trace exposure bias,
+position can leak trace progress, and searching many heads creates selection bias. The
+disjoint fixed-head split, generated-prefix condition, and counterfactual condition help
+separate these concerns but do not eliminate them.
+
+### Revision-5 artifacts
+
+Attention tables are `checkpoint_attention_detail.csv`,
+`checkpoint_attention_summary.csv`, `checkpoint_attention_by_count.csv`,
+`checkpoint_attention_by_k.csv`, `checkpoint_head_stability.csv`, and
+`checkpoint_attention_behavior_link.csv`. Behavioral generation is saved in
+`checkpoint_dynamics_autoregressive.csv`. State tables are
+`checkpoint_state_probe_summary.csv`, `checkpoint_state_by_count.csv`,
+`checkpoint_state_geometry.csv`, `checkpoint_state_cross_site.csv`,
+`checkpoint_counterfactual_trace_readout.csv`, `checkpoint_generated_state_status.csv`,
+and `checkpoint_state_similarity.csv`.
+
+Figures are `checkpoint_attention_retrieval_emergence.png`,
+`checkpoint_answer_routing.png`, `checkpoint_nonthinking_needle_coverage.png`,
+`checkpoint_head_role_stability.png`, `checkpoint_final_count_probe_heatmap.png`,
+`checkpoint_trace_progress_probe_heatmap.png`,
+`checkpoint_cross_site_counter_transfer.png`,
+`checkpoint_counterfactual_trace_readout.png`,
+`checkpoint_state_geometry_emergence.png`,
+`checkpoint_representation_stability.png`, `checkpoint_ordered_trace_retrieval.png`, and
+`checkpoint_mechanism_overview.png`. These are derived artifacts: archive them before
+deleting checkpoints if later recomputation is not required. The historical final-only
+`attention_*.csv` and `state_*.csv` files do not contain training dynamics.
+
+## Runtime instrumentation
+
+`tables/runtime_events.csv` is the common atomic log for pipeline stages, optimizer
+intervals, periodic teacher-forced and autoregressive evaluation, checkpoint writes,
+final tests, dynamics metric families, aggregation, and plotting. Deterministic event IDs
+deduplicate reruns; status distinguishes complete, failed, and cached work. Rows include
+scope, block, variant, step, UTC start/end, elapsed seconds, examples/batches, device,
+peak CUDA memory when available, cache state, and error type. CUDA is synchronized at
+the beginning and end of timed GPU blocks, not on every batch. Console messages expose
+the same `[timing:start]` and `[timing:done]` boundaries.
+
+`runtime_breakdown.png` aggregates completed rows by scope/block. Optimizer intervals
+exclude periodic evaluation and checkpoint serialization, allowing slow training to be
+distinguished from a large fixed suite or Drive I/O. Timings involving Colab and Google
+Drive depend on the active runtime, storage cache, and network conditions.

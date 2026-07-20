@@ -4,6 +4,7 @@ import json
 import math
 import random
 import shutil
+import time
 from contextlib import nullcontext
 from dataclasses import replace
 from itertools import permutations
@@ -32,6 +33,7 @@ from .data import (
 )
 from .model import TinyPositionCausalLM, build_model
 from .needle_pool import NeedlePool, load_needle_pool
+from .timing import record_duration_event, timed_event
 
 
 def atomic_csv(frame: pd.DataFrame, path: str | Path) -> None:
@@ -123,6 +125,32 @@ def _latest_checkpoint(root: Path) -> tuple[int, Path] | None:
     return max(candidates, key=lambda item: item[0], default=None)
 
 
+def checkpoint_steps(
+    run_dir: str | Path, position_encoding: str, mode: str
+) -> list[tuple[int, Path]]:
+    """Return validated numeric checkpoint paths in optimizer-step order."""
+
+    root = _checkpoint_root(Path(run_dir), position_encoding, mode)
+    result: list[tuple[int, Path]] = []
+    for path in root.glob("step_*/checkpoint.pt"):
+        try:
+            step = int(path.parent.name.removeprefix("step_"))
+        except ValueError:
+            continue
+        result.append((step, path))
+    return sorted(result)
+
+
+def planned_checkpoint_steps(cfg: V16_2Config) -> list[int]:
+    """Numeric snapshots: initialization, cadence, objective boundary, and final."""
+
+    values = {0, int(cfg.train_steps)}
+    values.update(range(cfg.checkpoint_every, cfg.train_steps + 1, cfg.checkpoint_every))
+    if cfg.max_steps_for_language_pred <= cfg.train_steps:
+        values.add(int(cfg.max_steps_for_language_pred))
+    return sorted(values)
+
+
 def _atomic_torch_save(payload: Any, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -162,17 +190,49 @@ def _save_checkpoint(
         "pool_fingerprint": pool.pool_fingerprint,
         "split_fingerprint": split.split_fingerprint,
     }
-    _atomic_torch_save(payload, path)
-    latest = root / "latest.json"
-    latest.write_text(
-        json.dumps({"step": int(step), "checkpoint": str(path.relative_to(run_dir))}, indent=2),
-        encoding="utf-8",
-    )
-    if sync_run_dir is not None:
-        for source in (path, latest):
-            target = sync_run_dir / source.relative_to(run_dir)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
+    block = "checkpoint_write_final" if label == "final" else "checkpoint_write"
+    with timed_event(
+        run_dir,
+        scope="training",
+        block=block,
+        position_encoding=position_encoding,
+        mode=mode,
+        step=step,
+        device=cfg.device,
+    ):
+        detail_prefix = "checkpoint_final" if label == "final" else "checkpoint"
+        with timed_event(
+            run_dir,
+            scope="training",
+            block=f"{detail_prefix}_serialize",
+            position_encoding=position_encoding,
+            mode=mode,
+            step=step,
+            device=cfg.device,
+        ):
+            _atomic_torch_save(payload, path)
+            latest = root / "latest.json"
+            latest.write_text(
+                json.dumps(
+                    {"step": int(step), "checkpoint": str(path.relative_to(run_dir))},
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        if sync_run_dir is not None:
+            with timed_event(
+                run_dir,
+                scope="training",
+                block=f"{detail_prefix}_drive_sync",
+                position_encoding=position_encoding,
+                mode=mode,
+                step=step,
+                device=cfg.device,
+            ):
+                for source in (path, latest):
+                    target = sync_run_dir / source.relative_to(run_dir)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, target)
     return path
 
 
@@ -481,6 +541,9 @@ def autoregressive_task_evaluation(
                     "set_id": example.set_id,
                     "count": example.count,
                     "count_bin": cfg.count_bin(int(example.count)),
+                    "corpus_region": example.corpus_region,
+                    "corpus_start": example.corpus_start,
+                    "prompt_sha256": example.prompt_sha256,
                     **_parse_generation(vocab.decode(generated[index]), vocab, example, mode),
                 }
             )
@@ -617,53 +680,74 @@ def _write_evaluations(
     *,
     run_ar: bool,
 ) -> None:
-    loss_rows, component_rows = evaluate_curve_suites(
-        model, cfg, vocab, curve_suites, position_encoding=position_encoding, mode=mode, step=step
-    )
-    _append_unique(
-        run_dir / "tables" / "eval_loss_curves.csv",
-        loss_rows,
-        ["step", "position_encoding", "mode", "curve_source", "suite", "task_occurrence_ratio"],
-    )
-    _append_unique(
-        run_dir / "tables" / "eval_loss_components.csv",
-        component_rows,
-        ["step", "position_encoding", "mode", "curve_source", "suite", "component"],
-    )
     heldout_task = curve_suites["heldout"]["task"]
-    detail = teacher_forced_task_evaluation(
-        model,
-        cfg,
-        vocab,
-        heldout_task,
+    tf_examples = sum(len(suites[suite]) for suites in curve_suites.values() for suite in ("raw", "task", "mixture")) + len(heldout_task)
+    with timed_event(
+        run_dir,
+        scope="training",
+        block="periodic_teacher_forced_evaluation",
         position_encoding=position_encoding,
         mode=mode,
         step=step,
-    )
-    _append_unique(
-        run_dir / "tables" / "eval_detail.csv",
-        detail,
-        ["step", "position_encoding", "mode", "example_id"],
-    )
-    if run_ar:
-        per_count = cfg.ar_examples_per_count
-        ar_examples = []
-        for count in range(1, cfg.count_max_threshold + 1):
-            ar_examples.extend([item for item in heldout_task if item.count == count][:per_count])
-        ar = autoregressive_task_evaluation(
+        device=cfg.device,
+        num_examples=tf_examples,
+    ):
+        loss_rows, component_rows = evaluate_curve_suites(
+            model, cfg, vocab, curve_suites, position_encoding=position_encoding, mode=mode, step=step
+        )
+        _append_unique(
+            run_dir / "tables" / "eval_loss_curves.csv",
+            loss_rows,
+            ["step", "position_encoding", "mode", "curve_source", "suite", "task_occurrence_ratio"],
+        )
+        _append_unique(
+            run_dir / "tables" / "eval_loss_components.csv",
+            component_rows,
+            ["step", "position_encoding", "mode", "curve_source", "suite", "component"],
+        )
+        detail = teacher_forced_task_evaluation(
             model,
             cfg,
             vocab,
-            ar_examples,
+            heldout_task,
             position_encoding=position_encoding,
             mode=mode,
             step=step,
         )
         _append_unique(
-            run_dir / "tables" / "autoregressive_detail.csv",
-            ar,
-            ["step", "position_encoding", "mode", "row_id"],
+            run_dir / "tables" / "eval_detail.csv",
+            detail,
+            ["step", "position_encoding", "mode", "example_id"],
         )
+    if run_ar:
+        per_count = cfg.ar_examples_per_count
+        ar_examples = []
+        for count in range(1, cfg.count_max_threshold + 1):
+            ar_examples.extend([item for item in heldout_task if item.count == count][:per_count])
+        with timed_event(
+            run_dir,
+            scope="training",
+            block="periodic_autoregressive_evaluation",
+            position_encoding=position_encoding,
+            mode=mode,
+            step=step,
+            device=cfg.device,
+            num_examples=len(ar_examples),
+        ):
+            ar = autoregressive_task_evaluation(
+                model,
+                cfg,
+                vocab,
+                ar_examples,
+                position_encoding=position_encoding,
+                mode=mode,
+                step=step,
+            )
+            _append_unique(
+                run_dir / "tables" / "autoregressive_detail.csv",
+                ar,
+                ["step", "position_encoding", "mode", "row_id"],
+            )
 
 
 def _write_final_test(
@@ -728,6 +812,21 @@ def train_v16_2_variant(
         payload = torch.load(path, map_location=cfg.device, weights_only=False)
         _restore_checkpoint(payload, model, optimizer, rng, pool, split, vocab)
         print(f"[resume] {position_encoding}/{mode} from step {start_step}", flush=True)
+    else:
+        _save_checkpoint(
+            model,
+            optimizer,
+            cfg,
+            vocab,
+            pool,
+            split,
+            position_encoding,
+            mode,
+            0,
+            rng,
+            run_dir,
+            sync_run_dir,
+        )
     sampling_state = _load_sampling_state(run_dir, position_encoding, mode, start_step, cfg)
 
     if start_step == 0:
@@ -740,7 +839,11 @@ def train_v16_2_variant(
         initial=start_step,
         total=cfg.train_steps,
     )
+    optimizer_interval_seconds = 0.0
+    optimizer_interval_steps = 0
+    numeric_checkpoint_steps = set(planned_checkpoint_steps(cfg))
     for step in progress:
+        optimizer_started = time.perf_counter()
         model.train()
         loss_phase = training_loss_phase(cfg, step)
         if step == cfg.max_steps_for_language_pred + 1:
@@ -774,6 +877,8 @@ def train_v16_2_variant(
         for group in optimizer.param_groups:
             group["lr"] = rate
         optimizer.step()
+        optimizer_interval_seconds += time.perf_counter() - optimizer_started
+        optimizer_interval_steps += 1
 
         if step % cfg.log_every == 0 or step in {1, cfg.train_steps}:
             is_task = np.asarray([example.example_kind == "counting_task" for example in examples])
@@ -840,6 +945,24 @@ def train_v16_2_variant(
             )
             progress.set_postfix(loss=f"{loss.item():.4f}", task=f"{is_task.mean():.2f}")
         if step % cfg.eval_every == 0 or step == cfg.train_steps:
+            if str(cfg.device).startswith("cuda") and torch.cuda.is_available():
+                sync_started = time.perf_counter()
+                torch.cuda.synchronize(cfg.device)
+                optimizer_interval_seconds += time.perf_counter() - sync_started
+            record_duration_event(
+                run_dir,
+                scope="training",
+                block="optimizer_interval",
+                duration_seconds=optimizer_interval_seconds,
+                position_encoding=position_encoding,
+                mode=mode,
+                step=step,
+                device=cfg.device,
+                num_examples=optimizer_interval_steps * cfg.batch_size,
+                num_batches=optimizer_interval_steps,
+            )
+            optimizer_interval_seconds = 0.0
+            optimizer_interval_steps = 0
             _write_evaluations(
                 model,
                 cfg,
@@ -851,7 +974,7 @@ def train_v16_2_variant(
                 step,
                 run_ar=(step % cfg.ar_eval_every == 0 or step == cfg.train_steps),
             )
-        if step % cfg.checkpoint_every == 0:
+        if step in numeric_checkpoint_steps:
             _save_checkpoint(
                 model, optimizer, cfg, vocab, pool, split, position_encoding, mode, step,
                 rng, run_dir, sync_run_dir,
@@ -860,20 +983,39 @@ def train_v16_2_variant(
         model, optimizer, cfg, vocab, pool, split, position_encoding, mode, cfg.train_steps,
         rng, run_dir, sync_run_dir, label="final",
     )
-    _write_final_test(model, cfg, vocab, test_suites, run_dir, position_encoding, mode)
-    permutation = prefix_permutation_consistency_evaluation(
-        model,
-        cfg,
-        vocab,
-        curve_suites["heldout"]["task"],
+    with timed_event(
+        run_dir,
+        scope="training",
+        block="final_test",
         position_encoding=position_encoding,
         mode=mode,
-    )
-    _append_unique(
-        run_dir / "tables" / "prefix_permutation_consistency.csv",
-        permutation,
-        ["position_encoding", "mode", "example_id"],
-    )
+        step=cfg.train_steps,
+        device=cfg.device,
+        num_examples=sum(len(values) for values in test_suites.values()),
+    ):
+        _write_final_test(model, cfg, vocab, test_suites, run_dir, position_encoding, mode)
+    with timed_event(
+        run_dir,
+        scope="training",
+        block="prefix_permutation_evaluation",
+        position_encoding=position_encoding,
+        mode=mode,
+        step=cfg.train_steps,
+        device=cfg.device,
+    ):
+        permutation = prefix_permutation_consistency_evaluation(
+            model,
+            cfg,
+            vocab,
+            curve_suites["heldout"]["task"],
+            position_encoding=position_encoding,
+            mode=mode,
+        )
+        _append_unique(
+            run_dir / "tables" / "prefix_permutation_consistency.csv",
+            permutation,
+            ["position_encoding", "mode", "example_id"],
+        )
 
 
 def summarize_learning_tables(run_dir: Path) -> None:
@@ -980,12 +1122,19 @@ def train_v16_2_models(
         sync_tree(run_dir, sync_run_dir)
 
 
-def load_final_v16_2_model(
+def load_v16_2_checkpoint_model(
     run_dir: str | Path,
     position_encoding: str,
     mode: str,
+    *,
+    step: int | None = None,
+    label: str | None = None,
     device: str | None = None,
-) -> tuple[V16_2Config, V16_2Vocab, NeedlePool, TinyPositionCausalLM]:
+) -> tuple[V16_2Config, V16_2Vocab, NeedlePool, CorpusSplit, TinyPositionCausalLM]:
+    """Load one v16_2 model checkpoint after validating all artifact identities."""
+
+    if (step is None) == (label is None):
+        raise ValueError("provide exactly one of step or label")
     run_dir = Path(run_dir)
     cfg = config_from_dict(json.loads((run_dir / "config.json").read_text(encoding="utf-8")))
     if device is not None:
@@ -1002,11 +1151,40 @@ def load_final_v16_2_model(
         vocab_fingerprint=vocab.fingerprint,
     )
     model = build_model(cfg, vocab, position_encoding, cfg.device)
-    path = _checkpoint_root(run_dir, position_encoding, mode) / "final" / "checkpoint.pt"
+    selected = label if label is not None else f"step_{int(step):06d}"
+    path = _checkpoint_root(run_dir, position_encoding, mode) / selected / "checkpoint.pt"
     if not path.exists():
-        raise FileNotFoundError(f"missing final checkpoint: {path}")
+        raise FileNotFoundError(f"missing v16_2 checkpoint: {path}")
     payload = torch.load(path, map_location=cfg.device, weights_only=False)
+    payload_cfg = config_from_dict(dict(payload.get("config", {})))
+    if payload_cfg != config_from_dict(json.loads((run_dir / "config.json").read_text(encoding="utf-8"))):
+        raise ValueError("checkpoint config does not match run config")
+    if payload.get("position_encoding") != position_encoding or payload.get("mode") != mode:
+        raise ValueError("checkpoint position encoding/mode does not match requested variant")
+    expected_step = cfg.train_steps if label == "final" else int(step)
+    if int(payload.get("step", -1)) != expected_step:
+        raise ValueError("checkpoint payload step does not match requested step")
     if payload.get("pool_fingerprint") != pool.pool_fingerprint:
-        raise ValueError("final checkpoint pool fingerprint mismatch")
+        raise ValueError("checkpoint pool fingerprint mismatch")
+    if payload.get("split_fingerprint") != split.split_fingerprint:
+        raise ValueError("checkpoint split fingerprint mismatch")
+    if payload.get("vocab_fingerprint") != vocab.fingerprint:
+        raise ValueError("checkpoint vocabulary fingerprint mismatch")
     model.load_state_dict(payload["model_state_dict"])
-    return cfg, vocab, pool, model.eval()
+    return cfg, vocab, pool, split, model.eval()
+
+
+def load_final_v16_2_model(
+    run_dir: str | Path,
+    position_encoding: str,
+    mode: str,
+    device: str | None = None,
+) -> tuple[V16_2Config, V16_2Vocab, NeedlePool, TinyPositionCausalLM]:
+    cfg, vocab, pool, _, model = load_v16_2_checkpoint_model(
+        run_dir,
+        position_encoding,
+        mode,
+        label="final",
+        device=device,
+    )
+    return cfg, vocab, pool, model

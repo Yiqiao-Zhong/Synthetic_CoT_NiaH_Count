@@ -55,7 +55,7 @@ class V16_2Config:
     log_every: int = 50
     eval_every: int = 500
     ar_eval_every: int = 1_000
-    checkpoint_every: int = 1_000
+    checkpoint_every: int = 500
     eval_examples_per_count: int = 100
     ar_examples_per_count: int = 10
     max_steps_for_language_pred: int = 1_500
@@ -194,6 +194,8 @@ class V16_2Config:
             raise ValueError(
                 "task_occurrence_ratio must be positive when task-output-only training is scheduled"
             )
+        if type(self.checkpoint_every) is not int or self.checkpoint_every <= 0:
+            raise ValueError("checkpoint_every must be a positive integer")
         if not (0 <= self.adam_beta1 < 1 and 0 <= self.adam_beta2 < 1):
             raise ValueError("Adam betas must be in [0, 1)")
         for name in (
@@ -202,7 +204,6 @@ class V16_2Config:
             "log_every",
             "eval_every",
             "ar_eval_every",
-            "checkpoint_every",
             "eval_examples_per_count",
             "analysis_batch_size",
         ):
@@ -329,6 +330,9 @@ def config_from_dict(values: dict[str, Any]) -> V16_2Config:
     data.setdefault("final_count_loss_weight", 1.0)
     data.setdefault("cot_trace_loss_weight", 1.0)
     data.setdefault("weight_decay", 0.01)
+    # Before revision 5, the main cadence was 1,000 steps. Preserve that value
+    # when loading a rare hand-written legacy config that omitted the field.
+    data.setdefault("checkpoint_every", 1_000)
     if legacy_loss_schedule:
         data["max_steps_for_language_pred"] = int(data["train_steps"])
     cfg = V16_2Config(**data)
@@ -350,7 +354,7 @@ def default_run_name(cfg: V16_2Config) -> str:
         f"taskr{_float_tag(cfg.task_occurrence_ratio)}_wd{_float_tag(cfg.weight_decay)}_"
         f"fcw{_float_tag(cfg.final_count_loss_weight)}_"
         f"cotw{_float_tag(cfg.cot_trace_loss_weight)}_langsteps{cfg.max_steps_for_language_pred}_"
-        f"steps{cfg.train_steps}_evaln{eval_size}_{variants.replace('/', '-')}_"
+        f"steps{cfg.train_steps}_ckpt{cfg.checkpoint_every}_evaln{eval_size}_{variants.replace('/', '-')}_"
         f"{schedule_tag}_seed{cfg.seed}"
     )
 

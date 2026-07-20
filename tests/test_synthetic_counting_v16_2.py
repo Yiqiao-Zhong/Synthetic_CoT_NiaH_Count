@@ -33,7 +33,11 @@ from synthetic_counting_v16_2.data import (
 )
 from synthetic_counting_v16_2.needle_pool import build_needle_pool
 from synthetic_counting_v16_2.plots import plot_v16_2_loss_suites
-from synthetic_counting_v16_2.training import evaluate_loss_suite, training_loss_phase
+from synthetic_counting_v16_2.training import (
+    evaluate_loss_suite,
+    planned_checkpoint_steps,
+    training_loss_phase,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,11 +67,13 @@ def test_config_alias_ratio_validation_and_run_identity():
         enabled_model_variants=("rope/thinking", "rpe/nonthinking"),
     )
     assert cfg.count_max == cfg.count_max_threshold == 10
+    assert preset_config("main").checkpoint_every == 500
     assert cfg.model_variants == (("rope", "thinking"), ("rpe", "nonthinking"))
     assert "taskr0p25" in default_run_name(cfg)
     assert "pool100x3" in default_run_name(cfg)
     assert "wd0p05" in default_run_name(cfg)
-    assert "fcw2_cotw3_langsteps15_steps123_evaln70" in default_run_name(cfg)
+    assert "fcw2_cotw3_langsteps15_steps123" in default_run_name(cfg)
+    assert "steps123_ckpt500_evaln70" in default_run_name(cfg)
     assert "allseq-taskout" in default_run_name(cfg)
     assert "rope-t-rpe-nt" in default_run_name(cfg)
     serialized = cfg.to_dict()
@@ -99,6 +105,9 @@ def test_config_alias_ratio_validation_and_run_identity():
     assert training_loss_phase(cfg, 15) == "all_sequence"
     assert training_loss_phase(cfg, 16) == "task_output"
     assert default_run_name(replace(cfg, max_steps_for_language_pred=16)) != default_run_name(cfg)
+    for value in (0, -1, 1.5, True):
+        with pytest.raises(ValueError, match="checkpoint_every"):
+            preset_config("main", checkpoint_every=value)
 
 
 def test_legacy_config_defaults_and_variant_validation():
@@ -109,6 +118,7 @@ def test_legacy_config_defaults_and_variant_validation():
     legacy.pop("cot_trace_loss_weight")
     legacy.pop("weight_decay")
     legacy.pop("max_steps_for_language_pred")
+    legacy.pop("checkpoint_every")
     loaded = config_from_dict(legacy)
     assert loaded.enabled_model_variants == (
         "rope/nonthinking",
@@ -118,6 +128,7 @@ def test_legacy_config_defaults_and_variant_validation():
     )
     assert loaded.final_count_loss_weight == loaded.cot_trace_loss_weight == 1.0
     assert loaded.weight_decay == 0.01
+    assert loaded.checkpoint_every == 1_000
     assert loaded.max_steps_for_language_pred == loaded.train_steps
     assert loaded.loss_scope == "all_sequence"
     with pytest.raises(ValueError, match="at least one"):
@@ -138,6 +149,7 @@ def test_cli_exposes_weights_variants_steps_and_evaluation_size():
             "--model-variant", "rope/thinking",
             "--model-variant", "rpe/nonthinking",
             "--train-steps", "17",
+            "--checkpoint-every", "5",
             "--eval-examples-per-count", "3",
         ]
     )
@@ -147,7 +159,16 @@ def test_cli_exposes_weights_variants_steps_and_evaluation_size():
     assert args.max_steps_for_language_pred == 12
     assert args.model_variant == ["rope/thinking", "rpe/nonthinking"]
     assert args.train_steps == 17
+    assert args.checkpoint_every == 5
     assert args.eval_examples_per_count == 3
+
+
+def test_checkpoint_plan_includes_nonaligned_boundary_and_final():
+    cfg = preset_config(
+        "debug", train_steps=8, checkpoint_every=3,
+        max_steps_for_language_pred=2,
+    )
+    assert planned_checkpoint_steps(cfg) == [0, 2, 3, 6, 8]
 
 
 def test_guarded_corpus_regions_are_disjoint(prepared):
@@ -520,6 +541,7 @@ def test_v16_2_notebook_compiles_and_legacy_v16_runner_is_isolated(tmp_path):
         "RUN_RPE_THINKING",
         "MAX_TRAIN_STEPS",
         "MAX_STEPS_FOR_LANGUAGE_PRED",
+        "CHECKPOINT_EVERY_STEPS",
         "EVAL_EXAMPLES_PER_COUNT",
     ):
         assert f"{editable_setting} =" in source
@@ -531,6 +553,7 @@ def test_v16_2_notebook_compiles_and_legacy_v16_runner_is_isolated(tmp_path):
     assert '"weight_decay": WEIGHT_DECAY' in source
     assert '"--train-steps", str(MAX_TRAIN_STEPS)' in source
     assert '"--max-steps-for-language-pred", str(MAX_STEPS_FOR_LANGUAGE_PRED)' in source
+    assert '"--checkpoint-every", str(CHECKPOINT_EVERY_STEPS)' in source
     assert "max_steps_for_language_pred=MAX_STEPS_FOR_LANGUAGE_PRED" in source
     assert '"task_output_only_steps": TASK_OUTPUT_ONLY_STEPS' in source
     assert '"--eval-examples-per-count", str(EVAL_EXAMPLES_PER_COUNT)' in source
@@ -564,6 +587,12 @@ def test_v16_2_notebook_compiles_and_legacy_v16_runner_is_isolated(tmp_path):
     assert "MAX_TRAIN_STEPS = 10_000" in generated_source
     assert "MAX_STEPS_FOR_LANGUAGE_PRED = 1_500" in generated_source
     assert "EVAL_EXAMPLES_PER_COUNT = 100" in generated_source
+    assert "CHECKPOINT_EVERY_STEPS = 500" in generated_source
+    assert "RUN_CHECKPOINT_DYNAMICS = True" in generated_source
+    assert "DYNAMICS_ATTENTION_EXAMPLES_PER_COUNT = 20" in generated_source
+    assert "DYNAMICS_AR_EXAMPLES_PER_COUNT = 10" in generated_source
+    assert "DYNAMICS_STATE_TRAIN_EXAMPLES_PER_COUNT = 40" in generated_source
+    assert "DYNAMICS_STATE_EVAL_EXAMPLES_PER_COUNT = 15" in generated_source
     assert generated["metadata"] == notebook["metadata"]
     assert [cell["id"] for cell in generated["cells"]] == [
         cell["id"] for cell in notebook["cells"]

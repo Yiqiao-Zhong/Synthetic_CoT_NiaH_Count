@@ -73,8 +73,10 @@ def build() -> Path:
             import shutil
             import subprocess
             import sys
+            import time
             from pathlib import Path
 
+            setup_started = time.perf_counter()
             assert DRIVE_READY, "Run the Google Drive mount cell before environment setup"
             assert DRIVE_REPO_ROOT.exists(), DRIVE_REPO_ROOT
             assert (DRIVE_REPO_ROOT / "pyproject.toml").exists(), (
@@ -185,6 +187,7 @@ def build() -> Path:
                 "cuda": torch.cuda.is_available(),
                 "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
             })
+            print(f"Environment setup block: {time.perf_counter() - setup_started:.1f} seconds")
             """,
             "environment-setup",
         ),
@@ -223,6 +226,7 @@ def build() -> Path:
             RUN_RPE_THINKING = True
             MAX_TRAIN_STEPS = 10_000         # optimizer steps for each enabled model
             MAX_STEPS_FOR_LANGUAGE_PRED = 1_500  # through this step use all-token LM loss; afterward train task output only
+            CHECKPOINT_EVERY_STEPS = 500      # save step 0, every N steps, the objective boundary, and the final step
             EVAL_EXAMPLES_PER_COUNT = 100    # examples for each count; suite size = this value x COUNT_MAX_THRESHOLD
             NEEDLE_POOL_SIZE = 100
             NEEDLE_POOL_FREQUENCY_THRESHOLD = 0.04
@@ -259,6 +263,7 @@ def build() -> Path:
                 enabled_model_variants=ENABLED_MODEL_VARIANTS,
                 train_steps=MAX_TRAIN_STEPS,
                 max_steps_for_language_pred=MAX_STEPS_FOR_LANGUAGE_PRED,
+                checkpoint_every=CHECKPOINT_EVERY_STEPS,
                 eval_examples_per_count=EVAL_EXAMPLES_PER_COUNT,
                 needle_pool_size=NEEDLE_POOL_SIZE,
                 needle_pool_frequency_threshold=NEEDLE_POOL_FREQUENCY_THRESHOLD,
@@ -267,6 +272,12 @@ def build() -> Path:
             PERIODIC_TF_EXAMPLES_PER_MODEL = 7 * EVAL_EXAMPLES_PER_SUITE
             LANGUAGE_PREDICTION_STEPS = min(MAX_STEPS_FOR_LANGUAGE_PRED, MAX_TRAIN_STEPS)
             TASK_OUTPUT_ONLY_STEPS = max(0, MAX_TRAIN_STEPS - MAX_STEPS_FOR_LANGUAGE_PRED)
+            PLANNED_CHECKPOINT_STEPS = sorted({
+                0,
+                *range(CHECKPOINT_EVERY_STEPS, MAX_TRAIN_STEPS + 1, CHECKPOINT_EVERY_STEPS),
+                min(MAX_STEPS_FOR_LANGUAGE_PRED, MAX_TRAIN_STEPS),
+                MAX_TRAIN_STEPS,
+            })
             print({
                 "config": PLANNED_CONFIG.to_dict(),
                 "enabled_model_variants": ENABLED_MODEL_VARIANTS,
@@ -277,6 +288,9 @@ def build() -> Path:
                 "task_output_starts": {"nonthinking": "<Ans>", "thinking": "<Think>"},
                 "max_steps_per_model": MAX_TRAIN_STEPS,
                 "total_planned_optimizer_steps": len(ENABLED_MODEL_VARIANTS) * MAX_TRAIN_STEPS,
+                "checkpoint_every_steps": CHECKPOINT_EVERY_STEPS,
+                "planned_checkpoint_steps_per_model": PLANNED_CHECKPOINT_STEPS,
+                "numeric_checkpoints_per_model": len(PLANNED_CHECKPOINT_STEPS),
                 "eval_examples_per_suite": EVAL_EXAMPLES_PER_SUITE,
                 "periodic_teacher_forced_examples_per_model": PERIODIC_TF_EXAMPLES_PER_MODEL,
             })
@@ -298,6 +312,7 @@ def build() -> Path:
                 "--cot-trace-loss-weight", str(COT_TRACE_LOSS_WEIGHT),
                 "--train-steps", str(MAX_TRAIN_STEPS),
                 "--max-steps-for-language-pred", str(MAX_STEPS_FOR_LANGUAGE_PRED),
+                "--checkpoint-every", str(CHECKPOINT_EVERY_STEPS),
                 "--eval-examples-per-count", str(EVAL_EXAMPLES_PER_COUNT),
                 "--needle-pool-size", str(NEEDLE_POOL_SIZE),
                 "--needle-pool-frequency-threshold", str(NEEDLE_POOL_FREQUENCY_THRESHOLD),
@@ -311,7 +326,9 @@ def build() -> Path:
                 base_cmd += ["--checkpoint-sync-root", str(CHECKPOINT_SYNC_ROOT)]
             if SKIP_COMPLETED:
                 base_cmd.append("--skip-completed")
+            prepare_started = time.perf_counter()
             subprocess.run([*base_cmd, "--stage", "prepare"], check=True)
+            print(f"Prepare block: {time.perf_counter() - prepare_started:.1f} seconds")
 
             from synthetic_counting_v16_2.config import default_run_name
             RUN_DIR = Path(OUT_ROOT) / (RUN_NAME or default_run_name(PLANNED_CONFIG))
@@ -323,14 +340,91 @@ def build() -> Path:
         markdown("## 5. Train, analyze, and plot", "run-heading"),
         code(
             """
+            training_started = time.perf_counter()
             subprocess.run([*base_cmd, "--stage", "train,attention,state,plots"], check=True)
+            print(f"Training/final-diagnostics block: {time.perf_counter() - training_started:.1f} seconds")
             print("RUN_DIR =", RUN_DIR.resolve())
             """,
             "run-pipeline",
         ),
-        markdown("## 6. Inspect train-versus-held-out loss curves", "inspect-heading"),
+        markdown("## 6. Analyze internal mechanisms across saved checkpoints", "dynamics-heading"),
         code(
             """
+            # All metric families are independently switchable. Defaults use fixed,
+            # count-balanced examples at every checkpoint for comparable trajectories.
+            RUN_CHECKPOINT_DYNAMICS = True
+            RUN_ATTENTION_DYNAMICS = True
+            RUN_HIDDEN_STATE_DYNAMICS = True
+            RUN_GENERATED_TRACE_DYNAMICS = True
+            RUN_COUNTERFACTUAL_DYNAMICS = True
+            RUN_REPRESENTATION_STABILITY = True
+            FORCE_CHECKPOINT_DYNAMICS = False  # False resumes completed checkpoint partitions
+
+            DYNAMICS_ATTENTION_EXAMPLES_PER_COUNT = 20  # 10 select heads + 10 held-out reporting examples
+            DYNAMICS_AR_EXAMPLES_PER_COUNT = 10         # autoregressive generations per true count
+            DYNAMICS_STATE_TRAIN_EXAMPLES_PER_COUNT = 40  # ridge/centroid fitting examples per count
+            DYNAMICS_STATE_EVAL_EXAMPLES_PER_COUNT = 15   # held-out state examples per count
+
+            if RUN_CHECKPOINT_DYNAMICS:
+                from synthetic_counting_v16_2.training import checkpoint_steps
+
+                checkpoint_inventory = {
+                    variant: [step for step, _ in checkpoint_steps(RUN_DIR, *variant.split("/"))]
+                    for variant in ENABLED_MODEL_VARIANTS
+                }
+                print("Checkpoint inventory:", checkpoint_inventory)
+                required_steps = {min(MAX_STEPS_FOR_LANGUAGE_PRED, MAX_TRAIN_STEPS), MAX_TRAIN_STEPS}
+                for variant, available_steps in checkpoint_inventory.items():
+                    missing = required_steps - set(available_steps)
+                    if missing:
+                        raise FileNotFoundError(
+                            f"{variant} is missing required checkpoint step(s) {sorted(missing)}; "
+                            "restore the run's checkpoints from Google Drive before analysis"
+                        )
+                dynamics_cmd = [
+                    sys.executable, "-u", "scripts/analyze_v16_2_checkpoint_dynamics.py",
+                    str(RUN_DIR),
+                    "--device", DEVICE,
+                    "--attention-examples-per-count", str(DYNAMICS_ATTENTION_EXAMPLES_PER_COUNT),
+                    "--ar-examples-per-count", str(DYNAMICS_AR_EXAMPLES_PER_COUNT),
+                    "--state-train-examples-per-count", str(DYNAMICS_STATE_TRAIN_EXAMPLES_PER_COUNT),
+                    "--state-eval-examples-per-count", str(DYNAMICS_STATE_EVAL_EXAMPLES_PER_COUNT),
+                ]
+                for enabled, flag in (
+                    (RUN_ATTENTION_DYNAMICS, "--skip-attention"),
+                    (RUN_HIDDEN_STATE_DYNAMICS, "--skip-states"),
+                    (RUN_GENERATED_TRACE_DYNAMICS, "--skip-generated"),
+                    (RUN_COUNTERFACTUAL_DYNAMICS, "--skip-counterfactual"),
+                    (RUN_REPRESENTATION_STABILITY, "--skip-similarity"),
+                ):
+                    if not enabled:
+                        dynamics_cmd.append(flag)
+                if FORCE_CHECKPOINT_DYNAMICS:
+                    dynamics_cmd.append("--force")
+                dynamics_started = time.perf_counter()
+                subprocess.run(dynamics_cmd, check=True)
+                print(f"Checkpoint-dynamics block: {time.perf_counter() - dynamics_started:.1f} seconds")
+                print("Dynamics manifest:", RUN_DIR / "analysis" / "checkpoint_dynamics" / "manifest.json")
+                print("Detailed tables:", RUN_DIR / "tables" / "checkpoint_*.csv")
+                for figure_name in (
+                    "checkpoint_mechanism_overview.png",
+                    "checkpoint_attention_retrieval_emergence.png",
+                    "checkpoint_final_count_probe_heatmap.png",
+                    "checkpoint_counterfactual_trace_readout.png",
+                    "runtime_breakdown.png",
+                ):
+                    figure_path = RUN_DIR / "figures" / figure_name
+                    if figure_path.exists():
+                        display(Image(filename=str(figure_path)))
+            else:
+                print("Checkpoint-dynamics analysis skipped; saved checkpoints remain available.")
+            """,
+            "checkpoint-dynamics",
+        ),
+        markdown("## 7. Inspect train-versus-held-out loss curves", "inspect-heading"),
+        code(
+            """
+            inspect_started = time.perf_counter()
             losses = pd.read_csv(RUN_DIR / "tables" / "eval_loss_curves.csv")
             display(losses)
             display(Image(filename=str(RUN_DIR / "figures" / "learning_loss_suites_train_vs_heldout.png")))
@@ -338,21 +432,24 @@ def build() -> Path:
             if test_summary.exists():
                 display(Markdown("**Final-only untouched test results**"))
                 display(pd.read_csv(test_summary))
+            print(f"Result-display block: {time.perf_counter() - inspect_started:.1f} seconds")
             """,
             "inspect-losses",
         ),
-        markdown("## 7. Save the complete result bundle", "save-heading"),
+        markdown("## 8. Save the complete result bundle", "save-heading"),
         code(
             """
             import shutil
             from datetime import datetime
 
+            save_started = time.perf_counter()
             if DRIVE_READY:
                 destination = DRIVE_RESULTS_ROOT / f"{RUN_DIR.name}_{datetime.now():%Y%m%d_%H%M%S}"
                 shutil.copytree(RUN_DIR, destination, dirs_exist_ok=True)
                 print("Saved:", destination)
             else:
                 print("Drive unavailable; results remain at", RUN_DIR.resolve())
+            print(f"Result-copy block: {time.perf_counter() - save_started:.1f} seconds")
             """,
             "save-drive",
             ["google-drive-save"],

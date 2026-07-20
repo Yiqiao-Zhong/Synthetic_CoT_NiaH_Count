@@ -233,14 +233,81 @@ python -m synthetic_counting_v16_2.run_v16_2 \
   --final-count-loss-weight 1.0 --cot-trace-loss-weight 1.0 \
   --model-variant rope/thinking --model-variant rpe/thinking \
   --train-steps 10000 --max-steps-for-language-pred 1500 \
-  --eval-examples-per-count 100 --skip-completed
+  --checkpoint-every 500 --eval-examples-per-count 100 --skip-completed
 ```
+
+Revision 5 adds post-training checkpoint dynamics without changing v16 or historical
+v16_2 checkpoints. New main configs save numeric checkpoints at step 0, every 500 steps,
+the exact `max_steps_for_language_pred` boundary even when it is off cadence, and the
+exact final step, plus the existing `final` alias. `CHECKPOINT_EVERY_STEPS` is editable in
+the notebook, is saved in config/checkpoint metadata, and appears as `ckptN` in new
+default run names to prevent collisions with older cadences. More checkpoints require substantially more Drive storage; historical
+v16_2 runs keep their saved 1,000-step cadence and can be analyzed only at checkpoint
+steps that actually exist.
+
+The notebook's new checkpoint-dynamics block is enabled by default and can switch
+attention, hidden states, generated traces, counterfactual traces, and representation
+similarity independently. It loads one checkpoint at a time and never retrains or
+modifies a model. The same resumable analyzer can be run directly:
+
+```bash
+python scripts/analyze_v16_2_checkpoint_dynamics.py runs/synthetic_counting_v16_2/RUN_NAME \
+  --device cuda
+
+# Faster path: omit autoregressive/generated-prefix diagnostics.
+python scripts/analyze_v16_2_checkpoint_dynamics.py runs/synthetic_counting_v16_2/RUN_NAME \
+  --device cuda --skip-generated
+```
+
+Attention outputs measure prompt-needle mass and non-needle mass, prompt-normalized
+needle enrichment (needle attention share divided by its uniform prompt share), top-n
+needle recall/precision, needle-attention entropy, final-answer trace readout, and—for
+thinking trace-index queries—correct-k mass, top-1 accuracy, its `1/n` chance baseline,
+and diagonal dominance. Final-answer metrics apply to both modes; ordered trace metrics
+apply only to thinking. The 20 examples/count default is split into 10 examples used to
+select fixed heads and 10 disjoint reporting examples, avoiding same-example head
+selection and reporting.
+
+Hidden states include the embedding output as layer 0 and each Transformer block output
+thereafter. Ridge and nearest-centroid probes fit on fixed training-region task examples
+and report only on fixed held-out-region examples. They cover the final `<Ans>` state in
+both modes and trace-index/marker progress states in thinking. Additional metrics report
+ordered centroid PCA geometry, adjacent-count direction consistency, effective
+dimension, trace-to-answer/answer-to-trace ridge transfer and direction cosine, and
+linear CKA to the previous/final checkpoint. Gold teacher-forced states, states after an
+actually generated prefix, and the thinking counterfactual that removes only the final
+`<n> marker` pair for `n>=2` remain explicitly separate.
+
+The detailed tables are `checkpoint_attention_detail.csv`,
+`checkpoint_attention_summary.csv`, `checkpoint_attention_by_count.csv`,
+`checkpoint_attention_by_k.csv`, `checkpoint_head_stability.csv`,
+`checkpoint_attention_behavior_link.csv`, `checkpoint_dynamics_autoregressive.csv`,
+`checkpoint_state_probe_summary.csv`, `checkpoint_state_by_count.csv`,
+`checkpoint_state_geometry.csv`, `checkpoint_state_cross_site.csv`,
+`checkpoint_counterfactual_trace_readout.csv`, and
+`checkpoint_state_similarity.csv`. Corresponding `checkpoint_*.png` figures and
+`checkpoint_mechanism_overview.png` show their evolution. Once those derived artifacts
+are archived, checkpoints may be deleted if no recomputation is needed.
+
+These diagnostics do not establish causality: attention weights are correlational,
+decodability does not mean the model uses a direction, teacher-forced traces can hide
+exposure bias, trace position can leak progress, and inspecting many heads creates a
+multiple-selection risk. Fixed held-out head reporting reduces but does not remove the
+last issue. Generated and counterfactual results are therefore reported separately.
+
+Every main stage, optimizer interval, periodic teacher-forced/autoregressive evaluation,
+checkpoint write, and dynamics family emits `[timing:start]`/`[timing:done]` messages and
+an atomic row in `tables/runtime_events.csv`. Rows include deterministic event identity,
+scope/block/variant/step, UTC times, elapsed seconds, status/cache state, example count,
+device, peak CUDA memory, and error type. GPU forward blocks synchronize only at timing
+boundaries. `figures/runtime_breakdown.png` distinguishes optimizer time from evaluation,
+checkpoint I/O, and diagnostics; Colab/Drive I/O remains runtime/network dependent.
 
 The Colab entry point is `notebooks/Trace_Count_v16_2_Colab.ipynb`; regenerate it with
 `python scripts/build_v16_2_notebook.py`. The complete protocol is in
-`docs/pipelines/pipeline_v16_2_character_sets.md`. The generated notebook currently
-defaults to `TASK_OCCURRENCE_RATIO = 0.05`; the `1.0` command above is an explicit
-all-counting-task example rather than the notebook default. Its repository-test cell is
+`docs/pipelines/pipeline_v16_2_character_sets.md`. The builder template defaults to
+`TASK_OCCURRENCE_RATIO = 0.05`; the checked notebook may retain intentional local
+experiment edits. Its repository-test cell is
 disabled by default (`RUN_TESTS = False`): it is an optional developer preflight and is
 not required for data preparation, training, evaluation, or diagnostics.
 

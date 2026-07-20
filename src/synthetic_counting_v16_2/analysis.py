@@ -29,6 +29,20 @@ def _attention_categories(item: V16_2Rendered, weights: np.ndarray) -> dict[str,
     prompt = list(range(spans.prompt_start, spans.prompt_end_exclusive))
     non_needles = [position for position in prompt if position not in needle_set]
     needle_weights = weights[needles] if needles else np.asarray([], dtype=np.float64)
+    prompt_mass = float(weights[prompt].sum()) if prompt else 0.0
+    needle_fraction = float(needle_weights.sum() / prompt_mass) if prompt_mass > 1e-12 else 0.0
+    uniform_fraction = len(needles) / max(1, len(prompt))
+    enrichment = needle_fraction / uniform_fraction if uniform_fraction > 0 else np.nan
+    top_n_recall = np.nan
+    top_n_precision = np.nan
+    if needles and prompt:
+        top_n = min(len(needles), len(prompt))
+        prompt_weights = weights[prompt]
+        selected = np.argpartition(prompt_weights, -top_n)[-top_n:]
+        selected_positions = {prompt[int(index)] for index in selected}
+        matches = len(selected_positions & needle_set)
+        top_n_recall = matches / len(needles)
+        top_n_precision = matches / top_n
     return {
         "bos_mass": float(weights[spans.bos_pos]),
         "task_prefix_mass": float(weights[list(spans.task_prefix_positions)].sum()),
@@ -37,6 +51,10 @@ def _attention_categories(item: V16_2Rendered, weights: np.ndarray) -> dict[str,
         "trace_indices_mass": float(weights[list(spans.trace_index_positions)].sum()) if spans.trace_index_positions else 0.0,
         "trace_markers_mass": float(weights[list(spans.trace_marker_positions)].sum()) if spans.trace_marker_positions else 0.0,
         "needle_entropy_normalized": _normalized_entropy(needle_weights),
+        "prompt_mass": prompt_mass,
+        "needle_attention_enrichment": float(enrichment),
+        "top_n_needle_recall": float(top_n_recall),
+        "top_n_needle_precision": float(top_n_precision),
     }
 
 
@@ -85,12 +103,23 @@ def collect_v16_2_attention(
                                 "set_id": example.set_id,
                                 "set_frequency_bin": example.set_frequency_bin,
                                 "count": example.count,
+                                "corpus_region": example.corpus_region,
+                                "corpus_start": example.corpus_start,
+                                "prompt_sha256": example.prompt_sha256,
                                 "query_kind": query_kind,
                                 "query_k": query_k,
                                 "layer": layer_index,
                                 "head": head,
                                 "correct_prompt_needle_mass": correct_mass,
                                 "correct_top1": correct_top1,
+                                "chance_top1": 1.0 / float(example.count) if query_k is not None else np.nan,
+                                "diagonal_dominance": (
+                                    correct_mass / max(float(categories["prompt_needles_mass"]), 1e-12)
+                                    if query_k is not None else np.nan
+                                ),
+                                "trace_readout_mass": (
+                                    categories["trace_indices_mass"] + categories["trace_markers_mass"]
+                                ),
                                 **categories,
                             }
                         )
@@ -158,7 +187,7 @@ def _sites(item: V16_2Rendered, mode: str) -> list[tuple[str, int, int]]:
 
 
 @torch.no_grad()
-def _collect_states(
+def collect_v16_2_states(
     model,
     cfg: V16_2Config,
     vocab: V16_2Vocab,
@@ -192,23 +221,42 @@ def _collect_states(
     }
 
 
-def _nearest_centroid(train: np.ndarray, train_y: np.ndarray, test: np.ndarray) -> np.ndarray:
+def nearest_centroid(train: np.ndarray, train_y: np.ndarray, test: np.ndarray) -> np.ndarray:
     labels = np.unique(train_y)
     centers = np.stack([train[train_y == label].mean(axis=0) for label in labels])
     distances = ((test[:, None] - centers[None]) ** 2).sum(axis=-1)
     return labels[distances.argmin(axis=1)]
 
 
-def _ridge_prediction(train: np.ndarray, train_y: np.ndarray, test: np.ndarray) -> np.ndarray:
+def fit_ridge(
+    train: np.ndarray, train_y: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     mean = train.mean(axis=0, keepdims=True)
     scale = train.std(axis=0, keepdims=True)
     scale[scale < 1e-8] = 1
     x_train = np.column_stack((np.ones(len(train)), (train - mean) / scale))
-    x_test = np.column_stack((np.ones(len(test)), (test - mean) / scale))
     penalty = np.eye(x_train.shape[1])
     penalty[0, 0] = 0
     beta = np.linalg.solve(x_train.T @ x_train + penalty, x_train.T @ train_y)
+    return mean, scale, beta
+
+
+def apply_ridge(
+    fitted: tuple[np.ndarray, np.ndarray, np.ndarray], test: np.ndarray
+) -> np.ndarray:
+    mean, scale, beta = fitted
+    x_test = np.column_stack((np.ones(len(test)), (test - mean) / scale))
     return x_test @ beta
+
+
+def ridge_prediction(train: np.ndarray, train_y: np.ndarray, test: np.ndarray) -> np.ndarray:
+    return apply_ridge(fit_ridge(train, train_y), test)
+
+
+# Private aliases preserve the existing final-only implementation and older imports.
+_collect_states = collect_v16_2_states
+_nearest_centroid = nearest_centroid
+_ridge_prediction = ridge_prediction
 
 
 def run_v16_2_state_analysis(

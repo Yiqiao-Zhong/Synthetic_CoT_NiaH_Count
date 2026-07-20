@@ -17,6 +17,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--train-steps", type=int, default=None)
     parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=None,
+        help="save numeric checkpoints at this cadence; the objective boundary and final step are also retained",
+    )
+    parser.add_argument(
         "--max-steps-for-language-pred",
         type=int,
         default=None,
@@ -100,6 +106,7 @@ def main(argv: list[str] | None = None) -> None:
         "device",
         "seed",
         "train_steps",
+        "checkpoint_every",
         "max_steps_for_language_pred",
         "weight_decay",
         "eval_examples_per_count",

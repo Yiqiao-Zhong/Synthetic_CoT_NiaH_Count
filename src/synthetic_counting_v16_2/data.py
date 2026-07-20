@@ -540,6 +540,62 @@ def render_v16_2(example: V16_2Example, vocab: V16_2Vocab, mode: str) -> V16_2Re
     return V16_2Rendered("counting_task", mode, tokens, ids, list(ids), spans, prompt_needles, example.count)
 
 
+def render_v16_2_shortened_trace(
+    example: V16_2Example, vocab: V16_2Vocab
+) -> V16_2Rendered:
+    """Render an analysis-only thinking trace with its final index/marker pair removed."""
+
+    if example.example_kind != "counting_task" or example.count is None or example.count < 2:
+        raise ValueError("shortened-trace analysis requires a counting example with count >= 2")
+    gold = render_v16_2(example, vocab, "thinking")
+    assert gold.spans is not None and gold.spans.think_pos is not None
+    shortened_markers = example.needle_markers[:-1]
+    trace = [
+        token
+        for index, marker in enumerate(shortened_markers, start=1)
+        for token in (vocab.number_token(index), marker)
+    ]
+    think_pos = gold.spans.think_pos
+    trace_start = think_pos + 1
+    trace_positions = tuple(range(trace_start, trace_start + len(trace)))
+    close_pos = trace_start + len(trace)
+    ans_pos = close_pos + 1
+    count_pos = ans_pos + 1
+    eos_pos = count_pos + 1
+    tokens = [
+        *gold.tokens[: think_pos + 1],
+        *trace,
+        "</Think>",
+        "<Ans>",
+        vocab.number_token(example.count),
+        "<EOS>",
+    ]
+    spans = V16_2Spans(
+        gold.spans.bos_pos,
+        gold.spans.prompt_start,
+        gold.spans.prompt_end_exclusive,
+        think_pos,
+        trace_positions[0::2],
+        trace_positions[1::2],
+        close_pos,
+        ans_pos,
+        count_pos,
+        eos_pos,
+        gold.spans.task_prefix_positions,
+    )
+    ids = vocab.encode(tokens)
+    return V16_2Rendered(
+        "counting_task",
+        "thinking",
+        tokens,
+        ids,
+        list(ids),
+        spans,
+        gold.prompt_needle_positions,
+        example.count,
+    )
+
+
 def collate_v16_2(
     rendered: list[V16_2Rendered],
     vocab: V16_2Vocab,
