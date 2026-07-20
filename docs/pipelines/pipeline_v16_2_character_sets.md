@@ -44,25 +44,43 @@ The prompt remains an untouched contiguous corpus slice. `M_k` is the actual kth
 left-to-right prompt character belonging to the set. The set members are distinct;
 their prefix order is shuffled by default while the canonical set ID remains stable.
 
-## Weighted training objective
+## Scheduled weighted training objective
 
-Training retains all-sequence next-token supervision but permits two task-relevant
-weights:
+Training permits two task-relevant weights:
 
 - `final_count_loss_weight` applies to the final numeric answer token in both modes;
 - `cot_trace_loss_weight` applies to thinking trace indices and marker characters only.
 
-Control tokens (`<Think>`, `</Think>`, `<Ans>`, and `<EOS>`), task-prefix tokens, prompt
-characters, and raw-language targets retain weight 1. The objective is
+The objective is
 
 ```text
 sum(weight_i * CE_i) / sum(weight_i)
 ```
 
-over non-padding shifted targets. Both defaults are 1.0, reproducing the prior v16_2
-objective. Fixed-suite cross-entropies, perplexities, and component losses remain
-unweighted for comparability; training tables separately identify the weighted objective
-and the weighted shares assigned to final-count and trace targets.
+over the currently active shifted targets. Both task weights default to 1.0.
+
+`max_steps_for_language_pred` defaults to 1,500. Steps 1–1,500, inclusive, retain the
+historical all-sequence objective: control tokens, task-prefix tokens, prompt characters,
+and raw-language targets have unit weight unless covered by a task-specific weight.
+Starting at step 1,501, training becomes task-output-only with inclusive mode-specific
+starts:
+
+```text
+nonthinking: <Ans> <count> <EOS>
+thinking:    <Think> <trace> </Think> <Ans> <count> <EOS>
+```
+
+Raw examples and targets before those starts have zero objective weight. Trace and
+final-count weights remain active within the output spans. If a sampled post-transition
+batch contains no task example, it is deterministically resampled rather than applying an
+AdamW weight-decay-only update. A zero task ratio is invalid when the task-output phase
+would occur. The learning-rate schedule and optimizer state do not restart at the phase
+boundary.
+
+Fixed-suite cross-entropies, perplexities, and component losses remain unweighted and
+full-sequence for comparability. Training tables identify the active phase, objective
+token count, and weighted shares. Thinking remains teacher-forced during training, so the
+schedule removes language competition without itself eliminating trace exposure bias.
 
 ## Optimizer regularization
 
@@ -119,15 +137,18 @@ python -m synthetic_counting_v16_2.run_v16_2 \
   --model-variant rope/thinking \
   --model-variant rpe/thinking \
   --train-steps 10000 \
+  --max-steps-for-language-pred 1500 \
   --eval-examples-per-count 100 \
   --skip-completed
 ```
 
-The generated Colab notebook exposes both loss weights, `WEIGHT_DECAY`, four independent
-model switches, the maximum steps per enabled model, and evaluation examples per count.
-At least one model switch must be enabled. Legacy v16_2 configs without the newer fields
-load with unit task weights, weight decay `0.01`, and their former position-encoding x
-mode Cartesian product.
+The generated Colab notebook exposes both loss weights, `WEIGHT_DECAY`,
+`MAX_STEPS_FOR_LANGUAGE_PRED`, four independent model switches, the maximum steps per
+enabled model, and evaluation examples per count. At least one model switch must be
+enabled. New configs default to the 1,500-step boundary. Legacy v16_2 configs missing the
+field use their saved `train_steps` as the boundary, preserving historical all-sequence
+training. Other missing legacy fields retain unit task weights, weight decay `0.01`, and
+the former position-encoding x mode Cartesian product.
 
 Stages are `prepare -> train -> attention -> state -> plots`. A train or analysis stage
 refuses to start when the split, pool, or fixed-suite manifests are missing or when any

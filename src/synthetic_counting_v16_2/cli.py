@@ -17,6 +17,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--train-steps", type=int, default=None)
     parser.add_argument(
+        "--max-steps-for-language-pred",
+        type=int,
+        default=None,
+        help="use all-sequence language loss through this step, then train only the mode-specific task-output span",
+    )
+    parser.add_argument(
         "--weight-decay",
         type=float,
         default=None,
@@ -94,6 +100,7 @@ def main(argv: list[str] | None = None) -> None:
         "device",
         "seed",
         "train_steps",
+        "max_steps_for_language_pred",
         "weight_decay",
         "eval_examples_per_count",
         "final_count_loss_weight",

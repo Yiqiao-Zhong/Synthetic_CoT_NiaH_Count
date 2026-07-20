@@ -563,23 +563,43 @@ def collate_v16_2_loss_weights(
     rendered: list[V16_2Rendered],
     cfg: V16_2Config,
     device: str | torch.device,
+    *,
+    step: int | None = None,
 ) -> torch.Tensor:
-    """Return unshifted target weights aligned with each rendered label position."""
+    """Return step-specific unshifted weights aligned with rendered target positions."""
 
     if not rendered:
         raise ValueError("cannot build loss weights for an empty list")
+    if step is not None and (type(step) is not int or step < 0):
+        raise ValueError("step must be a nonnegative integer or None")
+    task_output_only = step is not None and step > cfg.max_steps_for_language_pred
     max_len = max(len(item.labels) for item in rendered)
     weights = torch.zeros((len(rendered), max_len), dtype=torch.float32)
     for row, item in enumerate(rendered):
-        weights[row, : len(item.labels)] = 1.0
+        if task_output_only:
+            if item.spans is None:
+                continue
+            if item.mode == "nonthinking":
+                start = item.spans.ans_pos
+            elif item.mode == "thinking":
+                if item.spans.think_pos is None:
+                    raise ValueError("thinking task output requires a <Think> position")
+                start = item.spans.think_pos
+            else:
+                raise ValueError(f"unknown rendered mode: {item.mode}")
+            weights[row, start : len(item.labels)] = 1.0
+        else:
+            weights[row, : len(item.labels)] = 1.0
         if item.spans is None:
             continue
-        weights[row, item.spans.count_pos] = float(cfg.final_count_loss_weight)
+        if weights[row, item.spans.count_pos] > 0:
+            weights[row, item.spans.count_pos] = float(cfg.final_count_loss_weight)
         for position in (
             *item.spans.trace_index_positions,
             *item.spans.trace_marker_positions,
         ):
-            weights[row, position] = float(cfg.cot_trace_loss_weight)
+            if weights[row, position] > 0:
+                weights[row, position] = float(cfg.cot_trace_loss_weight)
     return weights.to(device)
 
 

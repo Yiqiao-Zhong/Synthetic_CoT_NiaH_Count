@@ -58,6 +58,7 @@ class V16_2Config:
     checkpoint_every: int = 1_000
     eval_examples_per_count: int = 100
     ar_examples_per_count: int = 10
+    max_steps_for_language_pred: int = 1_500
     final_count_loss_weight: float = 1.0
     cot_trace_loss_weight: float = 1.0
 
@@ -178,7 +179,7 @@ class V16_2Config:
         if self.noise_source != "shakespeare_char" or self.task_type != "target_character_set":
             raise ValueError("v16_2 requires the Shakespeare target-character-set task")
         if self.loss_scope != "all_sequence":
-            raise ValueError("v16_2 requires all-sequence next-token loss")
+            raise ValueError("v16_2 requires all-sequence next-token loss metadata")
         if self.precision not in {"float32", "bf16"}:
             raise ValueError("precision must be float32 or bf16")
         if not math.isfinite(float(self.weight_decay)) or self.weight_decay < 0:
@@ -187,6 +188,12 @@ class V16_2Config:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and strictly positive")
+        if type(self.max_steps_for_language_pred) is not int or self.max_steps_for_language_pred < 0:
+            raise ValueError("max_steps_for_language_pred must be a nonnegative integer")
+        if self.max_steps_for_language_pred < self.train_steps and self.task_occurrence_ratio == 0:
+            raise ValueError(
+                "task_occurrence_ratio must be positive when task-output-only training is scheduled"
+            )
         if not (0 <= self.adam_beta1 < 1 and 0 <= self.adam_beta2 < 1):
             raise ValueError("Adam betas must be in [0, 1)")
         for name in (
@@ -210,10 +217,29 @@ class V16_2Config:
         result["count_max_alias"] = "read-only alias of count_max_threshold"
         result["effective_needle_pool_seed"] = self.effective_needle_pool_seed
         result["corpus_test_fraction"] = self.corpus_test_fraction
-        result["training_objective"] = (
-            "teacher-forced weighted next-token cross-entropy over every non-padding token; "
-            "final-count and CoT-trace targets use their configured weights"
-        )
+        if self.max_steps_for_language_pred < self.train_steps:
+            result["training_objective"] = (
+                "teacher-forced weighted next-token cross-entropy over every non-padding "
+                f"token through step {self.max_steps_for_language_pred}; from step "
+                f"{self.max_steps_for_language_pred + 1}, task-output targets only, "
+                "starting inclusively at <Ans> for nonthinking and <Think> for thinking"
+            )
+            result["training_loss_schedule"] = (
+                f"steps 1-{self.max_steps_for_language_pred}: all_sequence; steps "
+                f"{self.max_steps_for_language_pred + 1}-{self.train_steps}: task_output"
+            )
+        else:
+            result["training_objective"] = (
+                "teacher-forced weighted next-token cross-entropy over every non-padding "
+                "token for all configured training steps"
+            )
+            result["training_loss_schedule"] = (
+                f"steps 1-{self.train_steps}: all_sequence; task-output switch is after training"
+            )
+        result["task_output_scope"] = {
+            "nonthinking": "<Ans> through <EOS>, inclusive",
+            "thinking": "<Think> through <EOS>, inclusive",
+        }
         result["task_occurrence_ratio_definition"] = (
             "example-level probability of formatting a training corpus window as a counting task"
         )
@@ -276,6 +302,7 @@ def preset_config(preset: str = "debug", **overrides: Any) -> V16_2Config:
 
 def config_from_dict(values: dict[str, Any]) -> V16_2Config:
     data = dict(values)
+    legacy_loss_schedule = "max_steps_for_language_pred" not in data
     alias = data.pop("count_max", None)
     threshold = int(data["count_max_threshold"])
     if alias is not None and int(alias) != threshold:
@@ -285,6 +312,8 @@ def config_from_dict(values: dict[str, Any]) -> V16_2Config:
         "effective_needle_pool_seed",
         "corpus_test_fraction",
         "training_objective",
+        "training_loss_schedule",
+        "task_output_scope",
         "task_occurrence_ratio_definition",
     ):
         data.pop(derived, None)
@@ -300,6 +329,8 @@ def config_from_dict(values: dict[str, Any]) -> V16_2Config:
     data.setdefault("final_count_loss_weight", 1.0)
     data.setdefault("cot_trace_loss_weight", 1.0)
     data.setdefault("weight_decay", 0.01)
+    if legacy_loss_schedule:
+        data["max_steps_for_language_pred"] = int(data["train_steps"])
     cfg = V16_2Config(**data)
     cfg.validate()
     return cfg
@@ -308,13 +339,19 @@ def config_from_dict(values: dict[str, Any]) -> V16_2Config:
 def default_run_name(cfg: V16_2Config) -> str:
     variants = "-".join(value.replace("nonthinking", "nt").replace("thinking", "t") for value in cfg.enabled_model_variants)
     eval_size = cfg.eval_examples_per_count * cfg.count_max_threshold
+    schedule_tag = (
+        "allseq-taskout"
+        if cfg.max_steps_for_language_pred < cfg.train_steps
+        else "all_sequence"
+    )
     return (
         f"v16_2_{cfg.preset}_L{cfg.seq_len}_pool{cfg.needle_pool_size}x{cfg.needle_set_size}_"
         f"pf{_float_tag(cfg.needle_pool_frequency_threshold)}_count1-{cfg.count_max_threshold}_"
         f"taskr{_float_tag(cfg.task_occurrence_ratio)}_wd{_float_tag(cfg.weight_decay)}_"
         f"fcw{_float_tag(cfg.final_count_loss_weight)}_"
-        f"cotw{_float_tag(cfg.cot_trace_loss_weight)}_steps{cfg.train_steps}_evaln{eval_size}_"
-        f"{variants.replace('/', '-')}_all_sequence_seed{cfg.seed}"
+        f"cotw{_float_tag(cfg.cot_trace_loss_weight)}_langsteps{cfg.max_steps_for_language_pred}_"
+        f"steps{cfg.train_steps}_evaln{eval_size}_{variants.replace('/', '-')}_"
+        f"{schedule_tag}_seed{cfg.seed}"
     )
 
 

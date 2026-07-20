@@ -1565,3 +1565,240 @@ code-cell compilation, Ruff, and `git diff --check`. Perform one short CPU debug
 with `WEIGHT_DECAY=0.0` and one with `0.01`; verify distinct run directories and otherwise
 matching seeded data/model configuration. Update README and pipeline documentation before
 handing the changes back for commit.
+
+# revision plan 4: transition from language prediction to task-output-only loss
+
+## 1. Objective and exact boundary semantics
+
+Add a v16_2 training-schedule parameter:
+
+```python
+max_steps_for_language_pred: int = 1500
+```
+
+Training steps `1` through `max_steps_for_language_pred`, inclusive, retain the current
+weighted all-sequence next-token objective. Starting at step
+`max_steps_for_language_pred + 1`, exclude the language-modeling prefix and optimize only
+the complete task-output region. The starting target position depends on mode and is
+inclusive:
+
+```text
+nonthinking: <Ans> <numeric-count> <EOS>
+thinking:    <Think> <trace indices and markers> </Think> <Ans> <numeric-count> <EOS>
+```
+
+Thus the nonthinking task-output mask spans `ans_pos:eos_pos + 1`, while the thinking
+task-output mask spans `think_pos:eos_pos + 1`. The start delimiter is itself an active
+prediction target: `<Ans>` is predicted from the final prompt token in nonthinking mode,
+and `<Think>` is predicted from the final prompt token in thinking mode. The count target
+keeps `final_count_loss_weight`; trace indices and trace markers keep
+`cot_trace_loss_weight`; all other active task-output targets retain unit weight.
+
+Apply the mask to unshifted target positions before `shifted_v16_2_token_losses` performs
+its existing one-token causal shift. In particular, the first output delimiter is
+predicted by the logits immediately before it, the numeric count at `count_pos` is
+predicted from the logits at `ans_pos`, and EOS at `eos_pos` is predicted from the logits
+at `count_pos`. Add alignment-focused unit tests for both modes to prevent off-by-one
+errors at either start boundary.
+
+Interpret the requested “sum” as restricting the numerator to these task-output token
+losses while retaining the existing normalization by the active weight sum. Do not use
+an unnormalized batch sum: the number of active output tokens differs substantially
+between thinking and nonthinking examples and across counts, so a raw sum would make
+gradient scale depend on trace length and batch composition. The learning-rate schedule,
+optimizer state, weight decay, gradient clipping, and global step continue uninterrupted
+across the boundary.
+
+Allow `0`, meaning task-output-only training from step 1. Allow values equal to or above
+`train_steps`, meaning no switch occurs during that run. Require a nonnegative integer
+and reject booleans, negative values, and non-integral values before creating artifacts.
+
+## 2. Raw examples and mode-specific consequences
+
+Raw-language examples have no task-output span and therefore contribute zero objective
+weight after the transition. Continue sampling and recording them only if preserving the
+configured example stream is required for deterministic compatibility, but do not let an
+all-raw post-transition batch silently perform an AdamW-only update. Add a deterministic
+guard that resamples such a batch until at least one counting task is present, with a
+clear validation error when `task_occurrence_ratio == 0` and the switch would occur before
+training ends. This is particularly important for the builder default ratio `0.05`, for
+which an all-raw batch is uncommon but not negligible over thousands of steps.
+
+In nonthinking mode the second phase concentrates learning on entering the answer region,
+predicting the count, and terminating. In thinking mode it preserves the entire CoT
+generation objective, including the decisions to start and stop thinking, while removing
+loss from the Shakespeare prompt and task prefix. This is aligned with the observed
+failure: the thinking model already maps a generated trace to its answer reliably, but
+needs better autoregressive trace generation. `cot_trace_loss_weight` therefore remains
+meaningful after the transition and must not be zeroed by the phase mask.
+
+The objective remains teacher-forced, so this change reduces competition from language
+prediction but does not by itself eliminate exposure bias. Continue using autoregressive
+trace exactness and final-count accuracy to judge whether the thinking model actually
+benefits.
+
+## 3. Config, serialization, CLI, and run identity
+
+Add `max_steps_for_language_pred=1500` to `V16_2Config`, include it in validation,
+`to_dict`, `config.json`, checkpoint config metadata, and the human-readable derived
+training-objective description. Add a derived phase description that reports:
+
+```text
+steps 1-1500: weighted all-sequence loss
+steps 1501-5000: weighted task-output-only loss
+  nonthinking starts at <Ans>; thinking starts at <Think>
+```
+
+Do not leave metadata claiming that the entire run uses only `all_sequence`. Either add a
+separate explicit `training_loss_schedule` metadata field or broaden the existing
+`loss_scope` validation so new scheduled runs and historical all-sequence runs are
+distinguishable without changing model/data formats.
+
+Add a CLI option:
+
+```text
+--max-steps-for-language-pred INT
+```
+
+and forward it through the existing override dictionary to `preset_config`. Include the
+effective boundary in default run identity, for example `langsteps1500`, so scheduled and
+historical all-sequence runs cannot share a default output directory. Saved-config
+equality checks must continue rejecting custom run-directory reuse when the schedule
+differs.
+
+Backward compatibility needs special handling because historical v16_2 configs do not
+contain this field. New configs and presets default to `1500`, as requested. When
+`config_from_dict` loads a genuinely legacy config missing the field, set its effective
+boundary to that saved config's `train_steps`, preserving its historical all-sequence
+behavior through the end of the run. This prevents loading or resuming an old checkpoint
+from silently changing its objective. Do not rename or mutate existing run directories or
+checkpoints.
+
+## 4. Training-mask implementation
+
+Extend `collate_v16_2_loss_weights` or add a narrowly named training-objective mask helper
+that accepts the absolute optimizer step. Keep target rendering and labels unchanged.
+The helper should:
+
+1. Build the existing all-sequence weights at or before the threshold.
+2. After the threshold, initialize every position to zero.
+3. For a nonthinking counting example, activate every target from `ans_pos` through
+   `eos_pos`, inclusive.
+4. For a thinking counting example, activate every target from `think_pos` through
+   `eos_pos`, inclusive.
+5. Within the active span, apply `final_count_loss_weight` at `count_pos` and
+   `cot_trace_loss_weight` at each trace index and trace marker; leave delimiters and EOS
+   at unit weight.
+6. Leave every position in a raw example and every padding position at zero while
+   preserving device/dtype behavior.
+
+Pass the current absolute step from `train_v16_2_variant`, including after checkpoint
+resume. Derive the phase entirely from `step` and the serialized config rather than
+storing mutable phase state, making a resumed step 1,501 identical to an uninterrupted
+step 1,501.
+
+Keep fixed-suite evaluation unchanged and unweighted. Continue reporting full-sequence
+train/held-out/test cross-entropies so the run reveals whether language loss stabilizes,
+worsens, or is forgotten after its gradients stop. Autoregressive validation also remains
+unchanged and is the primary criterion for whether the task-output phase improves
+counting and trace generation.
+
+## 5. Metrics and observability
+
+Extend `train_metrics.csv` with fields such as:
+
+- `training_loss_phase`: `all_sequence` or `task_output`;
+- `batch_objective_active_tokens`: number of targets with nonzero objective weight;
+- `batch_task_output_examples`: counting examples contributing output targets;
+- `language_prediction_enabled`: boolean boundary indicator.
+
+Keep the existing `batch_active_tokens` and cumulative sampling statistics defined over
+the rendered data stream for backward comparability. Compute
+`batch_final_count_weight_share` and `batch_cot_trace_weight_share` from the effective
+step-specific objective weights. After the transition, trace share must remain zero for
+nonthinking but must reflect the configured trace weights for thinking; final-count share
+must reflect its fraction of the full mode-specific task-output span. Continue logging
+unweighted component losses as diagnostics even for components whose training weight is
+zero, but clearly distinguish them from the optimized objective.
+
+Record the scheduled boundary in the planned notebook summary and make the console emit a
+single phase-transition message at the first task-output-only step. Avoid printing it
+again on every step or after a resume already beyond the boundary.
+
+## 6. Notebook block 3 and builder
+
+Add the following control to code block 3, **Easy-to-edit settings**, in both
+`scripts/build_v16_2_notebook.py` and the checked-in v16_2 notebook:
+
+```python
+MAX_STEPS_FOR_LANGUAGE_PRED = 1500  # through this step use all-token LM loss; afterward train task output only
+```
+
+Pass it to `preset_config` as `max_steps_for_language_pred`, display the two derived step
+ranges in `PLANNED_CONFIG` output, and add this CLI wiring to `base_cmd`:
+
+```python
+"--max-steps-for-language-pred", str(MAX_STEPS_FOR_LANGUAGE_PRED),
+```
+
+Do not reset the user's current task ratio, model switches, weights, training steps,
+evaluation size, weight decay, output root, or checkpoint choices while editing the
+generated notebook. If `MAX_STEPS_FOR_LANGUAGE_PRED >= MAX_TRAIN_STEPS`, print that the
+task-output-only phase will not run rather than presenting an empty or inverted range.
+
+## 7. Documentation
+
+Update `README.md` and `docs/pipelines/pipeline_v16_2_character_sets.md` with:
+
+- the default boundary and exact inclusive/exclusive step semantics;
+- the inclusive mode-specific starts: `<Ans>` for nonthinking and `<Think>` for thinking;
+- the exact active output spans, including delimiters, trace, count, and EOS as applicable;
+- the retained normalized weighted reduction and final-count weight interaction;
+- raw examples' zero contribution after the switch;
+- continued CoT-trace supervision and `cot_trace_loss_weight` behavior in thinking mode;
+- unchanged full-sequence evaluation curves and autoregressive checkpoint selection;
+- the special legacy-loading rule that preserves old all-sequence runs.
+
+Include a short example for a 5,000-step run: all-sequence optimization through 1,500,
+then task-output-only optimization for steps 1,501-5,000. State that this changes training
+behavior from earlier v16_2 runs even though tokenization, architecture, corpus split,
+needle pool, and evaluation suites remain unchanged.
+
+## 8. Tests and acceptance criteria
+
+Extend `tests/test_synthetic_counting_v16_2.py` to verify:
+
+1. Config, CLI, serialization, notebook, and builder round-trip the default `1500` and
+   arbitrary valid boundaries; invalid values fail early.
+2. A legacy config missing the field loads with its saved `train_steps`, reproducing the
+   historical full-sequence schedule.
+3. Default run names differ when only the language-prediction boundary differs.
+4. At step equal to the threshold, raw, prompt, trace, answer-delimiter, count, and EOS
+   targets have the existing weights.
+5. At the first step after the threshold, a nonthinking example has nonzero weights
+   exactly from `ans_pos` through `eos_pos`, a thinking example has nonzero weights
+   exactly from `think_pos` through `eos_pos`, and every raw-example weight is zero.
+6. Shifted-logit gradients are zero for all excluded prefix targets and nonzero for the
+   correctly aligned `<Ans>`/`<Think>` start predictor and subsequent output predictors.
+7. The task-output weighted loss uses the existing normalized reduction, honors both
+   configured task weights in their applicable modes, and remains finite for mixed
+   batches and variable-length thinking traces.
+8. An all-raw post-transition batch is resampled or rejected without applying an
+   optimizer/weight-decay-only step; a zero task ratio with an active second phase fails
+   validation.
+9. Resuming immediately before, at, and after the threshold produces the same phase,
+   objective, metrics, and parameter update as an uninterrupted run.
+10. Periodic train/held-out/test loss suites and autoregressive evaluations retain their
+    prior definitions.
+11. Training metrics show all-sequence phase rows through the boundary and task-output
+    rows afterward, with the expected mode-specific active-token totals and trace shares.
+12. Unit-weight pre-threshold behavior and untouched v16/v11-v14 behavior remain exactly
+    unchanged.
+
+Run focused unit and notebook-generation tests, legacy regression tests, notebook cell
+compilation, Ruff, and `git diff --check`. Then run a deterministic CPU debug experiment
+with one nonthinking model, four training steps, and boundary `2`; inspect steps 2 and 3
+to confirm the exact mask transition, save/resume at the boundary, and verify that
+autoregressive evaluation and full-sequence evaluation still execute. Run a second short
+thinking smoke test to confirm `<Think>`, trace, `</Think>`, `<Ans>`, count, and EOS remain
+active after the boundary while the task prefix and Shakespeare prompt are excluded.

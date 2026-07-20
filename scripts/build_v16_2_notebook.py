@@ -222,6 +222,7 @@ def build() -> Path:
             RUN_RPE_NONTHINKING = True
             RUN_RPE_THINKING = True
             MAX_TRAIN_STEPS = 10_000         # optimizer steps for each enabled model
+            MAX_STEPS_FOR_LANGUAGE_PRED = 1_500  # through this step use all-token LM loss; afterward train task output only
             EVAL_EXAMPLES_PER_COUNT = 100    # examples for each count; suite size = this value x COUNT_MAX_THRESHOLD
             NEEDLE_POOL_SIZE = 100
             NEEDLE_POOL_FREQUENCY_THRESHOLD = 0.04
@@ -257,17 +258,23 @@ def build() -> Path:
                 cot_trace_loss_weight=COT_TRACE_LOSS_WEIGHT,
                 enabled_model_variants=ENABLED_MODEL_VARIANTS,
                 train_steps=MAX_TRAIN_STEPS,
+                max_steps_for_language_pred=MAX_STEPS_FOR_LANGUAGE_PRED,
                 eval_examples_per_count=EVAL_EXAMPLES_PER_COUNT,
                 needle_pool_size=NEEDLE_POOL_SIZE,
                 needle_pool_frequency_threshold=NEEDLE_POOL_FREQUENCY_THRESHOLD,
             )
             EVAL_EXAMPLES_PER_SUITE = EVAL_EXAMPLES_PER_COUNT * COUNT_MAX_THRESHOLD
             PERIODIC_TF_EXAMPLES_PER_MODEL = 7 * EVAL_EXAMPLES_PER_SUITE
+            LANGUAGE_PREDICTION_STEPS = min(MAX_STEPS_FOR_LANGUAGE_PRED, MAX_TRAIN_STEPS)
+            TASK_OUTPUT_ONLY_STEPS = max(0, MAX_TRAIN_STEPS - MAX_STEPS_FOR_LANGUAGE_PRED)
             print({
                 "config": PLANNED_CONFIG.to_dict(),
                 "enabled_model_variants": ENABLED_MODEL_VARIANTS,
                 "number_of_models": len(ENABLED_MODEL_VARIANTS),
                 "weight_decay": WEIGHT_DECAY,
+                "language_prediction_steps": LANGUAGE_PREDICTION_STEPS,
+                "task_output_only_steps": TASK_OUTPUT_ONLY_STEPS,
+                "task_output_starts": {"nonthinking": "<Ans>", "thinking": "<Think>"},
                 "max_steps_per_model": MAX_TRAIN_STEPS,
                 "total_planned_optimizer_steps": len(ENABLED_MODEL_VARIANTS) * MAX_TRAIN_STEPS,
                 "eval_examples_per_suite": EVAL_EXAMPLES_PER_SUITE,
@@ -290,6 +297,7 @@ def build() -> Path:
                 "--final-count-loss-weight", str(FINAL_COUNT_LOSS_WEIGHT),
                 "--cot-trace-loss-weight", str(COT_TRACE_LOSS_WEIGHT),
                 "--train-steps", str(MAX_TRAIN_STEPS),
+                "--max-steps-for-language-pred", str(MAX_STEPS_FOR_LANGUAGE_PRED),
                 "--eval-examples-per-count", str(EVAL_EXAMPLES_PER_COUNT),
                 "--needle-pool-size", str(NEEDLE_POOL_SIZE),
                 "--needle-pool-frequency-threshold", str(NEEDLE_POOL_FREQUENCY_THRESHOLD),

@@ -74,6 +74,12 @@ def learning_rate(cfg: V16_2Config, step: int) -> float:
     return cfg.lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
 
 
+def training_loss_phase(cfg: V16_2Config, step: int) -> str:
+    """Return the objective phase for an absolute optimizer step."""
+
+    return "all_sequence" if step <= cfg.max_steps_for_language_pred else "task_output"
+
+
 def _autocast_context(cfg: V16_2Config):
     if (
         cfg.precision == "bf16"
@@ -489,9 +495,14 @@ def _training_batch(
     pool: NeedlePool,
     mode: str,
     rng: random.Random,
+    *,
+    require_task: bool = False,
 ) -> tuple[list[V16_2Example], list[V16_2Rendered]]:
-    examples = [make_training_example(cfg, vocab, text, split, pool, rng) for _ in range(cfg.batch_size)]
-    return examples, [render_v16_2(example, vocab, mode) for example in examples]
+    for _ in range(1_000):
+        examples = [make_training_example(cfg, vocab, text, split, pool, rng) for _ in range(cfg.batch_size)]
+        if not require_task or any(item.example_kind == "counting_task" for item in examples):
+            return examples, [render_v16_2(example, vocab, mode) for example in examples]
+    raise RuntimeError("could not sample a counting task for task-output-only training")
 
 
 @torch.no_grad()
@@ -731,9 +742,24 @@ def train_v16_2_variant(
     )
     for step in progress:
         model.train()
-        examples, rendered = _training_batch(cfg, vocab, text, split, pool, mode, rng)
+        loss_phase = training_loss_phase(cfg, step)
+        if step == cfg.max_steps_for_language_pred + 1:
+            print(
+                f"[train] {position_encoding}/{mode}: switching to task-output-only loss at step {step}",
+                flush=True,
+            )
+        examples, rendered = _training_batch(
+            cfg,
+            vocab,
+            text,
+            split,
+            pool,
+            mode,
+            rng,
+            require_task=loss_phase == "task_output",
+        )
         ids, labels, attention_mask = collate_v16_2(rendered, vocab, cfg.device)
-        loss_weights = collate_v16_2_loss_weights(rendered, cfg, cfg.device)
+        loss_weights = collate_v16_2_loss_weights(rendered, cfg, cfg.device, step=step)
         with _autocast_context(cfg):
             output = model(input_ids=ids, attention_mask=attention_mask)
             loss, token_losses, active = shifted_v16_2_token_losses(
@@ -755,6 +781,7 @@ def train_v16_2_variant(
             component_values = _component_example_means(token_losses, rendered)
             active_weights = loss_weights[:, 1:] * active
             active_weight_sum = float(active_weights.sum().detach().cpu())
+            objective_active_tokens = int((active_weights > 0).sum().detach().cpu())
             unweighted_loss = float(
                 ((token_losses * active).sum() / active.sum().clamp_min(1)).detach().cpu()
             )
@@ -786,6 +813,10 @@ def train_v16_2_variant(
                 "batch_active_weight_sum": active_weight_sum,
                 "batch_final_count_weight_share": final_count_weight_sum / max(1.0, active_weight_sum),
                 "batch_cot_trace_weight_share": trace_weight_sum / max(1.0, active_weight_sum),
+                "training_loss_phase": loss_phase,
+                "language_prediction_enabled": loss_phase == "all_sequence",
+                "batch_objective_active_tokens": objective_active_tokens,
+                "batch_task_output_examples": int(is_task.sum()),
                 "learning_rate": rate,
                 "gradient_norm": gradient_norm,
                 "configured_task_example_ratio": cfg.task_occurrence_ratio,

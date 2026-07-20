@@ -186,24 +186,37 @@ and ratio-matched suites. The primary train-versus-held-out curves average cross
 equally over input sequences, while token-weighted loss is saved as a secondary metric.
 The untouched test region is used only at the final checkpoint.
 
-v16_2 supports task-relevant training-loss weights without changing the rendered data.
-`final_count_loss_weight` weights the final numeric answer target in both output modes;
-`cot_trace_loss_weight` weights only thinking trace index and marker targets. `<Think>`,
-`</Think>`, `<Ans>`, `<EOS>`, task-prefix, prompt, and raw-language targets retain unit
-weight. The weighted objective is normalized by the sum of active weights. Both defaults
-are `1.0`, which preserves the previous unweighted objective, while fixed-suite
-cross-entropies and component losses remain unweighted for cross-run comparison.
+v16_2 supports task-relevant training-loss weights and a scheduled loss scope without
+changing the rendered data. `final_count_loss_weight` weights the final numeric answer
+target in both output modes; `cot_trace_loss_weight` weights only thinking trace index and
+marker targets. The weighted objective is always normalized by the sum of active weights.
+Both task weights default to `1.0`.
+
+`max_steps_for_language_pred` defaults to 1,500. Through that step, every non-padding
+target retains the original all-sequence supervision. Beginning at step 1,501, raw
+examples and the task prefix/Shakespeare prompt receive zero objective weight. The active
+task output starts inclusively at `<Ans>` for nonthinking and `<Think>` for thinking:
+
+```text
+nonthinking: <Ans> <count> <EOS>
+thinking:    <Think> <trace> </Think> <Ans> <count> <EOS>
+```
+
+Trace and final-count weights continue to apply inside those spans. Fixed-suite
+cross-entropies and component losses remain unweighted and full-sequence for cross-run
+comparison. The thinking objective remains teacher-forced, so removing language-loss
+competition does not by itself eliminate autoregressive trace exposure bias.
 
 Runs may enable any non-empty subset of `rope/nonthinking`, `rope/thinking`,
 `rpe/nonthinking`, and `rpe/thinking`. The Colab notebook exposes four independent model
-switches, `MAX_TRAIN_STEPS`, both loss weights, `WEIGHT_DECAY`, and
-`EVAL_EXAMPLES_PER_COUNT`. `WEIGHT_DECAY` defaults to `0.01`; `0.0` disables AdamW
-decay. The current optimizer applies the coefficient to every trainable parameter,
-including embeddings, biases, and LayerNorm parameters. The evaluation setting defaults
-to 100, giving 1,000 examples in each balanced fixed suite for counts 1 through 10. Each
-500-step checkpoint currently evaluates six loss suites plus one held-out behavioral
-suite, so the default is approximately 7,000 teacher-forced sequences per enabled model;
-autoregressive examples remain controlled separately.
+switches, `MAX_TRAIN_STEPS`, `MAX_STEPS_FOR_LANGUAGE_PRED`, both loss weights,
+`WEIGHT_DECAY`, and `EVAL_EXAMPLES_PER_COUNT`. `WEIGHT_DECAY` defaults to `0.01`; `0.0`
+disables AdamW decay. The current optimizer applies the coefficient to every trainable
+parameter, including embeddings, biases, and LayerNorm parameters. The evaluation setting
+defaults to 100, giving 1,000 examples in each balanced fixed suite for counts 1 through
+10. Each 500-step checkpoint currently evaluates six loss suites plus one held-out
+behavioral suite, so the default is approximately 7,000 teacher-forced sequences per
+enabled model; autoregressive examples remain controlled separately.
 
 Weight decay regularizes parameter magnitude but does not add dropout or early stopping.
 In the observed v16_2 runs, `0.01` did not prevent held-out language loss from worsening
@@ -219,7 +232,8 @@ python -m synthetic_counting_v16_2.run_v16_2 \
   --weight-decay 0.01 \
   --final-count-loss-weight 1.0 --cot-trace-loss-weight 1.0 \
   --model-variant rope/thinking --model-variant rpe/thinking \
-  --train-steps 10000 --eval-examples-per-count 100 --skip-completed
+  --train-steps 10000 --max-steps-for-language-pred 1500 \
+  --eval-examples-per-count 100 --skip-completed
 ```
 
 The Colab entry point is `notebooks/Trace_Count_v16_2_Colab.ipynb`; regenerate it with
@@ -252,11 +266,12 @@ the result directory is derived from it.
 
 The installation/environment compatibility measures themselves do not alter v16 or
 v16_2 model architectures, data formats, random seeds, manifests, or checkpoint schemas,
-and existing v16 checkpoints remain loadable. The v16_2 loss weights and model-selection
-controls documented above are separate, explicit experiment settings with
-backward-compatible defaults; they are saved in config/checkpoint metadata and encoded
-in new default run names. Newly named v16_2 runs also include the effective weight decay;
-older result directories and checkpoints are not renamed or modified.
+and existing v16 checkpoints remain loadable. The v16_2 loss weights, scheduled loss
+boundary, optimizer settings, and model-selection controls are saved in config/checkpoint
+metadata and encoded in new default run names. New v16_2 configs use the 1,500-step
+language boundary. A historical v16_2 config lacking that field loads with its saved
+`train_steps` as the boundary, preserving all-sequence training for that old run. Older
+result directories and checkpoints are not renamed or modified.
 The repository-wide NumPy range now permits NumPy 2 for newly resolved v16 environments,
 however, so a new v16 run under NumPy 2 is not promised to be bit-for-bit identical to
 an older run under NumPy 1.26. For strict historical v16 reproduction, retain a matched
